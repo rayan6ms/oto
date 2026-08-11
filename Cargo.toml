@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/oto-testkit"]
+members = ["crates/oto", "crates/oto-testkit"]
 resolver = "3"
 
 [workspace.package]
@@ -12,8 +12,9 @@ chacha20poly1305 = "0.11.0"
 futures-util = { version = "0.3.33", default-features = false, features = ["sink", "std"] }
 rcgen = "0.14.9"
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "test-util", "time"] }
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
-tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "handshake", "rustls-tls-native-roots"] }

@@ -83,6 +83,14 @@ pub struct FakeVoiceGatewayConfig {
     pub replay_capacity: usize,
     pub sequence_start: u16,
     pub sequence_modulus: u32,
+    /// Number of heartbeat acknowledgements to drop across all connections.
+    pub drop_heartbeat_acks: usize,
+    /// Deterministic delay applied before each non-dropped heartbeat ACK.
+    pub heartbeat_ack_delay: Duration,
+    /// Optional close injected at a precise handshake stage on every attempt.
+    pub scripted_close: Option<ScriptedClose>,
+    /// Deterministic delay between WebSocket upgrade and Hello.
+    pub hello_delay: Duration,
 }
 
 impl std::fmt::Debug for FakeVoiceGatewayConfig {
@@ -103,6 +111,10 @@ impl std::fmt::Debug for FakeVoiceGatewayConfig {
             .field("replay_capacity", &self.replay_capacity)
             .field("sequence_start", &self.sequence_start)
             .field("sequence_modulus", &self.sequence_modulus)
+            .field("drop_heartbeat_acks", &self.drop_heartbeat_acks)
+            .field("heartbeat_ack_delay", &self.heartbeat_ack_delay)
+            .field("scripted_close", &self.scripted_close)
+            .field("hello_delay", &self.hello_delay)
             .finish()
     }
 }
@@ -128,6 +140,10 @@ impl FakeVoiceGatewayConfig {
             replay_capacity: 64,
             sequence_start: 0,
             sequence_modulus: 65_536,
+            drop_heartbeat_acks: 0,
+            heartbeat_ack_delay: Duration::ZERO,
+            scripted_close: None,
+            hello_delay: Duration::ZERO,
         }
     }
 
@@ -149,6 +165,21 @@ impl FakeVoiceGatewayConfig {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GatewayCloseStage {
+    BeforeHello,
+    AfterHello,
+    AfterIdentify,
+    AfterReady,
+    OnResume,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScriptedClose {
+    pub stage: GatewayCloseStage,
+    pub close: VoiceClose,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -211,6 +242,10 @@ enum GatewayCommand {
         opcode: u8,
         payload: Vec<u8>,
     },
+    BufferJson {
+        opcode: u8,
+        data: Value,
+    },
     Close(VoiceClose),
 }
 
@@ -218,6 +253,13 @@ enum GatewayCommand {
 struct BufferedMessage {
     sequence: u16,
     message: Message,
+}
+
+#[derive(Debug)]
+struct GatewayProtocolState {
+    sequence: u16,
+    replay: VecDeque<BufferedMessage>,
+    remaining_dropped_acks: usize,
 }
 
 #[derive(Debug)]
@@ -388,6 +430,12 @@ impl FakeVoiceGateway {
         self.try_command(GatewayCommand::Binary { opcode, payload })
     }
 
+    /// Adds a numbered server message to Resume history without delivering it
+    /// on the current connection, modeling a message lost at interruption.
+    pub fn try_buffer_json(&self, opcode: u8, data: Value) -> Result<(), GatewayCommandError> {
+        self.try_command(GatewayCommand::BufferJson { opcode, data })
+    }
+
     pub fn try_close(&self, close: VoiceClose) -> Result<(), GatewayCommandError> {
         self.try_command(GatewayCommand::Close(close))
     }
@@ -418,8 +466,11 @@ async fn run_gateway(
     mut shutdown: watch::Receiver<bool>,
     state: Arc<Mutex<GatewayState>>,
 ) -> Result<(), GatewayError> {
-    let mut sequence = config.sequence_start;
-    let mut replay = VecDeque::<BufferedMessage>::with_capacity(config.replay_capacity);
+    let mut protocol = GatewayProtocolState {
+        sequence: config.sequence_start,
+        replay: VecDeque::with_capacity(config.replay_capacity),
+        remaining_dropped_acks: config.drop_heartbeat_acks,
+    };
 
     loop {
         let accepted = tokio::select! {
@@ -459,23 +510,39 @@ async fn run_gateway(
                 Err(_) => continue,
             }
         };
-        send_json(
+        if !config.hello_delay.is_zero() {
+            tokio::select! {
+                result = shutdown.changed() => {
+                    if result.is_err() || *shutdown.borrow() {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                () = tokio::time::sleep(config.hello_delay) => {}
+            }
+        }
+        if close_at_stage(&config, GatewayCloseStage::BeforeHello, &mut websocket).await? {
+            continue;
+        }
+        if send_json(
             &mut websocket,
             json!({
                 "op": 8,
                 "d": {"heartbeat_interval": config.heartbeat_interval.as_millis() as u64}
             }),
         )
-        .await?;
-
+        .await
+        .is_err()
+        {
+            continue;
+        }
         let end = run_connection(
             &mut websocket,
             &config,
             &mut commands,
             &mut shutdown,
             &state,
-            &mut sequence,
-            &mut replay,
+            &mut protocol,
         )
         .await?;
         if end == ConnectionEnd::Shutdown {
@@ -498,8 +565,7 @@ async fn run_connection(
     commands: &mut mpsc::Receiver<GatewayCommand>,
     shutdown: &mut watch::Receiver<bool>,
     state: &Arc<Mutex<GatewayState>>,
-    sequence: &mut u16,
-    replay: &mut VecDeque<BufferedMessage>,
+    protocol: &mut GatewayProtocolState,
 ) -> Result<ConnectionEnd, GatewayError> {
     loop {
         tokio::select! {
@@ -516,13 +582,36 @@ async fn run_connection(
                 match command {
                     GatewayCommand::Json { opcode, data, numbered } => {
                         if numbered {
-                            send_numbered_json(websocket, config, sequence, replay, opcode, data).await?;
+                            send_numbered_json(
+                                websocket,
+                                config,
+                                &mut protocol.sequence,
+                                &mut protocol.replay,
+                                opcode,
+                                data,
+                            ).await?;
                         } else {
                             send_json(websocket, json!({"op": opcode, "d": data})).await?;
                         }
                     }
                     GatewayCommand::Binary { opcode, payload } => {
-                        send_numbered_binary(websocket, config, sequence, replay, opcode, payload).await?;
+                        send_numbered_binary(
+                            websocket,
+                            config,
+                            &mut protocol.sequence,
+                            &mut protocol.replay,
+                            opcode,
+                            payload,
+                        ).await?;
+                    }
+                    GatewayCommand::BufferJson { opcode, data } => {
+                        buffer_numbered_json(
+                            config,
+                            &mut protocol.sequence,
+                            &mut protocol.replay,
+                            opcode,
+                            data,
+                        )?;
                     }
                     GatewayCommand::Close(close) => {
                         websocket.send(Message::Close(Some(CloseFrame {
@@ -547,8 +636,20 @@ async fn run_connection(
                         )) => {
                         return Ok(ConnectionEnd::Disconnected);
                     }
-                    Err(error) => return Err(error.into()),
+                    // A peer may disappear without a WebSocket close handshake during
+                    // reconnect fault tests. Keep the listener alive for the next
+                    // deterministic attempt regardless of the dependency-specific
+                    // disconnect discriminant.
+                    Err(_) => return Ok(ConnectionEnd::Disconnected),
                 };
+                if config
+                    .scripted_close
+                    .as_ref()
+                    .is_some_and(|scripted| scripted.stage == GatewayCloseStage::AfterHello)
+                {
+                    close_at_stage(config, GatewayCloseStage::AfterHello, websocket).await?;
+                    return Ok(ConnectionEnd::Disconnected);
+                }
                 match message {
                     Message::Text(text) => {
                         if text.len() > config.max_message_bytes {
@@ -562,7 +663,13 @@ async fn run_connection(
                                 return Ok(ConnectionEnd::Disconnected);
                             }
                         };
-                        if !handle_text(websocket, config, state, sequence, replay, value).await? {
+                        if !handle_text(
+                            websocket,
+                            config,
+                            state,
+                            protocol,
+                            value,
+                        ).await? {
                             return Ok(ConnectionEnd::Disconnected);
                         }
                     }
@@ -587,8 +694,7 @@ async fn handle_text(
     websocket: &mut ServerWebSocket,
     config: &FakeVoiceGatewayConfig,
     state: &Arc<Mutex<GatewayState>>,
-    sequence: &mut u16,
-    replay: &mut VecDeque<BufferedMessage>,
+    protocol: &mut GatewayProtocolState,
     value: Value,
 ) -> Result<bool, GatewayError> {
     let Some(opcode) = value.get("op").and_then(Value::as_u64) else {
@@ -602,11 +708,14 @@ async fn handle_text(
                 .lock()
                 .expect("fake gateway state mutex poisoned")
                 .record(GatewayRecord::Identify(data))?;
+            if close_at_stage(config, GatewayCloseStage::AfterIdentify, websocket).await? {
+                return Ok(false);
+            }
             send_numbered_json(
                 websocket,
                 config,
-                sequence,
-                replay,
+                &mut protocol.sequence,
+                &mut protocol.replay,
                 2,
                 json!({
                     "ssrc": config.ssrc,
@@ -616,6 +725,9 @@ async fn handle_text(
                 }),
             )
             .await?;
+            if close_at_stage(config, GatewayCloseStage::AfterReady, websocket).await? {
+                return Ok(false);
+            }
         }
         1 => {
             state
@@ -625,8 +737,8 @@ async fn handle_text(
             send_numbered_json(
                 websocket,
                 config,
-                sequence,
-                replay,
+                &mut protocol.sequence,
+                &mut protocol.replay,
                 4,
                 json!({
                     "mode": config.modes[0],
@@ -646,7 +758,14 @@ async fn handle_text(
                     nonce: nonce.clone(),
                     seq_ack,
                 })?;
-            send_json(websocket, json!({"op": 6, "d": {"t": nonce}})).await?;
+            if protocol.remaining_dropped_acks > 0 {
+                protocol.remaining_dropped_acks -= 1;
+            } else {
+                if !config.heartbeat_ack_delay.is_zero() {
+                    tokio::time::sleep(config.heartbeat_ack_delay).await;
+                }
+                send_json(websocket, json!({"op": 6, "d": {"t": nonce}})).await?;
+            }
         }
         5 => {
             state
@@ -660,7 +779,10 @@ async fn handle_text(
                 .lock()
                 .expect("fake gateway state mutex poisoned")
                 .record(GatewayRecord::Resume { seq_ack })?;
-            if !replay_after(websocket, replay, seq_ack).await? {
+            if close_at_stage(config, GatewayCloseStage::OnResume, websocket).await? {
+                return Ok(false);
+            }
+            if !replay_after(websocket, &protocol.replay, seq_ack).await? {
                 return Ok(false);
             }
             send_json(websocket, json!({"op": 9, "d": {}})).await?;
@@ -672,6 +794,26 @@ async fn handle_text(
                 .record(GatewayRecord::OtherText(value))?;
         }
     }
+    Ok(true)
+}
+
+async fn close_at_stage(
+    config: &FakeVoiceGatewayConfig,
+    stage: GatewayCloseStage,
+    websocket: &mut ServerWebSocket,
+) -> Result<bool, GatewayError> {
+    let Some(scripted) = config.scripted_close.as_ref() else {
+        return Ok(false);
+    };
+    if scripted.stage != stage {
+        return Ok(false);
+    }
+    websocket
+        .send(Message::Close(Some(CloseFrame {
+            code: scripted.close.code.into(),
+            reason: scripted.close.reason.clone().into(),
+        })))
+        .await?;
     Ok(true)
 }
 
@@ -716,6 +858,24 @@ async fn send_numbered_json(
     let message = Message::Text(text.into());
     buffer_message(config.replay_capacity, replay, current, message.clone());
     websocket.send(message).await?;
+    Ok(())
+}
+
+fn buffer_numbered_json(
+    config: &FakeVoiceGatewayConfig,
+    sequence: &mut u16,
+    replay: &mut VecDeque<BufferedMessage>,
+    opcode: u8,
+    data: Value,
+) -> Result<(), GatewayError> {
+    let current = take_sequence(sequence, config.sequence_modulus);
+    let text = serde_json::to_string(&json!({"op": opcode, "d": data, "seq": current}))?;
+    buffer_message(
+        config.replay_capacity,
+        replay,
+        current,
+        Message::Text(text.into()),
+    );
     Ok(())
 }
 

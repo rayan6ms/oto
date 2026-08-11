@@ -20,8 +20,8 @@ pub use crypto::{
 };
 pub use fault::{FaultAction, FaultError, FaultInjector, ScheduledPacket};
 pub use gateway::{
-    FakeVoiceGateway, FakeVoiceGatewayConfig, GatewayCommandError, GatewayError, GatewayRecord,
-    TestTls, VoiceClose,
+    FakeVoiceGateway, FakeVoiceGatewayConfig, GatewayCloseStage, GatewayCommandError, GatewayError,
+    GatewayRecord, ScriptedClose, TestTls, VoiceClose,
 };
 pub use rng::{DeterministicRng, DeterministicRngError};
 pub use udp::{
