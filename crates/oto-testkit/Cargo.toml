@@ -1,0 +1,18 @@
+[package]
+name = "oto-testkit"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+futures-util.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-tungstenite.workspace = true
