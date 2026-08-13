@@ -3734,6 +3734,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dave_roster_limit_accepts_edge_and_rejects_one_member_over() {
+        let gateway = TestGateway::start(FakeVoiceGatewayConfig::local())
+            .await
+            .expect("gateway starts");
+        let oto = test_oto(
+            &gateway,
+            ResourceLimits::default().with_dave_roster_members(2),
+        );
+        let connection = oto
+            .connect(voice_info(&gateway, "roster-limits", "token"))
+            .await
+            .expect("gateway connects");
+
+        gateway
+            .try_dispatch_json(12, json!({"user_ids": ["1", "2"]}), true)
+            .expect("exact roster queues");
+        gateway
+            .try_dispatch_json(250, json!({"barrier": "exact-roster"}), true)
+            .expect("ordered barrier queues");
+        eventually(|| connection.state().stats().unknown_opcodes() >= 1).await;
+        assert_eq!(connection.state().phase(), ConnectionPhase::Connected);
+
+        gateway
+            .try_dispatch_json(12, json!({"user_ids": ["1", "2", "3"]}), true)
+            .expect("one-over roster queues");
+        eventually(|| connection.state().phase() == ConnectionPhase::Failed).await;
+        assert_eq!(
+            connection
+                .state()
+                .failure()
+                .expect("roster limit failure persists")
+                .kind(),
+            ErrorKind::ResourceLimit
+        );
+
+        gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
     async fn command_saturation_and_slow_observer_never_hide_durable_final_state() {
         let gateway = TestGateway::start(FakeVoiceGatewayConfig::local())
             .await
