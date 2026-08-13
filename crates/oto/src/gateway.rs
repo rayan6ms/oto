@@ -167,6 +167,12 @@ enum DaveBinaryEnvelopeError {
     BodyTooLarge,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DaveRosterError {
+    Malformed,
+    TooManyMembers,
+}
+
 fn decode_dave_binary_envelope(
     bytes: &[u8],
     max_body_bytes: usize,
@@ -204,6 +210,24 @@ fn decode_dave_json_control(opcode: u64, data: &Value) -> Option<DaveControl> {
         }),
         _ => None,
     }
+}
+
+fn decode_dave_roster(data: &Value, max_members: usize) -> Result<Vec<u64>, DaveRosterError> {
+    let users = data
+        .get("user_ids")
+        .and_then(Value::as_array)
+        .ok_or(DaveRosterError::Malformed)?;
+    if users.len() > max_members {
+        return Err(DaveRosterError::TooManyMembers);
+    }
+    users
+        .iter()
+        .map(|user| {
+            user.as_str()
+                .and_then(|user| user.parse::<u64>().ok())
+                .ok_or(DaveRosterError::Malformed)
+        })
+        .collect()
 }
 
 #[cfg(fuzzing)]
@@ -1076,14 +1100,17 @@ async fn run_session(
                                 store.resume_succeeded(phase);
                             }
                             12 => {
-                                let Some(users) = data.get("user_ids").and_then(Value::as_array) else {
-                                    return SessionOutcome::Fatal(protocol_error(store.generation()));
-                                };
-                                let users = users.iter().map(|user| {
-                                    user.as_str().and_then(|user| user.parse::<u64>().ok())
-                                }).collect::<Option<Vec<_>>>();
-                                let Some(users) = users else {
-                                    return SessionOutcome::Fatal(protocol_error(store.generation()));
+                                let users = match decode_dave_roster(
+                                    &data,
+                                    config.limits.dave_roster_members(),
+                                ) {
+                                    Ok(users) => users,
+                                    Err(DaveRosterError::Malformed) => {
+                                        return SessionOutcome::Fatal(protocol_error(store.generation()));
+                                    }
+                                    Err(DaveRosterError::TooManyMembers) => {
+                                        return SessionOutcome::Fatal(resource_error(store.generation()));
+                                    }
                                 };
                                 if dave.is_some()
                                     && let Err(error) = run_dave_control(
@@ -1982,6 +2009,30 @@ mod tests {
                     &json!({"protocol_version": 1, "epoch": invalid_epoch})
                 )
                 .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn dave_roster_decoder_bounds_cardinality_before_parsing() {
+        assert_eq!(
+            decode_dave_roster(&json!({"user_ids": ["1", "2"]}), 2),
+            Ok(vec![1, 2])
+        );
+        assert_eq!(
+            decode_dave_roster(&json!({"user_ids": ["1", "2", "invalid"]}), 2),
+            Err(DaveRosterError::TooManyMembers)
+        );
+        for malformed in [
+            json!({}),
+            json!({"user_ids": null}),
+            json!({"user_ids": "1"}),
+            json!({"user_ids": [1]}),
+            json!({"user_ids": ["18446744073709551616"]}),
+        ] {
+            assert_eq!(
+                decode_dave_roster(&malformed, 2),
+                Err(DaveRosterError::Malformed)
             );
         }
     }
@@ -3799,6 +3850,12 @@ mod tests {
             .resource_limits(ResourceLimits::default().with_gateway_command_capacity(0))
             .build()
             .expect_err("zero capacity is rejected");
+        assert_eq!(error.kind(), ErrorKind::InvalidConfiguration);
+
+        let error = Oto::builder()
+            .resource_limits(ResourceLimits::default().with_dave_roster_members(0))
+            .build()
+            .expect_err("zero DAVE roster capacity is rejected");
         assert_eq!(error.kind(), ErrorKind::InvalidConfiguration);
 
         let error = Oto::builder()

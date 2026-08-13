@@ -14,6 +14,7 @@ pub struct ResourceLimits {
     gateway_text_bytes: usize,
     gateway_binary_bytes: usize,
     dave_binary_body_bytes: usize,
+    dave_roster_members: usize,
     gateway_command_capacity: usize,
     event_capacity: usize,
     event_subscriber_capacity: usize,
@@ -29,6 +30,7 @@ impl Default for ResourceLimits {
             gateway_text_bytes: 1_280_000,
             gateway_binary_bytes: 1_280_000,
             dave_binary_body_bytes: 1_048_576,
+            dave_roster_members: 4_096,
             gateway_command_capacity: 32,
             event_capacity: 64,
             event_subscriber_capacity: 8,
@@ -67,6 +69,11 @@ impl ResourceLimits {
             dave_binary_body_bytes
         ),
         (
+            dave_roster_members,
+            with_dave_roster_members,
+            dave_roster_members
+        ),
+        (
             gateway_command_capacity,
             with_gateway_command_capacity,
             gateway_command_capacity
@@ -103,6 +110,7 @@ impl ResourceLimits {
         let all_nonzero = self.gateway_text_bytes > 0
             && self.gateway_binary_bytes > 0
             && self.dave_binary_body_bytes > 0
+            && self.dave_roster_members > 0
             && self.gateway_command_capacity > 0
             && self.event_capacity > 0
             && self.event_subscriber_capacity > 0
