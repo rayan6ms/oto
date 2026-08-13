@@ -735,6 +735,59 @@ mod tests {
     }
 
     #[test]
+    fn transition_zero_executes_immediately_only_when_already_prepared() {
+        let mut new_core = Core::new(7, 9).unwrap();
+        assert!(
+            new_core
+                .control(Control::PrepareTransition {
+                    protocol_version: 1,
+                    id: 0,
+                })
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            new_core.snapshot(),
+            Snapshot {
+                active_version: 0,
+                transition_id: Some(0),
+                ready: false,
+            }
+        );
+        assert!(matches!(
+            new_core.control(Control::ExecuteTransition { id: 0 }),
+            Err(Failure::InvalidState)
+        ));
+        assert!(matches!(
+            new_core.encrypt(b"must remain blocked"),
+            Err(Failure::InvalidState)
+        ));
+
+        let mut ready_core = ready_fixture_core();
+        assert!(
+            ready_core
+                .control(Control::PrepareTransition {
+                    protocol_version: 1,
+                    id: 0,
+                })
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            ready_core.snapshot(),
+            Snapshot {
+                active_version: 1,
+                transition_id: None,
+                ready: true,
+            }
+        );
+        assert_ne!(
+            ready_core.encrypt(b"still encrypted").unwrap(),
+            b"still encrypted"
+        );
+    }
+
+    #[test]
     fn wrong_transition_ids_preserve_the_prepared_transition() {
         let mut core = prepared_fixture_core();
         let prepared = Snapshot {
