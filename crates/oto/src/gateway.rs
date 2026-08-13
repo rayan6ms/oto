@@ -2286,16 +2286,6 @@ mod tests {
         .expect("condition did not become true");
     }
 
-    async fn yield_eventually(label: &str, mut condition: impl FnMut() -> bool) {
-        for _ in 0..20_000 {
-            if condition() {
-                return;
-            }
-            tokio::task::yield_now().await;
-        }
-        panic!("{label} did not become true after bounded scheduler yields");
-    }
-
     #[tokio::test]
     async fn gateway_v8_identify_numbered_heartbeat_ping_and_unknown_payloads() {
         let mut config = FakeVoiceGatewayConfig::local();
@@ -3162,10 +3152,7 @@ mod tests {
             .await
             .expect("second generation is accepted");
         assert_eq!(second.get(), 2);
-        yield_eventually("second generation UDP discovery", || {
-            gateway.udp.capture().len() >= 2
-        })
-        .await;
+        eventually(|| gateway.udp.capture().len() >= 2).await;
 
         let third = connection
             .replace_voice_info(voice_info(&gateway, "generation-three", "token-three"))
@@ -3220,30 +3207,19 @@ mod tests {
             tokio::task::yield_now().await;
         }
         tokio::time::advance(Duration::from_millis(100)).await;
-        for _ in 0..20_000 {
-            if gateway
-                .records()
-                .iter()
-                .any(|record| matches!(record, GatewayRecord::Resume { .. }))
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(
+        // The reconnect performs real TCP/TLS I/O. Resume wall-clock time after
+        // driving the heartbeat timeout so the OS reactor is not starved by an
+        // always-runnable virtual-time polling loop in optimized tests.
+        tokio::time::resume();
+        eventually(|| {
             gateway
                 .records()
                 .iter()
-                .any(|record| matches!(record, GatewayRecord::Resume { .. })),
-            "resume missing; state={:?}, records={:?}",
-            connection.state(),
-            gateway.records()
-        );
-        yield_eventually("resume success", || {
-            connection.state().stats().resume_successes() == 1
+                .any(|record| matches!(record, GatewayRecord::Resume { .. }))
         })
         .await;
-        yield_eventually("post-resume heartbeat", || {
+        eventually(|| connection.state().stats().resume_successes() == 1).await;
+        eventually(|| {
             gateway
                 .records()
                 .iter()
@@ -3252,11 +3228,7 @@ mod tests {
                 >= 2
         })
         .await;
-        tokio::time::advance(Duration::from_millis(4)).await;
-        yield_eventually("delayed ACK RTT", || {
-            connection.state().gateway_rtt().is_some()
-        })
-        .await;
+        eventually(|| connection.state().gateway_rtt().is_some()).await;
         let state = connection.state();
         assert_eq!(state.stats().heartbeat_timeouts(), 1);
         assert_eq!(state.stats().resume_attempts(), 1);
