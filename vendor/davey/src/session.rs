@@ -1042,4 +1042,55 @@ mod oto_conformance_tests {
         assert_eq!(decrypt(&NEW_SECRET, &after).unwrap(), b"after");
         assert!(decrypt(&OLD_SECRET, &after).is_err());
     }
+
+    #[test]
+    fn valid_welcome_joins_generated_key_package_and_stages_sender_ratchet() {
+        let ciphersuite = Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256;
+        let external_signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+        let external_sender = ExternalSender::new(
+            external_signer.public().into(),
+            BasicCredential::new(vec![0, 1, 1, 0]).into(),
+        );
+        let external_sender_bytes = external_sender.tls_serialize_detached().unwrap();
+
+        let mut member = DaveSession::new(NonZeroU16::new(1).unwrap(), 7, 9, None).unwrap();
+        let mut joiner = DaveSession::new(NonZeroU16::new(1).unwrap(), 8, 9, None).unwrap();
+        member.set_external_sender(&external_sender_bytes).unwrap();
+        joiner.set_external_sender(&external_sender_bytes).unwrap();
+
+        let key_package =
+            KeyPackageIn::tls_deserialize_exact_bytes(&joiner.create_key_package().unwrap())
+                .unwrap()
+                .validate(member.provider.crypto(), ProtocolVersion::Mls10)
+                .unwrap();
+        let proposal = ExternalProposal::new_add::<OpenMlsRustCrypto>(
+            key_package,
+            GroupId::from_slice(&9_u64.to_be_bytes()),
+            GroupEpoch::from(0),
+            &external_signer,
+            SenderExtensionIndex::new(0),
+        )
+        .unwrap()
+        .tls_serialize_detached()
+        .unwrap();
+        let proposals = VLBytes::from(proposal).tls_serialize_detached().unwrap();
+        let response = member
+            .process_proposals(ProposalsOperationType::APPEND, &proposals, Some(&[7, 8]))
+            .unwrap()
+            .expect("add proposal creates commit and welcome");
+
+        joiner
+            .process_welcome(&response.welcome.expect("add commit includes welcome"))
+            .unwrap();
+        assert!(!joiner.is_ready());
+        assert!(matches!(
+            joiner.encrypt_opus(b"before execute"),
+            Err(EncryptError::NotReady)
+        ));
+
+        joiner.execute_transition().unwrap();
+        assert!(joiner.is_ready());
+        let encrypted = joiner.encrypt_opus(b"after execute").unwrap();
+        assert_ne!(encrypted.as_ref(), b"after execute");
+    }
 }
