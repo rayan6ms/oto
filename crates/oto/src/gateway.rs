@@ -17,6 +17,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_tls_with_
 use crate::audio::InstalledTransport;
 use crate::config::Config;
 use crate::connection::StateStore;
+use crate::dave::{self, Control as DaveControl, Outbound as DaveOutbound};
 use crate::error::{Error, ErrorKind, Operation, RetryDisposition};
 use crate::model::{CloseReason, ConnectionGeneration, ConnectionPhase, VoiceConnectInfo};
 use crate::transport::{
@@ -199,6 +200,7 @@ struct UdpTransport {
     selected_mode: TransportMode,
     encoder: Option<TransportEncoder>,
     dave_protocol_version: u16,
+    dave: Option<dave::Handle>,
     session_ready: bool,
 }
 
@@ -223,6 +225,7 @@ pub(crate) async fn run(
     let mut reconnect_attempts = 0_u8;
     let mut transport = None;
     let mut audio_attachment = None;
+    let mut dave = None;
 
     'control: loop {
         if *shutdown.borrow() {
@@ -284,6 +287,7 @@ pub(crate) async fn run(
                                 info = replacement;
                                 latest_sequence = None;
                                 transport = None;
+                                dave = None;
                                 reconnect_attempts = 0;
                                 attempt = Attempt::Identify;
                                 continue 'control;
@@ -350,6 +354,7 @@ pub(crate) async fn run(
                                     reconnect_attempts = 0;
                                     attempt = Attempt::Identify;
                                     transport = None;
+                                    dave = None;
                                 }
                                 BackoffOutcome::Shutdown => {
                                     finish_shutdown(&mut store, &mut initial);
@@ -388,6 +393,7 @@ pub(crate) async fn run(
             &mut reconnect_attempts,
             &mut transport,
             &mut audio_attachment,
+            &mut dave,
             &mut commands,
             &mut shutdown,
             &mut store,
@@ -415,6 +421,7 @@ pub(crate) async fn run(
                 } else {
                     latest_sequence = None;
                     transport = None;
+                    dave = None;
                     Attempt::Identify
                 };
                 match backoff_or_command(
@@ -436,6 +443,7 @@ pub(crate) async fn run(
                         reconnect_attempts = 0;
                         attempt = Attempt::Identify;
                         transport = None;
+                        dave = None;
                     }
                     BackoffOutcome::Shutdown => {
                         finish_shutdown(&mut store, &mut initial);
@@ -446,6 +454,7 @@ pub(crate) async fn run(
             SessionOutcome::FreshIdentify => {
                 latest_sequence = None;
                 transport = None;
+                dave = None;
                 reconnect_attempts = reconnect_attempts.saturating_add(1);
                 if reconnect_attempts > MAX_RECONNECT_ATTEMPTS {
                     let error = Error::new(
@@ -478,6 +487,7 @@ pub(crate) async fn run(
                     BackoffOutcome::Replaced => {
                         reconnect_attempts = 0;
                         transport = None;
+                        dave = None;
                     }
                     BackoffOutcome::Shutdown => {
                         finish_shutdown(&mut store, &mut initial);
@@ -489,6 +499,7 @@ pub(crate) async fn run(
                 info = replacement;
                 latest_sequence = None;
                 transport = None;
+                dave = None;
                 reconnect_attempts = 0;
                 attempt = Attempt::Identify;
             }
@@ -500,6 +511,7 @@ pub(crate) async fn run(
                         info = replacement;
                         latest_sequence = None;
                         transport = None;
+                        dave = None;
                         reconnect_attempts = 0;
                         attempt = Attempt::Identify;
                     }
@@ -547,6 +559,7 @@ async fn run_session(
     reconnect_attempts: &mut u8,
     transport: &mut Option<UdpTransport>,
     audio_attachment: &mut Option<(u64, mpsc::Sender<InstalledTransport>)>,
+    dave: &mut Option<dave::Handle>,
     commands: &mut mpsc::Receiver<Command>,
     shutdown: &mut watch::Receiver<bool>,
     store: &mut StateStore,
@@ -723,6 +736,7 @@ async fn run_session(
                     selected_mode: completion.mode,
                     encoder: None,
                     dave_protocol_version: 0,
+                    dave: None,
                     session_ready: false,
                 });
                 if let Err(error) = timed_send(&mut websocket, select).await {
@@ -908,13 +922,37 @@ async fn run_session(
                                     encoder
                                 };
                                 debug_assert_eq!(encoder.mode(), mode);
+                                if description.dave_protocol_version > dave::MAX_PROTOCOL_VERSION {
+                                    return SessionOutcome::Fatal(dave_error(store.generation()));
+                                }
+                                if description.dave_protocol_version != 0 && dave.is_none() {
+                                    *dave = match dave::Handle::spawn(
+                                        info.info.user_id(),
+                                        info.info.channel_id(),
+                                        config.limits.gateway_command_capacity(),
+                                    ) {
+                                        Ok(handle) => Some(handle),
+                                        Err(source) => return SessionOutcome::Fatal(
+                                            dave_error(store.generation()).with_source(source)
+                                        ),
+                                    };
+                                }
+                                if description.dave_protocol_version == 0 {
+                                    *dave = None;
+                                }
                                 active.dave_protocol_version = description.dave_protocol_version;
+                                active.dave = if description.dave_protocol_version != 0 {
+                                    dave.clone()
+                                } else {
+                                    None
+                                };
                                 active.session_ready = true;
                                 let installed = InstalledTransport {
                                     generation: store.generation(),
                                     socket: active.socket.clone(),
                                     encoder,
                                     dave_protocol_version: description.dave_protocol_version,
+                                    dave: active.dave.clone(),
                                 };
                                 if let Some((_, updates)) = audio_attachment.as_ref() {
                                     match deliver_transport(updates, installed).await {
@@ -970,6 +1008,76 @@ async fn run_session(
                                 );
                                 store.resume_succeeded(phase);
                             }
+                            12 => {
+                                let Some(users) = data.get("user_ids").and_then(Value::as_array) else {
+                                    return SessionOutcome::Fatal(protocol_error(store.generation()));
+                                };
+                                let users = users.iter().map(|user| {
+                                    user.as_str().and_then(|user| user.parse::<u64>().ok())
+                                }).collect::<Option<Vec<_>>>();
+                                let Some(users) = users else {
+                                    return SessionOutcome::Fatal(protocol_error(store.generation()));
+                                };
+                                if dave.is_some()
+                                    && let Err(error) = run_dave_control(
+                                        dave, info, config, DaveControl::Roster(users),
+                                        &mut websocket, store.generation(),
+                                    ).await
+                                {
+                                    return SessionOutcome::Fatal(error);
+                                }
+                            }
+                            13 => {
+                                let Some(user) = data.get("user_id").and_then(Value::as_str)
+                                    .and_then(|user| user.parse::<u64>().ok()) else {
+                                    return SessionOutcome::Fatal(protocol_error(store.generation()));
+                                };
+                                if dave.is_some()
+                                    && let Err(error) = run_dave_control(
+                                        dave, info, config, DaveControl::MemberDisconnected(user),
+                                        &mut websocket, store.generation(),
+                                    ).await
+                                {
+                                    return SessionOutcome::Fatal(error);
+                                }
+                            }
+                            21 | 22 | 24 => {
+                                let control = match envelope.op {
+                                    21 => {
+                                        let Some(version) = u16_field(&data, "protocol_version") else {
+                                            return SessionOutcome::Fatal(protocol_error(store.generation()));
+                                        };
+                                        let Some(id) = u16_field(&data, "transition_id") else {
+                                            return SessionOutcome::Fatal(protocol_error(store.generation()));
+                                        };
+                                        DaveControl::PrepareTransition { protocol_version: version, id }
+                                    }
+                                    22 => {
+                                        let Some(id) = u16_field(&data, "transition_id") else {
+                                            return SessionOutcome::Fatal(protocol_error(store.generation()));
+                                        };
+                                        DaveControl::ExecuteTransition { id }
+                                    }
+                                    24 => {
+                                        let Some(version) = u16_field(&data, "protocol_version") else {
+                                            return SessionOutcome::Fatal(protocol_error(store.generation()));
+                                        };
+                                        let Some(epoch) = data.get("epoch").and_then(Value::as_u64) else {
+                                            return SessionOutcome::Fatal(protocol_error(store.generation()));
+                                        };
+                                        DaveControl::PrepareEpoch { protocol_version: version, epoch }
+                                    }
+                                    _ => unreachable!(),
+                                };
+                                if let Err(error) = run_dave_control(
+                                    dave, info, config, control, &mut websocket, store.generation(),
+                                ).await {
+                                    return SessionOutcome::Fatal(error);
+                                }
+                                if dave.as_ref().is_some_and(|handle| handle.snapshot().ready) {
+                                    store.phase_to(ConnectionPhase::Connected);
+                                }
+                            }
                             _ => store.unknown_opcode(),
                         }
                     }
@@ -981,9 +1089,26 @@ async fn run_session(
                             return SessionOutcome::Fatal(protocol_error(store.generation()));
                         }
                         *latest_sequence = Some(Number::from(u16::from_be_bytes([bytes[0], bytes[1]])));
-                        // P08 owns binary DAVE payload handling. P05 only consumes the
-                        // numbered envelope so Resume acknowledges it correctly.
-                        store.unknown_opcode();
+                        let body = &bytes[3..];
+                        if body.len() > config.limits.dave_binary_body_bytes() {
+                            return SessionOutcome::Fatal(resource_error(store.generation()));
+                        }
+                        let control = match bytes[2] {
+                            25 => Some(DaveControl::ExternalSender(body.to_vec())),
+                            27 => Some(DaveControl::Proposals(body.to_vec())),
+                            29 => Some(DaveControl::Commit(body.to_vec())),
+                            30 => Some(DaveControl::Welcome(body.to_vec())),
+                            _ => None,
+                        };
+                        if let Some(control) = control {
+                            if let Err(error) = run_dave_control(
+                                dave, info, config, control, &mut websocket, store.generation(),
+                            ).await {
+                                return SessionOutcome::Fatal(error);
+                            }
+                        } else {
+                            store.unknown_opcode();
+                        }
                     }
                     Message::Close(frame) => {
                         fail_pending_pings(&mut pending_pings, store.generation());
@@ -1058,6 +1183,48 @@ fn speaking_payload(ssrc: u32, speaking: bool) -> Message {
     }))
 }
 
+fn u16_field(data: &Value, field: &str) -> Option<u16> {
+    data.get(field)
+        .and_then(Value::as_u64)
+        .and_then(|value| u16::try_from(value).ok())
+}
+
+async fn run_dave_control(
+    dave: &mut Option<dave::Handle>,
+    info: &ValidatedInfo,
+    config: &Config,
+    control: DaveControl,
+    websocket: &mut ClientWebSocket,
+    generation: ConnectionGeneration,
+) -> Result<(), Error> {
+    if dave.is_none() {
+        *dave = Some(
+            dave::Handle::spawn(
+                info.info.user_id(),
+                info.info.channel_id(),
+                config.limits.gateway_command_capacity(),
+            )
+            .map_err(|source| dave_error(generation).with_source(source))?,
+        );
+    }
+    let actions = dave
+        .as_ref()
+        .expect("DAVE handle initialized")
+        .control(control)
+        .await
+        .map_err(|source| dave_error(generation).with_source(source))?;
+    for action in actions {
+        let message = match action {
+            DaveOutbound::Json { opcode, data } => json_message(json!({"op": opcode, "d": data})),
+            DaveOutbound::Binary(bytes) => Message::Binary(bytes.into()),
+        };
+        timed_send(websocket, message)
+            .await
+            .map_err(|error| error.for_operation_generation(Operation::Connect, generation))?;
+    }
+    Ok(())
+}
+
 fn attach_audio(
     transport: &mut Option<UdpTransport>,
     attachment: &mut Option<(u64, mpsc::Sender<InstalledTransport>)>,
@@ -1085,7 +1252,12 @@ fn attach_audio(
         let _ = reply.send(Err(retrying_error(Operation::StartAudio, generation)));
         return;
     };
-    if active.dave_protocol_version != 0 {
+    if active.dave_protocol_version != 0
+        && !active
+            .dave
+            .as_ref()
+            .is_some_and(|dave| dave.snapshot().ready)
+    {
         let _ = reply.send(Err(Error::new(
             ErrorKind::DaveRequired,
             Operation::StartAudio,
@@ -1111,7 +1283,8 @@ fn attach_audio(
         generation,
         socket: active.socket.clone(),
         encoder,
-        dave_protocol_version: 0,
+        dave_protocol_version: active.dave_protocol_version,
+        dave: active.dave.clone(),
     };
     match reply.send(Ok(installed)) {
         Ok(()) => *attachment = Some((audio_id, updates)),
@@ -1484,6 +1657,17 @@ fn protocol_error(generation: ConnectionGeneration) -> Error {
         RetryDisposition::Fatal,
         None,
         "voice gateway protocol payload was invalid",
+    )
+}
+
+fn dave_error(generation: ConnectionGeneration) -> Error {
+    Error::new(
+        ErrorKind::DaveTransition,
+        Operation::Connect,
+        Some(generation),
+        RetryDisposition::Fatal,
+        None,
+        "DAVE setup or transition failed",
     )
 }
 

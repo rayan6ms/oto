@@ -193,6 +193,14 @@ pub enum GatewayRecord {
     OtherText(Value),
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum DaveClientRecord {
+    KeyPackage(Vec<u8>),
+    CommitWelcome(Vec<u8>),
+    Ready { transition_id: u16 },
+    InvalidCommitWelcome { transition_id: u16 },
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VoiceClose {
     pub code: u16,
@@ -229,6 +237,8 @@ pub enum GatewayCommandError {
     Closed,
     #[error("binary message has {actual} bytes, exceeding maximum {maximum}")]
     MessageTooLarge { actual: usize, maximum: usize },
+    #[error("invalid DAVE proposals operation {operation}")]
+    InvalidDaveOperation { operation: u8 },
 }
 
 #[derive(Debug)]
@@ -402,6 +412,97 @@ impl FakeVoiceGateway {
             .collect()
     }
 
+    #[must_use]
+    pub fn dave_client_records(&self) -> Vec<DaveClientRecord> {
+        self.records()
+            .iter()
+            .filter_map(parse_dave_client_record)
+            .collect()
+    }
+
+    pub fn try_dave_prepare_transition(
+        &self,
+        protocol_version: u16,
+        transition_id: u16,
+    ) -> Result<(), GatewayCommandError> {
+        self.try_dispatch_json(
+            21,
+            json!({
+                "protocol_version": protocol_version,
+                "transition_id": transition_id,
+            }),
+            true,
+        )
+    }
+
+    pub fn try_dave_execute_transition(
+        &self,
+        transition_id: u16,
+    ) -> Result<(), GatewayCommandError> {
+        self.try_dispatch_json(22, json!({"transition_id": transition_id}), true)
+    }
+
+    pub fn try_dave_prepare_epoch(
+        &self,
+        protocol_version: u16,
+        epoch: u64,
+    ) -> Result<(), GatewayCommandError> {
+        self.try_dispatch_json(
+            24,
+            json!({"protocol_version": protocol_version, "epoch": epoch}),
+            true,
+        )
+    }
+
+    pub fn try_dave_external_sender(
+        &self,
+        external_sender: Vec<u8>,
+    ) -> Result<(), GatewayCommandError> {
+        self.try_dispatch_binary(25, external_sender)
+    }
+
+    pub fn try_dave_proposals(
+        &self,
+        operation: u8,
+        proposals: Vec<u8>,
+    ) -> Result<(), GatewayCommandError> {
+        if operation > 1 {
+            return Err(GatewayCommandError::InvalidDaveOperation { operation });
+        }
+        let mut payload = Vec::with_capacity(1 + proposals.len());
+        payload.push(operation);
+        payload.extend_from_slice(&proposals);
+        self.try_dispatch_binary(27, payload)
+    }
+
+    pub fn try_dave_commit(
+        &self,
+        transition_id: u16,
+        commit: Vec<u8>,
+    ) -> Result<(), GatewayCommandError> {
+        self.try_dave_transition_binary(29, transition_id, commit)
+    }
+
+    pub fn try_dave_welcome(
+        &self,
+        transition_id: u16,
+        welcome: Vec<u8>,
+    ) -> Result<(), GatewayCommandError> {
+        self.try_dave_transition_binary(30, transition_id, welcome)
+    }
+
+    fn try_dave_transition_binary(
+        &self,
+        opcode: u8,
+        transition_id: u16,
+        body: Vec<u8>,
+    ) -> Result<(), GatewayCommandError> {
+        let mut payload = Vec::with_capacity(2 + body.len());
+        payload.extend_from_slice(&transition_id.to_be_bytes());
+        payload.extend_from_slice(&body);
+        self.try_dispatch_binary(opcode, payload)
+    }
+
     pub fn try_dispatch_json(
         &self,
         opcode: u8,
@@ -455,6 +556,33 @@ impl FakeVoiceGateway {
         self.shutdown.send_replace(true);
         self.task.await??;
         Ok(())
+    }
+}
+
+fn parse_dave_client_record(record: &GatewayRecord) -> Option<DaveClientRecord> {
+    match record {
+        GatewayRecord::Binary(bytes) => {
+            let (&opcode, body) = bytes.split_first()?;
+            match opcode {
+                26 => Some(DaveClientRecord::KeyPackage(body.to_vec())),
+                28 => Some(DaveClientRecord::CommitWelcome(body.to_vec())),
+                _ => None,
+            }
+        }
+        GatewayRecord::OtherText(value) => {
+            let opcode = value.get("op")?.as_u64()?;
+            let transition_id = value
+                .get("d")?
+                .get("transition_id")?
+                .as_u64()
+                .and_then(|value| u16::try_from(value).ok())?;
+            match opcode {
+                23 => Some(DaveClientRecord::Ready { transition_id }),
+                31 => Some(DaveClientRecord::InvalidCommitWelcome { transition_id }),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 
@@ -939,4 +1067,37 @@ async fn close_decode_error(websocket: &mut ServerWebSocket) {
             reason: "failed to decode payload".into(),
         })))
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dave_client_semantics_decode_only_bounded_client_opcodes() {
+        assert_eq!(
+            parse_dave_client_record(&GatewayRecord::Binary(vec![26, 1, 2])),
+            Some(DaveClientRecord::KeyPackage(vec![1, 2]))
+        );
+        assert_eq!(
+            parse_dave_client_record(&GatewayRecord::Binary(vec![28, 3, 4])),
+            Some(DaveClientRecord::CommitWelcome(vec![3, 4]))
+        );
+        assert_eq!(
+            parse_dave_client_record(&GatewayRecord::OtherText(
+                json!({"op": 23, "d": {"transition_id": 7}})
+            )),
+            Some(DaveClientRecord::Ready { transition_id: 7 })
+        );
+        assert_eq!(
+            parse_dave_client_record(&GatewayRecord::OtherText(
+                json!({"op": 31, "d": {"transition_id": 9}})
+            )),
+            Some(DaveClientRecord::InvalidCommitWelcome { transition_id: 9 })
+        );
+        assert_eq!(
+            parse_dave_client_record(&GatewayRecord::Binary(vec![99, 1])),
+            None
+        );
+    }
 }

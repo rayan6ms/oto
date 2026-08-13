@@ -9,6 +9,7 @@ static TEST_ALLOCATOR: &stats_alloc::StatsAlloc<std::alloc::System> =
 mod audio;
 mod config;
 mod connection;
+mod dave;
 mod error;
 mod gateway;
 mod model;

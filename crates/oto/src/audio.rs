@@ -7,6 +7,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, timeout};
 
+use crate::dave;
 use crate::error::{Error, ErrorKind, Operation, RetryDisposition};
 use crate::gateway::Command as GatewayCommand;
 use crate::model::{
@@ -95,6 +96,7 @@ pub(crate) struct InstalledTransport {
     pub(crate) socket: Arc<tokio::net::UdpSocket>,
     pub(crate) encoder: TransportEncoder,
     pub(crate) dave_protocol_version: u16,
+    pub(crate) dave: Option<dave::Handle>,
 }
 
 impl std::fmt::Debug for InstalledTransport {
@@ -672,7 +674,12 @@ impl Executor {
         };
         self.pause_timeline().await?;
         self.speaking = false;
-        if update.dave_protocol_version != 0 {
+        if update.dave_protocol_version != 0
+            && !update
+                .dave
+                .as_ref()
+                .is_some_and(|dave| dave.snapshot().ready)
+        {
             self.transport = Some(update);
             return Err(audio_error(
                 ErrorKind::DaveRequired,
@@ -742,13 +749,28 @@ impl Executor {
     }
 
     async fn send_payload(&mut self, len: usize, silence: bool) -> Result<SendOutcome, Error> {
+        let dave = self
+            .transport
+            .as_ref()
+            .and_then(|transport| transport.dave.clone());
+        let encrypted = if let Some(dave) = dave {
+            Some(dave.encrypt(&self.frame[..len]).await.map_err(|source| {
+                audio_error(
+                    ErrorKind::DaveTransition,
+                    Operation::StartAudio,
+                    RetryDisposition::Fatal,
+                    "DAVE media encryption failed",
+                )
+                .with_source(source)
+            })?)
+        } else {
+            None
+        };
+        let payload = encrypted.as_deref().unwrap_or(&self.frame[..len]);
         let Some(transport) = self.transport.as_mut() else {
             return Ok(SendOutcome::Renewing);
         };
-        match transport
-            .encoder
-            .encrypt_next(&self.frame[..len], &mut self.packet)
-        {
+        match transport.encoder.encrypt_next(payload, &mut self.packet) {
             Ok(()) => {}
             Err(TransportCryptoFailure::NonceExhausted) => {
                 self.request_renewal().await?;
@@ -978,6 +1000,7 @@ mod tests {
                 socket: Arc::new(socket),
                 encoder,
                 dave_protocol_version: 0,
+                dave: None,
             },
             transport_updates,
             pacer,
