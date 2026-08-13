@@ -197,6 +197,9 @@ fn decode_dave_binary_envelope(
     if dave_binary_min_body_bytes(bytes[2]).is_some_and(|minimum| body.len() < minimum) {
         return Err(DaveBinaryEnvelopeError::Malformed);
     }
+    if bytes[2] == 27 && !matches!(body[0], 0 | 1) {
+        return Err(DaveBinaryEnvelopeError::Malformed);
+    }
     let control = match bytes[2] {
         25 => Some(DaveControl::ExternalSender(body.to_vec())),
         27 => Some(DaveControl::Proposals(body.to_vec())),
@@ -251,8 +254,11 @@ pub(crate) fn fuzz_dave_binary_envelope(input: &[u8]) {
                 assert!(
                     input.len() < 3
                         || (exact_body <= maximum
-                            && dave_binary_min_body_bytes(input[2])
-                                .is_some_and(|minimum| exact_body < minimum))
+                            && (dave_binary_min_body_bytes(input[2])
+                                .is_some_and(|minimum| exact_body < minimum)
+                                || (input[2] == 27
+                                    && exact_body >= 2
+                                    && !matches!(input[3], 0 | 1))))
                 );
             }
             Err(DaveBinaryEnvelopeError::BodyTooLarge) => {
@@ -264,6 +270,7 @@ pub(crate) fn fuzz_dave_binary_envelope(input: &[u8]) {
                     dave_binary_min_body_bytes(input[2])
                         .is_none_or(|minimum| exact_body >= minimum)
                 );
+                assert!(input[2] != 27 || matches!(input[3], 0 | 1));
                 assert_eq!(sequence, u16::from_be_bytes([input[0], input[1]]));
                 assert_eq!(control.is_some(), matches!(input[2], 25 | 27 | 29 | 30));
             }
@@ -1948,6 +1955,10 @@ mod tests {
             decode_dave_binary_envelope(&[0, 2, 255, 9], 1),
             Ok((2, None))
         ));
+        for operation in u8::MIN..=u8::MAX {
+            let result = decode_dave_binary_envelope(&[0, 3, 27, operation, 9], 2);
+            assert_eq!(result.is_ok(), matches!(operation, 0 | 1));
+        }
     }
 
     #[test]
