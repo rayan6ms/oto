@@ -173,6 +173,15 @@ enum DaveRosterError {
     TooManyMembers,
 }
 
+fn dave_binary_min_body_bytes(opcode: u8) -> Option<usize> {
+    match opcode {
+        25 => Some(4),
+        27 => Some(2),
+        29 | 30 => Some(3),
+        _ => None,
+    }
+}
+
 fn decode_dave_binary_envelope(
     bytes: &[u8],
     max_body_bytes: usize,
@@ -184,6 +193,9 @@ fn decode_dave_binary_envelope(
     let body = &bytes[3..];
     if body.len() > max_body_bytes {
         return Err(DaveBinaryEnvelopeError::BodyTooLarge);
+    }
+    if dave_binary_min_body_bytes(bytes[2]).is_some_and(|minimum| body.len() < minimum) {
+        return Err(DaveBinaryEnvelopeError::Malformed);
     }
     let control = match bytes[2] {
         25 => Some(DaveControl::ExternalSender(body.to_vec())),
@@ -235,12 +247,23 @@ pub(crate) fn fuzz_dave_binary_envelope(input: &[u8]) {
     let exact_body = input.len().saturating_sub(3);
     for maximum in [0, exact_body.saturating_sub(1), exact_body, 1_048_576] {
         match decode_dave_binary_envelope(input, maximum) {
-            Err(DaveBinaryEnvelopeError::Malformed) => assert!(input.len() < 3),
+            Err(DaveBinaryEnvelopeError::Malformed) => {
+                assert!(
+                    input.len() < 3
+                        || (exact_body <= maximum
+                            && dave_binary_min_body_bytes(input[2])
+                                .is_some_and(|minimum| exact_body < minimum))
+                );
+            }
             Err(DaveBinaryEnvelopeError::BodyTooLarge) => {
                 assert!(input.len() >= 3 && exact_body > maximum);
             }
             Ok((sequence, control)) => {
                 assert!(input.len() >= 3 && exact_body <= maximum);
+                assert!(
+                    dave_binary_min_body_bytes(input[2])
+                        .is_none_or(|minimum| exact_body >= minimum)
+                );
                 assert_eq!(sequence, u16::from_be_bytes([input[0], input[1]]));
                 assert_eq!(control.is_some(), matches!(input[2], 25 | 27 | 29 | 30));
             }
@@ -1934,10 +1957,17 @@ mod tests {
             bytes.extend((0..body_len).map(|index| index as u8));
             for opcode in u8::MIN..=u8::MAX {
                 bytes[2] = opcode;
-                let decoded = decode_dave_binary_envelope(&bytes, body_len)
-                    .expect("exact body bound is always structurally valid");
-                assert_eq!(decoded.0, 0xA55A);
-                assert_eq!(decoded.1.is_some(), matches!(opcode, 25 | 27 | 29 | 30));
+                if dave_binary_min_body_bytes(opcode).is_some_and(|minimum| body_len < minimum) {
+                    assert!(matches!(
+                        decode_dave_binary_envelope(&bytes, body_len),
+                        Err(DaveBinaryEnvelopeError::Malformed)
+                    ));
+                } else {
+                    let decoded = decode_dave_binary_envelope(&bytes, body_len)
+                        .expect("exact body bound accepts complete opcode payloads");
+                    assert_eq!(decoded.0, 0xA55A);
+                    assert_eq!(decoded.1.is_some(), matches!(opcode, 25 | 27 | 29 | 30));
+                }
 
                 if body_len > 0 {
                     assert!(matches!(
