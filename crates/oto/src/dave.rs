@@ -910,6 +910,57 @@ mod tests {
     }
 
     #[test]
+    fn later_epoch_retains_old_sender_until_new_transition_is_prepared() {
+        let mut core = ready_fixture_core();
+        assert_ne!(core.encrypt(b"before epoch").unwrap(), b"before epoch");
+
+        assert!(
+            core.control(Control::PrepareEpoch {
+                protocol_version: 1,
+                epoch: 2,
+            })
+            .unwrap()
+            .is_empty()
+        );
+        assert_eq!(
+            core.snapshot(),
+            Snapshot {
+                active_version: 1,
+                transition_id: None,
+                ready: true,
+            }
+        );
+        assert_ne!(
+            core.encrypt(b"old sender remains").unwrap(),
+            b"old sender remains"
+        );
+
+        assert!(
+            core.control(Control::PrepareTransition {
+                protocol_version: 1,
+                id: 8,
+            })
+            .unwrap()
+            .is_empty()
+        );
+        let pending = Snapshot {
+            active_version: 1,
+            transition_id: Some(8),
+            ready: true,
+        };
+        assert_eq!(core.snapshot(), pending);
+        assert!(matches!(
+            core.control(Control::ExecuteTransition { id: 8 }),
+            Err(Failure::InvalidState)
+        ));
+        assert_eq!(core.snapshot(), pending);
+        assert_ne!(
+            core.encrypt(b"old sender still active").unwrap(),
+            b"old sender still active"
+        );
+    }
+
+    #[test]
     fn malformed_backend_input_is_typed_and_never_ready() {
         let mut core = Core::new(7, 9).unwrap();
         assert!(matches!(
