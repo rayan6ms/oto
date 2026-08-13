@@ -18,3 +18,4 @@ tokio-tungstenite.workspace = true
 [dev-dependencies]
 oto-testkit = { path = "../oto-testkit" }
 rustls.workspace = true
+stats_alloc = "0.1.10"

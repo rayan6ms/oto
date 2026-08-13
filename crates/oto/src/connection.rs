@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -6,6 +6,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
+use crate::audio::{AudioControl, FrameSource, PacedAudioSender, SpawnAudio};
 use crate::config::Config;
 use crate::error::{Error, ErrorKind, Operation, RetryDisposition};
 use crate::gateway::{self, Command};
@@ -22,6 +23,7 @@ pub struct VoiceConnection {
 }
 
 struct Inner {
+    config: Arc<Config>,
     commands: mpsc::Sender<Command>,
     shutdown: watch::Sender<bool>,
     state: watch::Receiver<ConnectionSnapshot>,
@@ -30,6 +32,28 @@ struct Inner {
     event_lagged: Arc<AtomicU64>,
     subscriber_capacity: usize,
     task: Mutex<Option<JoinHandle<()>>>,
+    audio_active: Arc<AtomicBool>,
+    next_audio_id: AtomicU64,
+    audio: Mutex<Option<Arc<AudioControl>>>,
+}
+
+struct AudioReservation {
+    active: Arc<AtomicBool>,
+    committed: bool,
+}
+
+impl AudioReservation {
+    fn commit(mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for AudioReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.active.store(false, Ordering::Release);
+        }
+    }
 }
 
 impl std::fmt::Debug for VoiceConnection {
@@ -74,6 +98,7 @@ impl VoiceConnection {
         let initial = ConnectionSnapshot::initial();
         let (state_tx, state_rx) = watch::channel(initial.clone());
         let (events, _) = broadcast::channel(config.limits.event_capacity());
+        let subscriber_capacity = config.limits.event_subscriber_capacity();
         let (commands, command_rx) = mpsc::channel(config.limits.gateway_command_capacity());
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (initial_tx, initial_rx) = oneshot::channel();
@@ -92,14 +117,18 @@ impl VoiceConnection {
         ));
         let connection = Self {
             inner: Arc::new(Inner {
+                config,
                 commands,
                 shutdown,
                 state: state_rx,
                 events,
                 subscribers: Arc::new(AtomicUsize::new(0)),
                 event_lagged: Arc::new(AtomicU64::new(0)),
-                subscriber_capacity: config.limits.event_subscriber_capacity(),
+                subscriber_capacity,
                 task: Mutex::new(Some(task)),
+                audio_active: Arc::new(AtomicBool::new(false)),
+                next_audio_id: AtomicU64::new(1),
+                audio: Mutex::new(None),
             }),
         };
 
@@ -204,7 +233,125 @@ impl VoiceConnection {
         })
     }
 
+    pub async fn start_audio<S: FrameSource>(&self, source: S) -> Result<PacedAudioSender, Error> {
+        if self
+            .inner
+            .audio_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(Error::new(
+                ErrorKind::ResourceLimit,
+                Operation::StartAudio,
+                Some(self.state().generation()),
+                RetryDisposition::Fatal,
+                None,
+                "a paced audio sender is already attached",
+            ));
+        }
+        let reservation = AudioReservation {
+            active: self.inner.audio_active.clone(),
+            committed: false,
+        };
+        let sender = self.start_audio_reserved(Box::new(source)).await?;
+        reservation.commit();
+        Ok(sender)
+    }
+
+    async fn start_audio_reserved(
+        &self,
+        source: Box<dyn FrameSource>,
+    ) -> Result<PacedAudioSender, Error> {
+        let audio_id = self
+            .inner
+            .next_audio_id
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(1)
+            })
+            .map_err(|_| {
+                Error::new(
+                    ErrorKind::ResourceLimit,
+                    Operation::StartAudio,
+                    Some(self.state().generation()),
+                    RetryDisposition::Fatal,
+                    None,
+                    "audio attachment identifier exhausted",
+                )
+            })?;
+        let pacer = self
+            .inner
+            .config
+            .pacer
+            .register()
+            .await
+            .map_err(|failure| {
+                Error::new(
+                    if failure == crate::pacer::PacerFailure::Overloaded {
+                        ErrorKind::Overloaded
+                    } else {
+                        ErrorKind::Shutdown
+                    },
+                    Operation::StartAudio,
+                    Some(self.state().generation()),
+                    RetryDisposition::Fatal,
+                    None,
+                    "shared pacing coordinator is unavailable",
+                )
+            })?;
+        let (updates, transport_updates) = mpsc::channel(1);
+        let (reply, response) = oneshot::channel();
+        self.send_command(
+            Command::AttachAudio {
+                audio_id,
+                updates,
+                reply,
+            },
+            Operation::StartAudio,
+        )
+        .await?;
+        let transport = response.await.unwrap_or_else(|_| {
+            Err(Error::new(
+                ErrorKind::Shutdown,
+                Operation::StartAudio,
+                Some(self.state().generation()),
+                RetryDisposition::Shutdown,
+                None,
+                "gateway owner stopped before audio attachment completed",
+            ))
+        })?;
+        let control = AudioControl::spawn(SpawnAudio {
+            id: audio_id,
+            source,
+            transport,
+            transport_updates,
+            pacer,
+            gateway_commands: self.inner.commands.clone(),
+            connection_state: self.inner.state.clone(),
+            connection_shutdown: self.inner.shutdown.subscribe(),
+            events: self.inner.events.clone(),
+            command_capacity: self.inner.config.limits.sender_command_capacity(),
+            max_frame_bytes: self.inner.config.limits.encoded_opus_frame_bytes(),
+            max_datagram_bytes: self.inner.config.limits.udp_datagram_bytes(),
+            active: self.inner.audio_active.clone(),
+        });
+        *self
+            .inner
+            .audio
+            .lock()
+            .expect("audio control mutex poisoned") = Some(control.clone());
+        Ok(control.sender())
+    }
+
     pub async fn shutdown(&self) -> Result<ConnectionSnapshot, Error> {
+        let audio = self
+            .inner
+            .audio
+            .lock()
+            .expect("audio control mutex poisoned")
+            .clone();
+        if let Some(audio) = audio {
+            let _ = audio.stop().await;
+        }
         self.inner.shutdown.send_replace(true);
         self.stop_task().await;
         Ok(self.state())
@@ -409,5 +556,28 @@ impl StateStore {
 
     fn commit(&self) {
         self.state.send_replace(self.current.clone());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelled_audio_admission_releases_its_reservation() {
+        let active = Arc::new(AtomicBool::new(true));
+        drop(AudioReservation {
+            active: active.clone(),
+            committed: false,
+        });
+        assert!(!active.load(Ordering::Acquire));
+
+        active.store(true, Ordering::Release);
+        AudioReservation {
+            active: active.clone(),
+            committed: false,
+        }
+        .commit();
+        assert!(active.load(Ordering::Acquire));
     }
 }

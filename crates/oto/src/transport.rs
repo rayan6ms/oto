@@ -260,6 +260,11 @@ impl TransportEncoder {
         self.mode
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_test_nonce_start(&mut self, nonce: u32) {
+        self.next_nonce = Some(nonce);
+    }
+
     // P07 wires this encoder to the paced sender. Keeping packet construction here
     // lets P06 prove the wire and nonce contracts without exposing a raw-send API.
     #[allow(dead_code)]

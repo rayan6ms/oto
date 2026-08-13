@@ -118,6 +118,26 @@ impl ConnectionGeneration {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct SourceGeneration(NonZeroU64);
+
+impl SourceGeneration {
+    pub(crate) const FIRST: Self = Self(NonZeroU64::MIN);
+
+    pub(crate) fn next(self) -> Option<Self> {
+        self.0
+            .get()
+            .checked_add(1)
+            .and_then(NonZeroU64::new)
+            .map(Self)
+    }
+
+    #[must_use]
+    pub fn get(self) -> u64 {
+        self.0.get()
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConnectionPhase {
@@ -144,6 +164,118 @@ pub enum AudioPhase {
     DrainingSilence,
     Stopped,
     Failed,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AudioStats {
+    frames_sent: u64,
+    silence_frames_sent: u64,
+    frames_unavailable: u64,
+    skipped_deadlines: u64,
+    send_failures: u64,
+    source_overruns: u64,
+    max_lateness: Duration,
+}
+
+impl AudioStats {
+    pub(crate) fn from_values(
+        frames_sent: u64,
+        silence_frames_sent: u64,
+        frames_unavailable: u64,
+        skipped_deadlines: u64,
+        send_failures: u64,
+        source_overruns: u64,
+        max_lateness: Duration,
+    ) -> Self {
+        Self {
+            frames_sent,
+            silence_frames_sent,
+            frames_unavailable,
+            skipped_deadlines,
+            send_failures,
+            source_overruns,
+            max_lateness,
+        }
+    }
+    #[must_use]
+    pub fn frames_sent(self) -> u64 {
+        self.frames_sent
+    }
+    #[must_use]
+    pub fn silence_frames_sent(self) -> u64 {
+        self.silence_frames_sent
+    }
+    #[must_use]
+    pub fn frames_unavailable(self) -> u64 {
+        self.frames_unavailable
+    }
+    #[must_use]
+    pub fn skipped_deadlines(self) -> u64 {
+        self.skipped_deadlines
+    }
+    #[must_use]
+    pub fn send_failures(self) -> u64 {
+        self.send_failures
+    }
+    #[must_use]
+    pub fn source_overruns(self) -> u64 {
+        self.source_overruns
+    }
+    #[must_use]
+    pub fn max_lateness(self) -> Duration {
+        self.max_lateness
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioSnapshot {
+    generation: SourceGeneration,
+    phase: AudioPhase,
+    failure: Option<ErrorKind>,
+    stats: AudioStats,
+}
+
+impl AudioSnapshot {
+    pub(crate) fn initial() -> Self {
+        Self {
+            generation: SourceGeneration::FIRST,
+            phase: AudioPhase::WaitingForSource,
+            failure: None,
+            stats: AudioStats::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn generation(&self) -> SourceGeneration {
+        self.generation
+    }
+    #[must_use]
+    pub fn phase(&self) -> AudioPhase {
+        self.phase
+    }
+    #[must_use]
+    pub fn failure(&self) -> Option<ErrorKind> {
+        self.failure
+    }
+    #[must_use]
+    pub fn stats(&self) -> AudioStats {
+        self.stats
+    }
+
+    pub(crate) fn set_generation(&mut self, generation: SourceGeneration) {
+        self.generation = generation;
+        self.failure = None;
+    }
+    pub(crate) fn set_phase(&mut self, phase: AudioPhase) {
+        self.phase = phase;
+    }
+    pub(crate) fn set_failure(&mut self, failure: ErrorKind) {
+        self.failure = Some(failure);
+        self.phase = AudioPhase::Failed;
+    }
+    pub(crate) fn set_stats(&mut self, stats: AudioStats) {
+        self.stats = stats;
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -354,6 +486,10 @@ pub enum ConnectionEvent {
     VoiceInfoReplaced {
         old: ConnectionGeneration,
         new: ConnectionGeneration,
+    },
+    AudioChanged {
+        generation: SourceGeneration,
+        phase: AudioPhase,
     },
     Failure(FailureSnapshot),
     Closed(CloseReason),

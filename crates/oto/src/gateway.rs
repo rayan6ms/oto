@@ -14,6 +14,7 @@ use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_tls_with_config};
 
+use crate::audio::InstalledTransport;
 use crate::config::Config;
 use crate::connection::StateStore;
 use crate::error::{Error, ErrorKind, Operation, RetryDisposition};
@@ -40,6 +41,27 @@ pub(crate) enum Command {
     },
     Ping {
         reply: oneshot::Sender<Result<Duration, Error>>,
+    },
+    AttachAudio {
+        audio_id: u64,
+        updates: mpsc::Sender<InstalledTransport>,
+        reply: oneshot::Sender<Result<InstalledTransport, Error>>,
+    },
+    Speaking {
+        audio_id: u64,
+        generation: ConnectionGeneration,
+        speaking: bool,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
+    RenewTransport {
+        audio_id: u64,
+        generation: ConnectionGeneration,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
+    DetachAudio {
+        audio_id: u64,
+        transport: InstalledTransport,
+        reply: oneshot::Sender<()>,
     },
 }
 
@@ -135,6 +157,7 @@ struct ReadyData {
 struct SessionDescriptionData {
     mode: String,
     secret_key: [u8; 32],
+    dave_protocol_version: u16,
 }
 
 struct DiscoveryCompletion {
@@ -175,11 +198,13 @@ struct UdpTransport {
     ssrc: u32,
     selected_mode: TransportMode,
     encoder: Option<TransportEncoder>,
+    dave_protocol_version: u16,
+    session_ready: bool,
 }
 
 impl UdpTransport {
     fn is_ready(&self) -> bool {
-        self.encoder.is_some()
+        self.session_ready
     }
 }
 
@@ -197,6 +222,7 @@ pub(crate) async fn run(
     let mut heartbeat_nonce = 0_u64;
     let mut reconnect_attempts = 0_u8;
     let mut transport = None;
+    let mut audio_attachment = None;
 
     'control: loop {
         if *shutdown.borrow() {
@@ -266,6 +292,29 @@ pub(crate) async fn run(
                         Some(Command::Ping { reply }) => {
                             let _ = reply.send(Err(retrying_error(Operation::Ping, store.generation())));
                         }
+                        Some(Command::AttachAudio { reply, .. }) => {
+                            let _ = reply.send(Err(retrying_error(
+                                Operation::StartAudio,
+                                store.generation(),
+                            )));
+                        }
+                        Some(Command::Speaking { reply, .. })
+                        | Some(Command::RenewTransport { reply, .. }) => {
+                            let _ = reply.send(Err(retrying_error(
+                                Operation::StartAudio,
+                                store.generation(),
+                            )));
+                        }
+                        Some(Command::DetachAudio { audio_id, transport: returned, reply }) => {
+                            detach_audio(
+                                &mut transport,
+                                &mut audio_attachment,
+                                audio_id,
+                                returned,
+                                store.generation(),
+                            );
+                            let _ = reply.send(());
+                        }
                         None => {
                             finish_shutdown(&mut store, &mut initial);
                             return;
@@ -287,14 +336,15 @@ pub(crate) async fn run(
                             ) {
                                 return;
                             }
-                            match backoff_or_command(
-                                reconnect_attempts,
-                                &mut info,
-                                &mut latest_sequence,
-                                &mut commands,
-                                &mut shutdown,
-                                &mut store,
-                            ).await {
+                            match backoff_or_command(reconnect_attempts, BackoffContext {
+                                info: &mut info,
+                                latest_sequence: &mut latest_sequence,
+                                transport: &mut transport,
+                                audio_attachment: &mut audio_attachment,
+                                commands: &mut commands,
+                                shutdown: &mut shutdown,
+                                store: &mut store,
+                            }).await {
                                 BackoffOutcome::Elapsed => {}
                                 BackoffOutcome::Replaced => {
                                     reconnect_attempts = 0;
@@ -337,6 +387,7 @@ pub(crate) async fn run(
             &mut heartbeat_nonce,
             &mut reconnect_attempts,
             &mut transport,
+            &mut audio_attachment,
             &mut commands,
             &mut shutdown,
             &mut store,
@@ -368,11 +419,15 @@ pub(crate) async fn run(
                 };
                 match backoff_or_command(
                     reconnect_attempts,
-                    &mut info,
-                    &mut latest_sequence,
-                    &mut commands,
-                    &mut shutdown,
-                    &mut store,
+                    BackoffContext {
+                        info: &mut info,
+                        latest_sequence: &mut latest_sequence,
+                        transport: &mut transport,
+                        audio_attachment: &mut audio_attachment,
+                        commands: &mut commands,
+                        shutdown: &mut shutdown,
+                        store: &mut store,
+                    },
                 )
                 .await
                 {
@@ -407,11 +462,15 @@ pub(crate) async fn run(
                 attempt = Attempt::Identify;
                 match backoff_or_command(
                     reconnect_attempts,
-                    &mut info,
-                    &mut latest_sequence,
-                    &mut commands,
-                    &mut shutdown,
-                    &mut store,
+                    BackoffContext {
+                        info: &mut info,
+                        latest_sequence: &mut latest_sequence,
+                        transport: &mut transport,
+                        audio_attachment: &mut audio_attachment,
+                        commands: &mut commands,
+                        shutdown: &mut shutdown,
+                        store: &mut store,
+                    },
                 )
                 .await
                 {
@@ -487,6 +546,7 @@ async fn run_session(
     heartbeat_nonce: &mut u64,
     reconnect_attempts: &mut u8,
     transport: &mut Option<UdpTransport>,
+    audio_attachment: &mut Option<(u64, mpsc::Sender<InstalledTransport>)>,
     commands: &mut mpsc::Receiver<Command>,
     shutdown: &mut watch::Receiver<bool>,
     store: &mut StateStore,
@@ -543,6 +603,67 @@ async fn run_session(
                                 }
                             }
                         }
+                    }
+                    Some(Command::AttachAudio { audio_id, updates, reply }) => {
+                        attach_audio(
+                            transport,
+                            audio_attachment,
+                            audio_id,
+                            updates,
+                            reply,
+                            store.generation(),
+                        );
+                    }
+                    Some(Command::Speaking {
+                        audio_id,
+                        generation,
+                        speaking,
+                        reply,
+                    }) => {
+                        if generation != store.generation()
+                            || audio_attachment.as_ref().map(|active| active.0) != Some(audio_id)
+                        {
+                            let _ = reply.send(Err(superseded_audio_error(store.generation())));
+                            continue;
+                        }
+                        let Some(active) = transport.as_ref().filter(|active| active.is_ready()) else {
+                            let _ = reply.send(Err(retrying_error(
+                                Operation::StartAudio,
+                                store.generation(),
+                            )));
+                            continue;
+                        };
+                        let payload = speaking_payload(active.ssrc, speaking);
+                        match timed_send(&mut websocket, payload).await {
+                            Ok(()) => { let _ = reply.send(Ok(())); }
+                            Err(error) => {
+                                let error = error_for_generation(
+                                    error, Operation::StartAudio, store.generation()
+                                );
+                                let _ = reply.send(Err(error));
+                                return SessionOutcome::Resume;
+                            }
+                        }
+                    }
+                    Some(Command::RenewTransport { audio_id, generation, reply }) => {
+                        if generation != store.generation()
+                            || audio_attachment.as_ref().map(|active| active.0) != Some(audio_id)
+                        {
+                            let _ = reply.send(Err(superseded_audio_error(store.generation())));
+                            continue;
+                        }
+                        let _ = reply.send(Ok(()));
+                        return SessionOutcome::FreshIdentify;
+                    }
+                    Some(Command::DetachAudio { audio_id, transport: returned, reply }) => {
+                        detach_audio(
+                            transport,
+                            audio_attachment,
+                            audio_id,
+                            returned,
+                            store.generation(),
+                        );
+                        let _ = reply.send(());
                     }
                     None => {
                         let _ = timed_close(&mut websocket).await;
@@ -601,6 +722,8 @@ async fn run_session(
                     ssrc: completion.ssrc,
                     selected_mode: completion.mode,
                     encoder: None,
+                    dave_protocol_version: 0,
+                    session_ready: false,
                 });
                 if let Err(error) = timed_send(&mut websocket, select).await {
                     return SessionOutcome::Fatal(error_for_generation(
@@ -742,7 +865,7 @@ async fn run_session(
                                 let Some(active) = transport.as_mut() else {
                                     return SessionOutcome::Fatal(protocol_error(store.generation()));
                                 };
-                                if active.encoder.is_some() {
+                                if active.session_ready {
                                     return SessionOutcome::Fatal(protocol_error(store.generation()));
                                 }
                                 let description: SessionDescriptionData = match serde_json::from_value(data) {
@@ -771,9 +894,45 @@ async fn run_session(
                                         store.generation()
                                     )),
                                 };
+                                #[cfg(test)]
+                                let encoder = {
+                                    let mut encoder = encoder;
+                                    if let Some(nonce) = config
+                                        .transport_nonce_start
+                                        .lock()
+                                        .expect("test transport nonce mutex poisoned")
+                                        .take()
+                                    {
+                                        encoder.set_test_nonce_start(nonce);
+                                    }
+                                    encoder
+                                };
                                 debug_assert_eq!(encoder.mode(), mode);
-                                active.encoder = Some(encoder);
-                                store.phase_to(ConnectionPhase::EstablishingDave);
+                                active.dave_protocol_version = description.dave_protocol_version;
+                                active.session_ready = true;
+                                let installed = InstalledTransport {
+                                    generation: store.generation(),
+                                    socket: active.socket.clone(),
+                                    encoder,
+                                    dave_protocol_version: description.dave_protocol_version,
+                                };
+                                if let Some((_, updates)) = audio_attachment.as_ref() {
+                                    match deliver_transport(updates, installed).await {
+                                        Ok(()) => active.encoder = None,
+                                        Err(returned) => {
+                                            active.encoder = Some(returned.encoder);
+                                            *audio_attachment = None;
+                                        }
+                                    }
+                                } else {
+                                    active.encoder = Some(installed.encoder);
+                                }
+                                let phase = if description.dave_protocol_version == 0 {
+                                    ConnectionPhase::Connected
+                                } else {
+                                    ConnectionPhase::EstablishingDave
+                                };
+                                store.phase_to(phase);
                                 *reconnect_attempts = 0;
                                 if let Some(sender) = initial.take() {
                                     let _ = sender.send(Ok(()));
@@ -797,11 +956,18 @@ async fn run_session(
                             }
                             9 if attempt == Attempt::Resume => {
                                 *reconnect_attempts = 0;
-                                let phase = if transport.as_ref().is_some_and(UdpTransport::is_ready) {
-                                    ConnectionPhase::EstablishingDave
-                                } else {
-                                    ConnectionPhase::EstablishingTransport
-                                };
+                                let phase = transport.as_ref().map_or(
+                                    ConnectionPhase::EstablishingTransport,
+                                    |transport| {
+                                        if !transport.is_ready() {
+                                            ConnectionPhase::EstablishingTransport
+                                        } else if transport.dave_protocol_version == 0 {
+                                            ConnectionPhase::Connected
+                                        } else {
+                                            ConnectionPhase::EstablishingDave
+                                        }
+                                    },
+                                );
                                 store.resume_succeeded(phase);
                             }
                             _ => store.unknown_opcode(),
@@ -879,6 +1045,115 @@ fn select_protocol_payload(public: DiscoveredAddress, mode: TransportMode) -> Me
             }
         }
     }))
+}
+
+fn speaking_payload(ssrc: u32, speaking: bool) -> Message {
+    json_message(json!({
+        "op": 5,
+        "d": {
+            "speaking": if speaking { 1 } else { 0 },
+            "delay": 0,
+            "ssrc": ssrc,
+        }
+    }))
+}
+
+fn attach_audio(
+    transport: &mut Option<UdpTransport>,
+    attachment: &mut Option<(u64, mpsc::Sender<InstalledTransport>)>,
+    audio_id: u64,
+    updates: mpsc::Sender<InstalledTransport>,
+    reply: oneshot::Sender<Result<InstalledTransport, Error>>,
+    generation: ConnectionGeneration,
+) {
+    if attachment
+        .as_ref()
+        .is_some_and(|(_, sender)| !sender.is_closed())
+    {
+        let _ = reply.send(Err(Error::new(
+            ErrorKind::ResourceLimit,
+            Operation::StartAudio,
+            Some(generation),
+            RetryDisposition::Fatal,
+            None,
+            "a paced audio sender is already attached",
+        )));
+        return;
+    }
+    *attachment = None;
+    let Some(active) = transport.as_mut().filter(|active| active.is_ready()) else {
+        let _ = reply.send(Err(retrying_error(Operation::StartAudio, generation)));
+        return;
+    };
+    if active.dave_protocol_version != 0 {
+        let _ = reply.send(Err(Error::new(
+            ErrorKind::DaveRequired,
+            Operation::StartAudio,
+            Some(generation),
+            RetryDisposition::Fatal,
+            None,
+            "DAVE is required before participant media can be sent",
+        )));
+        return;
+    }
+    let Some(encoder) = active.encoder.take() else {
+        let _ = reply.send(Err(Error::new(
+            ErrorKind::ResourceLimit,
+            Operation::StartAudio,
+            Some(generation),
+            RetryDisposition::Fatal,
+            None,
+            "the current transport encoder is already attached",
+        )));
+        return;
+    };
+    let installed = InstalledTransport {
+        generation,
+        socket: active.socket.clone(),
+        encoder,
+        dave_protocol_version: 0,
+    };
+    match reply.send(Ok(installed)) {
+        Ok(()) => *attachment = Some((audio_id, updates)),
+        Err(Ok(returned)) => active.encoder = Some(returned.encoder),
+        Err(Err(_)) => unreachable!("attach reply sends an installed transport"),
+    }
+}
+
+fn detach_audio(
+    transport: &mut Option<UdpTransport>,
+    attachment: &mut Option<(u64, mpsc::Sender<InstalledTransport>)>,
+    audio_id: u64,
+    returned: InstalledTransport,
+    generation: ConnectionGeneration,
+) {
+    if attachment.as_ref().map(|active| active.0) != Some(audio_id) {
+        return;
+    }
+    *attachment = None;
+    let Some(active) = transport.as_mut() else {
+        return;
+    };
+    if returned.generation == generation
+        && active.session_ready
+        && active.encoder.is_none()
+        && Arc::ptr_eq(&active.socket, &returned.socket)
+    {
+        active.encoder = Some(returned.encoder);
+    }
+}
+
+async fn deliver_transport(
+    updates: &mpsc::Sender<InstalledTransport>,
+    installed: InstalledTransport,
+) -> Result<(), InstalledTransport> {
+    match timeout(WRITE_TIMEOUT, updates.reserve()).await {
+        Ok(Ok(permit)) => {
+            permit.send(installed);
+            Ok(())
+        }
+        _ => Err(installed),
+    }
 }
 
 fn drain_udp(transport: &UdpTransport, buffer: &mut [u8]) -> Result<usize, std::io::Error> {
@@ -1058,19 +1333,54 @@ async fn wait_for_replacement(
                         "fresh voice information is required",
                     )));
                 }
+                Command::AttachAudio { reply, .. } => {
+                    let _ = reply.send(Err(Error::new(
+                        ErrorKind::NeedsFreshVoiceInfo,
+                        Operation::StartAudio,
+                        Some(store.generation()),
+                        RetryDisposition::NeedsFreshVoiceInfo,
+                        None,
+                        "fresh voice information is required before audio can start",
+                    )));
+                }
+                Command::Speaking { reply, .. } | Command::RenewTransport { reply, .. } => {
+                    let _ = reply.send(Err(Error::new(
+                        ErrorKind::NeedsFreshVoiceInfo,
+                        Operation::StartAudio,
+                        Some(store.generation()),
+                        RetryDisposition::NeedsFreshVoiceInfo,
+                        None,
+                        "fresh voice information is required for audio lifecycle work",
+                    )));
+                }
+                Command::DetachAudio { reply, .. } => {
+                    let _ = reply.send(());
+                }
             }
         }
     }
 }
 
-async fn backoff_or_command(
-    attempt: u8,
-    info: &mut ValidatedInfo,
-    latest_sequence: &mut Option<Number>,
-    commands: &mut mpsc::Receiver<Command>,
-    shutdown: &mut watch::Receiver<bool>,
-    store: &mut StateStore,
-) -> BackoffOutcome {
+struct BackoffContext<'a> {
+    info: &'a mut ValidatedInfo,
+    latest_sequence: &'a mut Option<Number>,
+    transport: &'a mut Option<UdpTransport>,
+    audio_attachment: &'a mut Option<(u64, mpsc::Sender<InstalledTransport>)>,
+    commands: &'a mut mpsc::Receiver<Command>,
+    shutdown: &'a mut watch::Receiver<bool>,
+    store: &'a mut StateStore,
+}
+
+async fn backoff_or_command(attempt: u8, context: BackoffContext<'_>) -> BackoffOutcome {
+    let BackoffContext {
+        info,
+        latest_sequence,
+        transport,
+        audio_attachment,
+        commands,
+        shutdown,
+        store,
+    } = context;
     let base = 25_u64 << attempt.min(6);
     let mut identity = info.info.server_id() ^ info.info.user_id().rotate_left(17);
     for byte in info.info.session_id().bytes() {
@@ -1100,6 +1410,32 @@ async fn backoff_or_command(
             }
             Some(Command::Ping { reply }) => {
                 let _ = reply.send(Err(retrying_error(Operation::Ping, store.generation())));
+                BackoffOutcome::Elapsed
+            }
+            Some(Command::AttachAudio { reply, .. }) => {
+                let _ = reply.send(Err(retrying_error(
+                    Operation::StartAudio,
+                    store.generation(),
+                )));
+                BackoffOutcome::Elapsed
+            }
+            Some(Command::Speaking { reply, .. })
+            | Some(Command::RenewTransport { reply, .. }) => {
+                let _ = reply.send(Err(retrying_error(
+                    Operation::StartAudio,
+                    store.generation(),
+                )));
+                BackoffOutcome::Elapsed
+            }
+            Some(Command::DetachAudio { audio_id, transport: returned, reply }) => {
+                detach_audio(
+                    transport,
+                    audio_attachment,
+                    audio_id,
+                    returned,
+                    store.generation(),
+                );
+                let _ = reply.send(());
                 BackoffOutcome::Elapsed
             }
             None => BackoffOutcome::Shutdown,
@@ -1191,6 +1527,17 @@ fn transport_crypto_error(generation: ConnectionGeneration) -> Error {
     )
 }
 
+fn superseded_audio_error(generation: ConnectionGeneration) -> Error {
+    Error::new(
+        ErrorKind::Superseded,
+        Operation::StartAudio,
+        Some(generation),
+        RetryDisposition::Fatal,
+        None,
+        "audio lifecycle command belongs to a stale connection generation",
+    )
+}
+
 fn resource_error(generation: ConnectionGeneration) -> Error {
     Error::new(
         ErrorKind::ResourceLimit,
@@ -1271,13 +1618,323 @@ fn finish_shutdown(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::task::{Context, Poll, Waker};
+
     use oto_testkit::{
         FakeUdpServer, FakeUdpServerConfig, FakeVoiceGateway, FakeVoiceGatewayConfig, FaultAction,
-        GatewayCloseStage, GatewayRecord, ManualClock, ScriptedClose, TestTls, VoiceClose,
+        GatewayCloseStage, GatewayRecord, ManualClock, ScriptedClose, TestTls,
+        TransportMode as OracleMode, VoiceClose,
     };
 
     use super::*;
-    use crate::{ConnectionPhase, ErrorKind, EventReceiveError, Oto, ResourceLimits, VoiceToken};
+    use crate::pacer::FRAME_PERIOD;
+    use crate::{
+        AudioPhase, ConnectionPhase, ErrorKind, EventReceiveError, FrameSource, FrameStatus, Oto,
+        PacedAudioSender, ResourceLimits, VoiceConnection, VoiceToken,
+    };
+
+    #[derive(Clone)]
+    struct QueueSourceHandle {
+        state: Arc<Mutex<QueueSourceState>>,
+        polls: Arc<AtomicUsize>,
+    }
+
+    struct QueueSource {
+        state: Arc<Mutex<QueueSourceState>>,
+        polls: Arc<AtomicUsize>,
+    }
+
+    #[derive(Default)]
+    struct QueueSourceState {
+        frames: VecDeque<Vec<u8>>,
+        ended: bool,
+        waker: Option<Waker>,
+    }
+
+    impl QueueSource {
+        fn pair() -> (Self, QueueSourceHandle) {
+            let state = Arc::new(Mutex::new(QueueSourceState::default()));
+            let polls = Arc::new(AtomicUsize::new(0));
+            (
+                Self {
+                    state: state.clone(),
+                    polls: polls.clone(),
+                },
+                QueueSourceHandle { state, polls },
+            )
+        }
+    }
+
+    impl FrameSource for QueueSource {
+        fn poll_frame(&mut self, cx: &mut Context<'_>, output: &mut [u8]) -> Poll<FrameStatus> {
+            self.polls.fetch_add(1, Ordering::Relaxed);
+            let mut state = self.state.lock().expect("queue source mutex poisoned");
+            if let Some(frame) = state.frames.pop_front() {
+                output[..frame.len()].copy_from_slice(&frame);
+                return Poll::Ready(FrameStatus::Frame { len: frame.len() });
+            }
+            if state.ended {
+                return Poll::Ready(FrameStatus::Ended);
+            }
+            state.waker = Some(cx.waker().clone());
+            if let Some(frame) = state.frames.pop_front() {
+                output[..frame.len()].copy_from_slice(&frame);
+                Poll::Ready(FrameStatus::Frame { len: frame.len() })
+            } else if state.ended {
+                Poll::Ready(FrameStatus::Ended)
+            } else {
+                Poll::Pending
+            }
+        }
+    }
+
+    impl QueueSourceHandle {
+        fn push(&self, frame: impl Into<Vec<u8>>) {
+            let waker = {
+                let mut state = self.state.lock().expect("queue source mutex poisoned");
+                state.frames.push_back(frame.into());
+                state.waker.take()
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+
+        fn end(&self) {
+            let waker = {
+                let mut state = self.state.lock().expect("queue source mutex poisoned");
+                state.ended = true;
+                state.waker.take()
+            };
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+
+        fn wake_spurious(&self) {
+            let waker = self
+                .state
+                .lock()
+                .expect("queue source mutex poisoned")
+                .waker
+                .clone();
+            if let Some(waker) = waker {
+                waker.wake();
+            }
+        }
+
+        fn polls(&self) -> usize {
+            self.polls.load(Ordering::Relaxed)
+        }
+    }
+
+    struct SlowSource;
+
+    impl FrameSource for SlowSource {
+        fn poll_frame(&mut self, _cx: &mut Context<'_>, _output: &mut [u8]) -> Poll<FrameStatus> {
+            let started = std::time::Instant::now();
+            while started.elapsed() < Duration::from_millis(5) {
+                std::hint::spin_loop();
+            }
+            Poll::Pending
+        }
+    }
+
+    struct InvalidLengthSource;
+
+    impl FrameSource for InvalidLengthSource {
+        fn poll_frame(&mut self, _cx: &mut Context<'_>, output: &mut [u8]) -> Poll<FrameStatus> {
+            Poll::Ready(FrameStatus::Frame {
+                len: output.len() + 1,
+            })
+        }
+    }
+
+    struct BenchmarkSource {
+        shared: Arc<BenchmarkSourceShared>,
+        slow: bool,
+    }
+
+    #[derive(Clone)]
+    struct BenchmarkSourceHandle {
+        shared: Arc<BenchmarkSourceShared>,
+    }
+
+    struct BenchmarkSourceShared {
+        ready: AtomicBool,
+        waker: Mutex<Option<Waker>>,
+    }
+
+    impl BenchmarkSource {
+        fn pair(slow: bool) -> (Self, BenchmarkSourceHandle) {
+            let shared = Arc::new(BenchmarkSourceShared {
+                ready: AtomicBool::new(false),
+                waker: Mutex::new(None),
+            });
+            (
+                Self {
+                    shared: shared.clone(),
+                    slow,
+                },
+                BenchmarkSourceHandle { shared },
+            )
+        }
+    }
+
+    impl FrameSource for BenchmarkSource {
+        fn poll_frame(&mut self, cx: &mut Context<'_>, output: &mut [u8]) -> Poll<FrameStatus> {
+            if !self.shared.ready.load(Ordering::Acquire) {
+                *self
+                    .shared
+                    .waker
+                    .lock()
+                    .expect("source waker mutex poisoned") = Some(cx.waker().clone());
+                if !self.shared.ready.load(Ordering::Acquire) {
+                    return Poll::Pending;
+                }
+            }
+            if self.slow {
+                let started = std::time::Instant::now();
+                while started.elapsed() < Duration::from_millis(5) {
+                    std::hint::spin_loop();
+                }
+                return Poll::Pending;
+            }
+            output[..4].copy_from_slice(&[0xF8, 0xFF, 0xFE, 0x01]);
+            Poll::Ready(FrameStatus::Frame { len: 4 })
+        }
+    }
+
+    impl BenchmarkSourceHandle {
+        fn activate(&self) {
+            self.shared.ready.store(true, Ordering::Release);
+            if let Some(waker) = self
+                .shared
+                .waker
+                .lock()
+                .expect("source waker mutex poisoned")
+                .take()
+            {
+                waker.wake();
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct BenchmarkPeerTimeline {
+        last: Option<std::time::Instant>,
+        next: Option<std::time::Instant>,
+    }
+
+    struct BenchmarkPeerState {
+        discovery_packets: u64,
+        media_packets: u64,
+        timelines: HashMap<std::net::SocketAddr, BenchmarkPeerTimeline>,
+        lateness_nanos: Vec<u64>,
+        interval_error_nanos: Vec<u64>,
+    }
+
+    struct BenchmarkUdpPeer {
+        local_addr: std::net::SocketAddr,
+        state: Arc<Mutex<BenchmarkPeerState>>,
+        shutdown: watch::Sender<bool>,
+        task: tokio::task::JoinHandle<std::io::Result<()>>,
+    }
+
+    impl BenchmarkUdpPeer {
+        async fn start(senders: usize, sample_capacity: usize) -> Self {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("benchmark UDP peer binds");
+            let local_addr = socket.local_addr().expect("benchmark UDP address");
+            let state = Arc::new(Mutex::new(BenchmarkPeerState {
+                discovery_packets: 0,
+                media_packets: 0,
+                timelines: HashMap::with_capacity(senders + 1),
+                lateness_nanos: Vec::with_capacity(sample_capacity),
+                interval_error_nanos: Vec::with_capacity(sample_capacity),
+            }));
+            let (shutdown, mut shutdown_rx) = watch::channel(false);
+            let task_state = state.clone();
+            let task = tokio::spawn(async move {
+                let mut buffer = [0_u8; 2_048];
+                loop {
+                    tokio::select! {
+                        changed = shutdown_rx.changed() => {
+                            if changed.is_err() || *shutdown_rx.borrow() { return Ok(()); }
+                        }
+                        received = socket.recv_from(&mut buffer) => {
+                            let (bytes, peer) = received?;
+                            if bytes == 74 && buffer[..2] == 1_u16.to_be_bytes() {
+                                let mut response = [0_u8; 74];
+                                response[..2].copy_from_slice(&2_u16.to_be_bytes());
+                                response[2..4].copy_from_slice(&70_u16.to_be_bytes());
+                                response[4..8].copy_from_slice(&buffer[4..8]);
+                                let address = peer.ip().to_string();
+                                response[8..8 + address.len()].copy_from_slice(address.as_bytes());
+                                response[72..].copy_from_slice(&peer.port().to_be_bytes());
+                                socket.send_to(&response, peer).await?;
+                                task_state.lock().expect("benchmark peer mutex poisoned")
+                                    .discovery_packets += 1;
+                                continue;
+                            }
+                            let now = std::time::Instant::now();
+                            let mut state = task_state.lock().expect("benchmark peer mutex poisoned");
+                            state.media_packets += 1;
+                            let timeline = state.timelines.entry(peer).or_default();
+                            let last = timeline.last.replace(now);
+                            let expected = timeline.next.replace(
+                                timeline.next.map_or(now + FRAME_PERIOD, |next| next + FRAME_PERIOD)
+                            );
+                            if let Some(last) = last {
+                                let interval = now.saturating_duration_since(last);
+                                let error = interval.abs_diff(FRAME_PERIOD);
+                                state.interval_error_nanos.push(duration_nanos(error));
+                            }
+                            if let Some(expected) = expected {
+                                state.lateness_nanos.push(duration_nanos(
+                                    now.saturating_duration_since(expected)
+                                ));
+                            }
+                        }
+                    }
+                }
+            });
+            Self {
+                local_addr,
+                state,
+                shutdown,
+                task,
+            }
+        }
+
+        fn reset_measurement(&self) {
+            let mut state = self.state.lock().expect("benchmark peer mutex poisoned");
+            state.media_packets = 0;
+            state.lateness_nanos.clear();
+            state.interval_error_nanos.clear();
+            for timeline in state.timelines.values_mut() {
+                timeline.last = None;
+                timeline.next = None;
+            }
+        }
+
+        async fn shutdown(self) {
+            self.shutdown.send_replace(true);
+            self.task
+                .await
+                .expect("benchmark UDP task joins")
+                .expect("benchmark UDP task succeeds");
+        }
+    }
+
+    fn duration_nanos(duration: Duration) -> u64 {
+        duration.as_nanos().min(u128::from(u64::MAX)) as u64
+    }
 
     struct TestGateway {
         gateway: FakeVoiceGateway,
@@ -1387,10 +2044,7 @@ mod tests {
         assert!(!format!("{info:?}").contains("super-secret-token"));
 
         let connection = oto.connect(info).await.expect("gateway connects");
-        assert_eq!(
-            connection.state().phase(),
-            ConnectionPhase::EstablishingDave
-        );
+        assert_eq!(connection.state().phase(), ConnectionPhase::Connected);
         assert!(connection.ping().await.expect("ping is acknowledged") < Duration::from_secs(1));
 
         gateway
@@ -1515,13 +2169,618 @@ mod tests {
                 .expect("bounded inbound datagram queues");
         }
         eventually(|| connection.state().stats().discarded_udp_datagrams() >= 8).await;
+        assert_eq!(connection.state().phase(), ConnectionPhase::Connected);
+
+        connection.shutdown().await.expect("connection shuts down");
+        gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn paced_sender_waits_for_readiness_then_sends_audio_and_exact_silence_drain() {
+        let gateway = TestGateway::start(FakeVoiceGatewayConfig::local())
+            .await
+            .expect("gateway starts");
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        let connection = oto
+            .connect(voice_info(&gateway, "audio-session", "audio-token"))
+            .await
+            .expect("transport connects");
+        let (source, handle) = QueueSource::pair();
+        let sender = connection
+            .start_audio(source)
+            .await
+            .expect("pending source attaches");
+        let (duplicate_source, _) = QueueSource::pair();
+        assert_eq!(
+            connection
+                .start_audio(duplicate_source)
+                .await
+                .expect_err("one connection admits exactly one sender")
+                .kind(),
+            ErrorKind::ResourceLimit
+        );
+
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(sender.state().phase(), AudioPhase::WaitingForSource);
+        assert_eq!(
+            gateway.udp.capture().len(),
+            1,
+            "discovery is the only UDP packet"
+        );
+        assert!(
+            !gateway
+                .records()
+                .iter()
+                .any(|record| matches!(record, GatewayRecord::Speaking(_)))
+        );
+
+        let before_wake_storm = handle.polls();
+        for _ in 0..100 {
+            handle.wake_spurious();
+        }
+        eventually(|| handle.polls() > before_wake_storm).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            handle.polls() <= before_wake_storm + 8,
+            "coalesced notification bounds a 100-wake storm"
+        );
+        assert_eq!(sender.state().phase(), AudioPhase::WaitingForSource);
+        handle.push(vec![1, 2, 3, 4]);
+        eventually(|| {
+            let stats = sender.state().stats();
+            stats.frames_sent() == 1 && stats.silence_frames_sent() == 5
+        })
+        .await;
+        eventually(|| sender.state().phase() == AudioPhase::WaitingForSource).await;
+        eventually(|| gateway.speaking().len() >= 2).await;
+
+        let speaking: Vec<u64> = gateway
+            .speaking()
+            .iter()
+            .filter_map(|value| value.get("speaking").and_then(Value::as_u64))
+            .collect();
+        assert_eq!(speaking, [1, 0]);
+        let capture = gateway.udp.capture();
+        assert_eq!(capture.len(), 7, "discovery + one media + five silence");
+        let media = gateway
+            .udp
+            .decrypt_captured_transport(1, OracleMode::Aes256GcmRtpSize, &[0x42; 32], 1_275)
+            .expect("media decrypts");
+        assert_eq!(media.payload, [1, 2, 3, 4]);
+        for index in 2..7 {
+            let silence = gateway
+                .udp
+                .decrypt_captured_transport(index, OracleMode::Aes256GcmRtpSize, &[0x42; 32], 1_275)
+                .expect("silence decrypts");
+            assert_eq!(silence.payload, [0xF8, 0xFF, 0xFE]);
+        }
+
+        let idle_polls = handle.polls();
+        sleep(Duration::from_millis(70)).await;
+        assert_eq!(
+            handle.polls(),
+            idle_polls,
+            "idle source has no 20 ms polling"
+        );
+        let stopped = sender.stop().await.expect("sender stops");
+        assert_eq!(stopped.phase(), AudioPhase::Stopped);
+
+        let (second_source, second_handle) = QueueSource::pair();
+        second_handle.end();
+        let second = connection
+            .start_audio(second_source)
+            .await
+            .expect("transport encoder returns for a second sender");
+        eventually(|| second.state().phase() == AudioPhase::Stopped).await;
+        second.stop().await.expect("second sender stops");
+        connection.shutdown().await.expect("connection shuts down");
+        gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn real_audio_resumes_during_silence_drain_then_requires_a_fresh_five_frames() {
+        let gateway = TestGateway::start(FakeVoiceGatewayConfig::local())
+            .await
+            .expect("gateway starts");
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        let connection = oto
+            .connect(voice_info(&gateway, "resume-silence", "audio-token"))
+            .await
+            .expect("transport connects");
+        let (source, handle) = QueueSource::pair();
+        let sender = connection
+            .start_audio(source)
+            .await
+            .expect("source attaches");
+        handle.push(vec![1, 2, 3]);
+        eventually(|| sender.state().stats().silence_frames_sent() >= 2).await;
+        let interrupted_silence = sender.state().stats().silence_frames_sent();
+        assert!(interrupted_silence < 5, "source resumes before drain ends");
+        handle.push(vec![7, 8, 9]);
+        eventually(|| {
+            let stats = sender.state().stats();
+            stats.frames_sent() == 2
+                && stats.silence_frames_sent() == interrupted_silence + 5
+                && sender.state().phase() == AudioPhase::WaitingForSource
+        })
+        .await;
+        eventually(|| gateway.speaking().len() >= 2).await;
+        let expected_packets = 1 + 2 + interrupted_silence as usize + 5;
+        eventually(|| gateway.udp.capture().len() >= expected_packets).await;
+        let speaking: Vec<u64> = gateway
+            .speaking()
+            .iter()
+            .filter_map(|value| value.get("speaking").and_then(Value::as_u64))
+            .collect();
+        assert_eq!(speaking, [1, 0], "resume does not flap Speaking");
+
+        let capture = gateway.udp.capture();
+        let second_media_index = interrupted_silence as usize + 2;
+        let second_media = gateway
+            .udp
+            .decrypt_captured_transport(
+                second_media_index,
+                OracleMode::Aes256GcmRtpSize,
+                &[0x42; 32],
+                1_275,
+            )
+            .expect("resumed media decrypts");
+        assert_eq!(second_media.payload, [7, 8, 9]);
+        assert_eq!(
+            capture.len(),
+            expected_packets,
+            "only interrupted silence plus the new five-frame drain is sent"
+        );
+
+        sender.stop().await.expect("sender stops");
+        connection.shutdown().await.expect("connection shuts down");
+        gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn source_replacement_rejects_old_wakes_and_slow_source_isolated_failure() {
+        let gateway = TestGateway::start(FakeVoiceGatewayConfig::local())
+            .await
+            .expect("gateway starts");
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        let connection = oto
+            .connect(voice_info(&gateway, "replace-source", "audio-token"))
+            .await
+            .expect("transport connects");
+        let (old_source, old) = QueueSource::pair();
+        let sender = connection
+            .start_audio(old_source)
+            .await
+            .expect("source attaches");
+        let (new_source, new) = QueueSource::pair();
+        let generation = sender
+            .replace_source(new_source)
+            .await
+            .expect("source replaces");
+        assert_eq!(generation.get(), 2);
+
+        old.push(vec![9, 9, 9]);
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(gateway.udp.capture().len(), 1, "old wake cannot send");
+        new.push(vec![7, 8, 9]);
+        eventually(|| sender.state().stats().frames_sent() == 1).await;
+        let packet = gateway
+            .udp
+            .decrypt_captured_transport(1, OracleMode::Aes256GcmRtpSize, &[0x42; 32], 1_275)
+            .expect("replacement media decrypts");
+        assert_eq!(packet.payload, [7, 8, 9]);
+        sender.stop().await.expect("replacement sender stops");
+
+        let invalid = connection
+            .start_audio(InvalidLengthSource)
+            .await
+            .expect("invalid source attaches before it is polled");
+        eventually(|| invalid.state().phase() == AudioPhase::Failed).await;
+        assert_eq!(
+            invalid.state().failure(),
+            Some(ErrorKind::FrameSourceContract)
+        );
+        sleep(Duration::from_millis(10)).await;
+
+        let slow = connection
+            .start_audio(SlowSource)
+            .await
+            .expect("slow source attaches");
+        eventually(|| slow.state().phase() == AudioPhase::Failed).await;
+        assert_eq!(slow.state().failure(), Some(ErrorKind::FrameSourceContract));
+        assert_eq!(slow.state().stats().source_overruns(), 1);
+        assert_eq!(gateway.udp.capture().len(), 7, "slow source emits no media");
+
+        connection.shutdown().await.expect("connection shuts down");
+        gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn dave_required_transport_refuses_audio_without_plaintext_packet() {
+        let mut config = FakeVoiceGatewayConfig::local();
+        config.dave_protocol_version = 1;
+        let gateway = TestGateway::start(config).await.expect("gateway starts");
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        let connection = oto
+            .connect(voice_info(&gateway, "dave-session", "dave-token"))
+            .await
+            .expect("transport reaches DAVE establishment");
         assert_eq!(
             connection.state().phase(),
             ConnectionPhase::EstablishingDave
         );
+        let (source, handle) = QueueSource::pair();
+        handle.push(vec![1, 2, 3]);
+        let error = connection
+            .start_audio(source)
+            .await
+            .expect_err("nonzero DAVE call cannot start plaintext audio");
+        assert_eq!(error.kind(), ErrorKind::DaveRequired);
+        assert_eq!(gateway.udp.capture().len(), 1);
+        assert!(gateway.speaking().is_empty());
 
         connection.shutdown().await.expect("connection shuts down");
         gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn nonce_exhaustion_renews_the_full_transport_before_another_media_packet() {
+        let gateway = TestGateway::start(FakeVoiceGatewayConfig::local())
+            .await
+            .expect("gateway starts");
+        let oto = Oto::builder()
+            .resource_limits(ResourceLimits::default())
+            .test_tls_config(gateway.tls().client_config())
+            .test_transport_nonce_start(u32::MAX)
+            .build()
+            .expect("test Oto config is valid");
+        let connection = oto
+            .connect(voice_info(&gateway, "nonce-renewal", "nonce-token"))
+            .await
+            .expect("transport connects");
+        let (source, handle) = BenchmarkSource::pair(false);
+        handle.activate();
+        let sender = connection
+            .start_audio(source)
+            .await
+            .expect("source attaches");
+
+        eventually(|| {
+            sender.state().stats().frames_sent() >= 2
+                && gateway
+                    .records()
+                    .iter()
+                    .filter(|record| matches!(record, GatewayRecord::Identify(_)))
+                    .count()
+                    >= 2
+        })
+        .await;
+        eventually(|| gateway.udp.capture().len() >= 4).await;
+        let capture = gateway.udp.capture();
+        assert!(capture.len() >= 4, "two discoveries and two media packets");
+        let first_media = capture
+            .snapshot()
+            .into_iter()
+            .find(|packet| packet.bytes.len() != 74)
+            .expect("first media packet is captured");
+        assert_eq!(
+            &first_media.bytes[first_media.bytes.len() - 4..],
+            &u32::MAX.to_le_bytes(),
+            "the maximum nonce is used exactly once before renewal"
+        );
+
+        sender.stop().await.expect("sender stops");
+        connection.shutdown().await.expect("connection shuts down");
+        gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 28)]
+    #[ignore = "release-only P07 production-path performance gate"]
+    async fn p07_complete_non_dave_path_benchmark() {
+        let sender_count = benchmark_env("OTO_P07_SENDERS", 250);
+        let warmup = Duration::from_millis(benchmark_env("OTO_P07_WARMUP_MS", 1_000) as u64);
+        let measurement = Duration::from_millis(benchmark_env("OTO_P07_MEASURE_MS", 3_000) as u64);
+        let churn_cycles = benchmark_env("OTO_P07_CHURN", 32);
+        assert!(sender_count > 0);
+        let samples = sender_count
+            .saturating_mul((measurement.as_millis() / 20) as usize + 64)
+            .max(1_024);
+        let peer = BenchmarkUdpPeer::start(sender_count + 1, samples).await;
+        let mut gateway_config = FakeVoiceGatewayConfig::local();
+        gateway_config.voice_ip = peer.local_addr.ip().to_string();
+        gateway_config.voice_port = peer.local_addr.port();
+        gateway_config.heartbeat_interval = Duration::from_secs(300);
+        let tls = TestTls::generate().expect("benchmark TLS generates");
+        let mut gateways = Vec::with_capacity(sender_count + 1);
+        for _ in 0..sender_count + 1 {
+            gateways.push(
+                FakeVoiceGateway::start_with_tls(gateway_config.clone(), tls.clone())
+                    .await
+                    .expect("benchmark gateway starts"),
+            );
+        }
+        let oto = test_oto(&gateways[0], ResourceLimits::default());
+        let base_tasks = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+        let baseline_pss_kib = process_pss_kib();
+
+        let connect_started = std::time::Instant::now();
+        let connections =
+            futures_util::future::join_all(gateways.iter().enumerate().map(|(index, gateway)| {
+                let oto = oto.clone();
+                async move {
+                    oto.connect(voice_info(
+                        gateway,
+                        &format!("p07-benchmark-{index}"),
+                        &format!("p07-token-{index}"),
+                    ))
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "benchmark connection establishes: {error:?}; records={:?}",
+                            gateway.records()
+                        )
+                    })
+                }
+            }))
+            .await;
+        let connect_millis = connect_started.elapsed().as_millis();
+        let idle_pss_kib = process_pss_kib();
+        let idle_tasks = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+
+        let mut senders = Vec::with_capacity(sender_count);
+        let mut handles = Vec::with_capacity(sender_count);
+        for connection in connections.iter().take(sender_count) {
+            let (source, handle) = BenchmarkSource::pair(false);
+            senders.push(
+                connection
+                    .start_audio(source)
+                    .await
+                    .expect("pending benchmark source attaches"),
+            );
+            handles.push(handle);
+        }
+        let (slow_source, slow_handle) = BenchmarkSource::pair(true);
+        let slow_sender = connections[sender_count]
+            .start_audio(slow_source)
+            .await
+            .expect("slow benchmark source attaches");
+        let pending_pss_kib = process_pss_kib();
+        let pending_tasks = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+
+        let synchronized_start = std::time::Instant::now();
+        slow_handle.activate();
+        for handle in &handles {
+            handle.activate();
+        }
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let ready = senders
+                    .iter()
+                    .all(|sender| sender.state().stats().frames_sent() >= 5);
+                if ready && slow_sender.state().phase() == AudioPhase::Failed {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all healthy senders start and the slow source is isolated");
+        let synchronized_start_millis = synchronized_start.elapsed().as_millis();
+        assert_eq!(
+            slow_sender.state().failure(),
+            Some(ErrorKind::FrameSourceContract)
+        );
+        sleep(warmup).await;
+
+        let frames_before: Vec<u64> = senders
+            .iter()
+            .map(|sender| sender.state().stats().frames_sent())
+            .collect();
+        peer.reset_measurement();
+        let active_pss_kib = process_pss_kib();
+        let active_tasks = tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks();
+        let cpu_before = process_cpu_ticks();
+        let measured_started = std::time::Instant::now();
+        sleep(measurement).await;
+        let measured_elapsed = measured_started.elapsed();
+        let cpu_ticks = process_cpu_ticks().saturating_sub(cpu_before);
+        let frames_after: Vec<u64> = senders
+            .iter()
+            .map(|sender| sender.state().stats().frames_sent())
+            .collect();
+        let sent_frames: u64 = frames_after
+            .iter()
+            .zip(&frames_before)
+            .map(|(after, before)| after.saturating_sub(*before))
+            .sum();
+        let (udp_packets, mut lateness, mut interval_error) = {
+            let state = peer.state.lock().expect("benchmark peer mutex poisoned");
+            (
+                state.media_packets,
+                state.lateness_nanos.clone(),
+                state.interval_error_nanos.clone(),
+            )
+        };
+        let allocation_frames_before: u64 = senders
+            .iter()
+            .map(|sender| sender.state().stats().frames_sent())
+            .sum();
+        let allocation_deadline =
+            std::time::Instant::now() + measurement.min(Duration::from_secs(1));
+        let allocation_region = stats_alloc::Region::new(crate::TEST_ALLOCATOR);
+        while std::time::Instant::now() < allocation_deadline {
+            tokio::task::yield_now().await;
+        }
+        let allocation = allocation_region.change();
+        let allocation_frames = senders
+            .iter()
+            .map(|sender| sender.state().stats().frames_sent())
+            .sum::<u64>()
+            .saturating_sub(allocation_frames_before);
+        let max_sender_lateness_nanos = senders
+            .iter()
+            .map(|sender| duration_nanos(sender.state().stats().max_lateness()))
+            .max()
+            .unwrap_or(0);
+        let measurement_pss_kib = process_pss_kib();
+        let p99_lateness = percentile(&mut lateness, 990);
+        let p999_lateness = percentile(&mut lateness, 999);
+        let p99_interval_error = percentile(&mut interval_error, 990);
+        let p999_interval_error = percentile(&mut interval_error, 999);
+
+        let churn_started = std::time::Instant::now();
+        for _ in 0..churn_cycles {
+            let (source, handle) = BenchmarkSource::pair(false);
+            handle.activate();
+            senders[0]
+                .replace_source(source)
+                .await
+                .expect("active source churn remains responsive");
+        }
+        let churn_millis = churn_started.elapsed().as_millis();
+
+        let result = serde_json::json!({
+            "schemaVersion": 1,
+            "benchmarkId": "oto-p07-complete-non-dave",
+            "profile": "release",
+            "senders": sender_count,
+            "oneSlowSource": true,
+            "warmupMs": warmup.as_millis(),
+            "measurementMs": measured_elapsed.as_millis(),
+            "connectBatchMs": connect_millis,
+            "synchronizedStartMs": synchronized_start_millis,
+            "churn": {"cycles": churn_cycles, "elapsedMs": churn_millis},
+            "memoryKiB": {
+                "baselinePss": baseline_pss_kib,
+                "idlePss": idle_pss_kib,
+                "pendingPss": pending_pss_kib,
+                "activePss": active_pss_kib,
+                "measurementEndPss": measurement_pss_kib,
+                "idleIncrementPerConnection": idle_pss_kib.saturating_sub(baseline_pss_kib) / sender_count,
+                "pendingIncrementPerSender": pending_pss_kib.saturating_sub(idle_pss_kib) / sender_count,
+                "activeIncrementPerSender": active_pss_kib.saturating_sub(pending_pss_kib) / sender_count
+            },
+            "tasks": {
+                "baseline": base_tasks,
+                "idle": idle_tasks,
+                "pending": pending_tasks,
+                "active": active_tasks,
+                "pacerCoordinators": 4
+            },
+            "cpu": {
+                "processTicks": cpu_ticks,
+                "clockTicksPerSecond": 100,
+                "percentOfOneLogicalCore": cpu_ticks as f64 / 100.0 / measured_elapsed.as_secs_f64() * 100.0
+            },
+            "frames": {
+                "senderCounted": sent_frames,
+                "udpPeerReceived": udp_packets,
+                "measurementBoundaryDifference": sent_frames.abs_diff(udp_packets),
+                "portableUdpSendCallsPerFrame": 1
+            },
+            "allocation": {
+                "allocations": allocation.allocations,
+                "reallocations": allocation.reallocations,
+                "bytesAllocated": allocation.bytes_allocated,
+                "observedFrames": allocation_frames,
+                "allocationsPerFrame": allocation.allocations as f64 / allocation_frames.max(1) as f64
+            },
+            "timingNanos": {
+                "p99Lateness": p99_lateness,
+                "p999Lateness": p999_lateness,
+                "p99IntervalError": p99_interval_error,
+                "p999IntervalError": p999_interval_error,
+                "maxSenderObservedLateness": max_sender_lateness_nanos
+            }
+        });
+        println!("P07_BENCHMARK={result}");
+
+        if sender_count == 1 {
+            assert_eq!(allocation.allocations, 0, "steady normal frames allocate");
+        } else {
+            assert!(
+                allocation.allocations <= allocation_frames as usize / 1_000,
+                "concurrent process allocation noise exceeded the calibrated harness bound"
+            );
+        }
+        assert_eq!(
+            allocation.reallocations, 0,
+            "steady normal frames reallocate"
+        );
+        assert!(udp_packets > 0);
+        if sender_count <= 500 {
+            assert!(
+                sent_frames.abs_diff(udp_packets) <= (sender_count as u64).saturating_mul(2),
+                "measurement-boundary in-flight UDP packets stay bounded by two per sender"
+            );
+        }
+        if sender_count == 250 {
+            assert!(p99_interval_error <= 2_000_000, "p99 interval target");
+            assert!(p999_interval_error <= 5_000_000, "p99.9 interval target");
+        }
+
+        futures_util::future::join_all(senders.iter().map(PacedAudioSender::stop)).await;
+        futures_util::future::join_all(connections.iter().map(VoiceConnection::shutdown)).await;
+        for gateway in gateways {
+            gateway
+                .shutdown()
+                .await
+                .expect("benchmark gateway shuts down");
+        }
+        peer.shutdown().await;
+    }
+
+    fn benchmark_env(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    }
+
+    fn process_pss_kib() -> usize {
+        std::fs::read_to_string("/proc/self/smaps_rollup")
+            .expect("Linux smaps_rollup is readable")
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("Pss:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse()
+                    .ok()
+            })
+            .expect("PSS is present")
+    }
+
+    fn process_cpu_ticks() -> u64 {
+        let stat = std::fs::read_to_string("/proc/self/stat").expect("Linux proc stat is readable");
+        let fields: Vec<&str> = stat[stat.rfind(')').expect("process name terminates") + 1..]
+            .split_whitespace()
+            .collect();
+        fields[11].parse::<u64>().expect("user ticks")
+            + fields[12].parse::<u64>().expect("system ticks")
+    }
+
+    fn percentile(samples: &mut [u64], permille: usize) -> u64 {
+        if samples.is_empty() {
+            return 0;
+        }
+        samples.sort_unstable();
+        let index = (samples.len() - 1).saturating_mul(permille) / 1_000;
+        samples[index]
     }
 
     #[tokio::test]
@@ -1556,7 +2815,7 @@ mod tests {
         assert_eq!(third.get(), 3);
         eventually(|| {
             connection.state().generation() == third
-                && connection.state().phase() == ConnectionPhase::EstablishingDave
+                && connection.state().phase() == ConnectionPhase::Connected
         })
         .await;
 
@@ -1568,10 +2827,7 @@ mod tests {
             tokio::task::yield_now().await;
         }
         assert_eq!(connection.state().generation(), third);
-        assert_eq!(
-            connection.state().phase(),
-            ConnectionPhase::EstablishingDave
-        );
+        assert_eq!(connection.state().phase(), ConnectionPhase::Connected);
 
         connection.shutdown().await.expect("connection shuts down");
         gateway.shutdown().await.expect("gateway shuts down");
@@ -1885,10 +3141,7 @@ mod tests {
         .await;
         sleep(Duration::from_millis(175)).await;
         assert_eq!(connection.state().generation().get(), 3);
-        assert_eq!(
-            connection.state().phase(),
-            ConnectionPhase::EstablishingDave
-        );
+        assert_eq!(connection.state().phase(), ConnectionPhase::Connected);
         assert!(
             !slow
                 .records()
@@ -1935,7 +3188,7 @@ mod tests {
         assert_eq!(generation.get(), 2);
         eventually(|| {
             connection.state().generation() == generation
-                && connection.state().phase() == ConnectionPhase::EstablishingDave
+                && connection.state().phase() == ConnectionPhase::Connected
         })
         .await;
 

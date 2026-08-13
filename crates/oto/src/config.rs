@@ -6,6 +6,7 @@ use rustls::ClientConfig;
 use crate::connection::VoiceConnection;
 use crate::error::{Error, ErrorKind, Operation, RetryDisposition};
 use crate::model::VoiceConnectInfo;
+use crate::pacer::Pacer;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ResourceLimits {
@@ -148,6 +149,8 @@ pub struct OtoBuilder {
     limits: ResourceLimits,
     #[cfg(test)]
     tls_config: Option<Arc<ClientConfig>>,
+    #[cfg(test)]
+    transport_nonce_start: Option<u32>,
 }
 
 impl std::fmt::Debug for OtoBuilder {
@@ -162,8 +165,11 @@ impl std::fmt::Debug for OtoBuilder {
 
 pub(crate) struct Config {
     pub(crate) limits: ResourceLimits,
+    pub(crate) pacer: Pacer,
     #[cfg(test)]
     pub(crate) tls_config: Option<Arc<ClientConfig>>,
+    #[cfg(test)]
+    pub(crate) transport_nonce_start: std::sync::Mutex<Option<u32>>,
 }
 
 impl Oto {
@@ -173,6 +179,8 @@ impl Oto {
             limits: ResourceLimits::default(),
             #[cfg(test)]
             tls_config: None,
+            #[cfg(test)]
+            transport_nonce_start: None,
         }
     }
 
@@ -193,8 +201,11 @@ impl OtoBuilder {
         Ok(Oto {
             config: Arc::new(Config {
                 limits: self.limits,
+                pacer: Pacer::new(),
                 #[cfg(test)]
                 tls_config: self.tls_config,
+                #[cfg(test)]
+                transport_nonce_start: std::sync::Mutex::new(self.transport_nonce_start),
             }),
         })
     }
@@ -202,6 +213,12 @@ impl OtoBuilder {
     #[cfg(test)]
     pub(crate) fn test_tls_config(mut self, config: Arc<ClientConfig>) -> Self {
         self.tls_config = Some(config);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_transport_nonce_start(mut self, nonce: u32) -> Self {
+        self.transport_nonce_start = Some(nonce);
         self
     }
 }
