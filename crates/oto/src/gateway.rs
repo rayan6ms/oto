@@ -2897,6 +2897,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn invalid_dave_commit_and_welcome_recover_with_fresh_packages_end_to_end() {
+        let mut config = FakeVoiceGatewayConfig::local();
+        config.dave_protocol_version = 1;
+        let gateway = TestGateway::start(config).await.expect("gateway starts");
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        let connection = oto
+            .connect(voice_info(&gateway, "dave-recovery", "dave-token"))
+            .await
+            .expect("transport reaches DAVE establishment");
+
+        gateway
+            .try_dave_prepare_transition(1, 8)
+            .expect("first transition queues");
+        gateway
+            .try_dave_commit(8, vec![0])
+            .expect("invalid commit queues");
+        eventually(|| gateway.dave_client_records().len() >= 2).await;
+
+        gateway
+            .try_dave_prepare_transition(1, 9)
+            .expect("replacement transition queues");
+        gateway
+            .try_dave_welcome(9, vec![0])
+            .expect("invalid welcome queues");
+        eventually(|| gateway.dave_client_records().len() >= 4).await;
+
+        let records = gateway.dave_client_records();
+        assert!(matches!(
+            records.as_slice(),
+            [
+                DaveClientRecord::InvalidCommitWelcome { transition_id: 8 },
+                DaveClientRecord::KeyPackage(first),
+                DaveClientRecord::InvalidCommitWelcome { transition_id: 9 },
+                DaveClientRecord::KeyPackage(second),
+            ] if first != second
+        ));
+        assert_eq!(
+            connection.state().phase(),
+            ConnectionPhase::EstablishingDave
+        );
+        assert!(connection.state().failure().is_none());
+
+        connection.shutdown().await.expect("connection shuts down");
+        gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
     async fn dave_resume_retains_session_but_fresh_identify_and_replacement_reset_it() {
         let mut config = FakeVoiceGatewayConfig::local();
         config.dave_protocol_version = 1;
