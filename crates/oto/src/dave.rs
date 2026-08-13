@@ -309,7 +309,9 @@ impl Core {
                 Ok(Vec::new())
             }
             Control::MemberDisconnected(user) => {
-                self.roster.remove(&user);
+                if user != self.user_id {
+                    self.roster.remove(&user);
+                }
                 Ok(Vec::new())
             }
         }
@@ -1174,6 +1176,27 @@ mod tests {
             Err(Failure::Backend)
         ));
         assert!(!core.snapshot().ready);
+    }
+
+    #[test]
+    fn roster_controls_cannot_remove_local_identity() {
+        let mut core = Core::new(FIXTURE_MY_USER_ID, FIXTURE_CHANNEL_ID).unwrap();
+        core.control(Control::Roster(vec![
+            FIXTURE_OTHER_USER_ID,
+            FIXTURE_OTHER_USER_ID,
+        ]))
+        .unwrap();
+        assert_eq!(core.roster.len(), 2);
+        assert!(core.roster.contains(&FIXTURE_MY_USER_ID));
+        assert!(core.roster.contains(&FIXTURE_OTHER_USER_ID));
+
+        core.control(Control::MemberDisconnected(FIXTURE_MY_USER_ID))
+            .unwrap();
+        assert!(core.roster.contains(&FIXTURE_MY_USER_ID));
+
+        core.control(Control::MemberDisconnected(FIXTURE_OTHER_USER_ID))
+            .unwrap();
+        assert_eq!(core.roster, HashSet::from([FIXTURE_MY_USER_ID]));
     }
 
     #[test]
