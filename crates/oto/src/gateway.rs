@@ -189,6 +189,23 @@ fn decode_dave_binary_envelope(
     Ok((sequence, control))
 }
 
+fn decode_dave_json_control(opcode: u64, data: &Value) -> Option<DaveControl> {
+    match opcode {
+        21 => Some(DaveControl::PrepareTransition {
+            protocol_version: u16_field(data, "protocol_version")?,
+            id: u16_field(data, "transition_id")?,
+        }),
+        22 => Some(DaveControl::ExecuteTransition {
+            id: u16_field(data, "transition_id")?,
+        }),
+        24 => Some(DaveControl::PrepareEpoch {
+            protocol_version: u16_field(data, "protocol_version")?,
+            epoch: data.get("epoch")?.as_u64()?,
+        }),
+        _ => None,
+    }
+}
+
 #[cfg(fuzzing)]
 pub(crate) fn fuzz_dave_binary_envelope(input: &[u8]) {
     let exact_body = input.len().saturating_sub(3);
@@ -1092,32 +1109,8 @@ async fn run_session(
                                 }
                             }
                             21 | 22 | 24 => {
-                                let control = match envelope.op {
-                                    21 => {
-                                        let Some(version) = u16_field(&data, "protocol_version") else {
-                                            return SessionOutcome::Fatal(protocol_error(store.generation()));
-                                        };
-                                        let Some(id) = u16_field(&data, "transition_id") else {
-                                            return SessionOutcome::Fatal(protocol_error(store.generation()));
-                                        };
-                                        DaveControl::PrepareTransition { protocol_version: version, id }
-                                    }
-                                    22 => {
-                                        let Some(id) = u16_field(&data, "transition_id") else {
-                                            return SessionOutcome::Fatal(protocol_error(store.generation()));
-                                        };
-                                        DaveControl::ExecuteTransition { id }
-                                    }
-                                    24 => {
-                                        let Some(version) = u16_field(&data, "protocol_version") else {
-                                            return SessionOutcome::Fatal(protocol_error(store.generation()));
-                                        };
-                                        let Some(epoch) = data.get("epoch").and_then(Value::as_u64) else {
-                                            return SessionOutcome::Fatal(protocol_error(store.generation()));
-                                        };
-                                        DaveControl::PrepareEpoch { protocol_version: version, epoch }
-                                    }
-                                    _ => unreachable!(),
+                                let Some(control) = decode_dave_json_control(envelope.op, &data) else {
+                                    return SessionOutcome::Fatal(protocol_error(store.generation()));
                                 };
                                 if let Err(error) = run_dave_control(
                                     dave, info, config, control, &mut websocket, store.generation(),
@@ -1926,6 +1919,70 @@ mod tests {
                     ));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn dave_json_control_decoder_enforces_integer_types_and_widths() {
+        assert!(matches!(
+            decode_dave_json_control(
+                21,
+                &json!({"protocol_version": u16::MAX, "transition_id": u16::MAX})
+            ),
+            Some(DaveControl::PrepareTransition {
+                protocol_version: u16::MAX,
+                id: u16::MAX,
+            })
+        ));
+        assert!(matches!(
+            decode_dave_json_control(22, &json!({"transition_id": 0})),
+            Some(DaveControl::ExecuteTransition { id: 0 })
+        ));
+        assert!(matches!(
+            decode_dave_json_control(24, &json!({"protocol_version": 1, "epoch": u64::MAX})),
+            Some(DaveControl::PrepareEpoch {
+                protocol_version: 1,
+                epoch: u64::MAX,
+            })
+        ));
+        assert!(decode_dave_json_control(20, &json!({})).is_none());
+
+        for invalid_u16 in [
+            Value::Null,
+            json!(-1),
+            json!(1.5),
+            json!(u64::from(u16::MAX) + 1),
+            json!("1"),
+        ] {
+            assert!(
+                decode_dave_json_control(
+                    21,
+                    &json!({"protocol_version": invalid_u16, "transition_id": 1})
+                )
+                .is_none()
+            );
+            assert!(
+                decode_dave_json_control(
+                    21,
+                    &json!({"protocol_version": 1, "transition_id": invalid_u16})
+                )
+                .is_none()
+            );
+            assert!(decode_dave_json_control(22, &json!({"transition_id": invalid_u16})).is_none());
+            assert!(
+                decode_dave_json_control(24, &json!({"protocol_version": invalid_u16, "epoch": 1}))
+                    .is_none()
+            );
+        }
+
+        for invalid_epoch in [Value::Null, json!(-1), json!(1.5), json!("1")] {
+            assert!(
+                decode_dave_json_control(
+                    24,
+                    &json!({"protocol_version": 1, "epoch": invalid_epoch})
+                )
+                .is_none()
+            );
         }
     }
 
