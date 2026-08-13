@@ -1312,15 +1312,29 @@ async fn run_dave_control(
         .await
         .map_err(|source| dave_error(generation).with_source(source))?;
     for action in actions {
-        let message = match action {
-            DaveOutbound::Json { opcode, data } => json_message(json!({"op": opcode, "d": data})),
-            DaveOutbound::Binary(bytes) => Message::Binary(bytes.into()),
-        };
+        let message =
+            dave_outbound_message(action, config.limits.gateway_binary_bytes(), generation)?;
         timed_send(websocket, message)
             .await
             .map_err(|error| error.for_operation_generation(Operation::Connect, generation))?;
     }
     Ok(())
+}
+
+fn dave_outbound_message(
+    action: DaveOutbound,
+    maximum_binary_bytes: usize,
+    generation: ConnectionGeneration,
+) -> Result<Message, Error> {
+    match action {
+        DaveOutbound::Json { opcode, data } => Ok(json_message(json!({"op": opcode, "d": data}))),
+        DaveOutbound::Binary(bytes) => {
+            if bytes.len() > maximum_binary_bytes {
+                return Err(resource_error(generation));
+            }
+            Ok(Message::Binary(bytes.into()))
+        }
+    }
 }
 
 fn attach_audio(
@@ -2076,6 +2090,39 @@ mod tests {
                 Err(DaveRosterError::Malformed)
             );
         }
+    }
+
+    #[test]
+    fn dave_outbound_binary_limit_accepts_edge_and_rejects_one_byte_over() {
+        let exact = dave_outbound_message(
+            DaveOutbound::Binary(vec![26, 1, 2, 3]),
+            4,
+            ConnectionGeneration::FIRST,
+        )
+        .expect("exact outbound binary limit is accepted");
+        assert!(matches!(exact, Message::Binary(bytes) if bytes.as_ref() == [26, 1, 2, 3]));
+
+        let error = dave_outbound_message(
+            DaveOutbound::Binary(vec![26, 1, 2, 3, 4]),
+            4,
+            ConnectionGeneration::FIRST,
+        )
+        .expect_err("one-over outbound binary message is rejected");
+        assert_eq!(error.kind(), ErrorKind::ResourceLimit);
+        assert_eq!(error.operation(), Operation::Connect);
+        assert_eq!(error.generation(), Some(ConnectionGeneration::FIRST));
+
+        assert!(matches!(
+            dave_outbound_message(
+                DaveOutbound::Json {
+                    opcode: 23,
+                    data: json!({"transition_id": 7}),
+                },
+                1,
+                ConnectionGeneration::FIRST,
+            ),
+            Ok(Message::Text(_))
+        ));
     }
 
     #[derive(Default)]
