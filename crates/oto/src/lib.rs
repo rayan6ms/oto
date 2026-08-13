@@ -16,7 +16,7 @@ mod model;
 mod pacer;
 mod transport;
 
-#[cfg(feature = "internal-fuzzing")]
+#[cfg(fuzzing)]
 #[doc(hidden)]
 pub mod __fuzzing {
     pub fn dave_binary_envelope(input: &[u8]) {

@@ -189,7 +189,7 @@ fn decode_dave_binary_envelope(
     Ok((sequence, control))
 }
 
-#[cfg(feature = "internal-fuzzing")]
+#[cfg(fuzzing)]
 pub(crate) fn fuzz_dave_binary_envelope(input: &[u8]) {
     let exact_body = input.len().saturating_sub(3);
     for maximum in [0, exact_body.saturating_sub(1), exact_body, 1_048_576] {

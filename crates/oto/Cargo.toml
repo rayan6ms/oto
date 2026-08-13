@@ -5,9 +5,6 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-[features]
-internal-fuzzing = []
-
 [dependencies]
 aes-gcm.workspace = true
 chacha20poly1305.workspace = true
@@ -23,3 +20,6 @@ tokio-tungstenite.workspace = true
 oto-testkit = { path = "../oto-testkit" }
 rustls.workspace = true
 stats_alloc = "0.1.10"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }

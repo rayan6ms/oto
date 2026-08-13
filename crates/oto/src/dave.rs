@@ -496,17 +496,17 @@ fn guarded<T, E>(operation: impl FnOnce() -> Result<T, E>) -> Result<T, Failure>
         .map_err(|_| Failure::Backend)
 }
 
-#[cfg(any(test, feature = "internal-fuzzing"))]
+#[cfg(any(test, fuzzing))]
 const UPSTREAM_FIXTURES: &str =
     include_str!("../../../vendor/davey/fixtures/upstream_session_fixtures.py");
-#[cfg(any(test, feature = "internal-fuzzing"))]
+#[cfg(any(test, fuzzing))]
 const FIXTURE_MY_USER_ID: u64 = 158_049_329_150_427_136;
-#[cfg(any(test, feature = "internal-fuzzing"))]
+#[cfg(any(test, fuzzing))]
 const FIXTURE_OTHER_USER_ID: u64 = 158_533_742_254_751_744;
-#[cfg(any(test, feature = "internal-fuzzing"))]
+#[cfg(any(test, fuzzing))]
 const FIXTURE_CHANNEL_ID: u64 = 927_310_423_890_473_011;
 
-#[cfg(any(test, feature = "internal-fuzzing"))]
+#[cfg(any(test, fuzzing))]
 fn fixture(name: &str, next_name: &str) -> Vec<u8> {
     let section = UPSTREAM_FIXTURES
         .split_once(name)
@@ -527,7 +527,7 @@ pub(crate) fn test_external_sender_fixture() -> Vec<u8> {
     fixture("EXTERNAL_SENDER", "APPENDING_PROPOSALS")
 }
 
-#[cfg(any(test, feature = "internal-fuzzing"))]
+#[cfg(any(test, fuzzing))]
 fn ready_fixture_core() -> Core {
     let mut core = prepared_fixture_core();
     core.control(Control::ExecuteTransition { id: 7 }).unwrap();
@@ -535,7 +535,7 @@ fn ready_fixture_core() -> Core {
     core
 }
 
-#[cfg(any(test, feature = "internal-fuzzing"))]
+#[cfg(any(test, fuzzing))]
 fn prepared_fixture_core() -> Core {
     let external_sender = fixture("EXTERNAL_SENDER", "APPENDING_PROPOSALS");
     let proposals = fixture("APPENDING_PROPOSALS", "REVOKING_PROPOSALS");
@@ -568,7 +568,7 @@ fn prepared_fixture_core() -> Core {
     core
 }
 
-#[cfg(feature = "internal-fuzzing")]
+#[cfg(fuzzing)]
 pub(crate) fn fuzz_control_sequence(input: &[u8]) {
     if input.len() > 1_048_576 {
         return;
@@ -645,7 +645,7 @@ pub(crate) fn fuzz_control_sequence(input: &[u8]) {
     }
 }
 
-#[cfg(feature = "internal-fuzzing")]
+#[cfg(fuzzing)]
 fn prefix_u16(input: &[u8], offset: usize) -> u16 {
     u16::from_be_bytes([
         input.get(offset).copied().unwrap_or(0),
@@ -653,7 +653,7 @@ fn prefix_u16(input: &[u8], offset: usize) -> u16 {
     ])
 }
 
-#[cfg(feature = "internal-fuzzing")]
+#[cfg(fuzzing)]
 fn prefix_u64(input: &[u8], offset: usize) -> u64 {
     let mut bytes = [0; 8];
     if let Some(available) = input.get(offset..) {
