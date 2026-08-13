@@ -735,6 +735,49 @@ mod tests {
     }
 
     #[test]
+    fn wrong_transition_ids_preserve_the_prepared_transition() {
+        let mut core = prepared_fixture_core();
+        let prepared = Snapshot {
+            active_version: 0,
+            transition_id: Some(7),
+            ready: false,
+        };
+        assert_eq!(core.snapshot(), prepared);
+
+        for rejected in [
+            Control::PrepareTransition {
+                protocol_version: 1,
+                id: 8,
+            },
+            Control::ExecuteTransition { id: 8 },
+            Control::Commit(vec![0, 8, 0]),
+            Control::Welcome(vec![0, 8, 0]),
+        ] {
+            assert!(matches!(core.control(rejected), Err(Failure::InvalidState)));
+            assert_eq!(core.snapshot(), prepared);
+            assert!(matches!(
+                core.encrypt(b"must remain blocked"),
+                Err(Failure::InvalidState)
+            ));
+        }
+
+        assert!(
+            core.control(Control::ExecuteTransition { id: 7 })
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            core.snapshot(),
+            Snapshot {
+                active_version: 1,
+                transition_id: None,
+                ready: true,
+            }
+        );
+        assert_ne!(core.encrypt(b"now encrypted").unwrap(), b"now encrypted");
+    }
+
+    #[test]
     fn valid_external_sender_produces_fresh_bounded_key_packages() {
         let mut core = Core::new(7, 9).unwrap();
         let external_sender = fixture("EXTERNAL_SENDER", "APPENDING_PROPOSALS");
