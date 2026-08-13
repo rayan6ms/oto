@@ -944,6 +944,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_orders_media_across_execute_without_partial_visibility() {
+        let handle = Handle::spawn_core(prepared_fixture_core(), 3);
+        let commands = &handle.inner.commands;
+        let frame = vec![1, 2, 3];
+
+        let (before_reply, mut before_responses) = mpsc::channel(1);
+        commands
+            .send(Command::Encrypt {
+                frame: frame.clone(),
+                len: frame.len(),
+                output: Vec::new(),
+                reply: before_reply,
+            })
+            .await
+            .unwrap();
+
+        let (execute_reply, execute_response) = oneshot::channel();
+        commands
+            .send(Command::Control {
+                control: Control::ExecuteTransition { id: 7 },
+                reply: execute_reply,
+            })
+            .await
+            .unwrap();
+
+        let (after_reply, mut after_responses) = mpsc::channel(1);
+        commands
+            .send(Command::Encrypt {
+                frame: frame.clone(),
+                len: frame.len(),
+                output: Vec::new(),
+                reply: after_reply,
+            })
+            .await
+            .unwrap();
+
+        let before = before_responses.recv().await.unwrap();
+        assert!(matches!(before.result, Err(Failure::InvalidState)));
+        assert!(before.output.is_empty());
+
+        assert!(execute_response.await.unwrap().unwrap().is_empty());
+
+        let after = after_responses.recv().await.unwrap();
+        after.result.unwrap();
+        assert_ne!(after.output, frame);
+        assert_eq!(
+            handle.snapshot(),
+            Snapshot {
+                active_version: 1,
+                transition_id: None,
+                ready: true,
+            }
+        );
+    }
+
+    #[tokio::test]
     #[ignore = "release-only P08 DAVE adapter performance evidence"]
     async fn p08_dave_adapter_benchmark() {
         let sessions = benchmark_env("OTO_P08_SESSIONS", 12).max(1);
