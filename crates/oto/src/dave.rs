@@ -496,17 +496,17 @@ fn guarded<T, E>(operation: impl FnOnce() -> Result<T, E>) -> Result<T, Failure>
         .map_err(|_| Failure::Backend)
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "internal-fuzzing"))]
 const UPSTREAM_FIXTURES: &str =
     include_str!("../../../vendor/davey/fixtures/upstream_session_fixtures.py");
-#[cfg(test)]
+#[cfg(any(test, feature = "internal-fuzzing"))]
 const FIXTURE_MY_USER_ID: u64 = 158_049_329_150_427_136;
-#[cfg(test)]
+#[cfg(any(test, feature = "internal-fuzzing"))]
 const FIXTURE_OTHER_USER_ID: u64 = 158_533_742_254_751_744;
-#[cfg(test)]
+#[cfg(any(test, feature = "internal-fuzzing"))]
 const FIXTURE_CHANNEL_ID: u64 = 927_310_423_890_473_011;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "internal-fuzzing"))]
 fn fixture(name: &str, next_name: &str) -> Vec<u8> {
     let section = UPSTREAM_FIXTURES
         .split_once(name)
@@ -527,7 +527,7 @@ pub(crate) fn test_external_sender_fixture() -> Vec<u8> {
     fixture("EXTERNAL_SENDER", "APPENDING_PROPOSALS")
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "internal-fuzzing"))]
 fn ready_fixture_core() -> Core {
     let mut core = prepared_fixture_core();
     core.control(Control::ExecuteTransition { id: 7 }).unwrap();
@@ -535,7 +535,7 @@ fn ready_fixture_core() -> Core {
     core
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "internal-fuzzing"))]
 fn prepared_fixture_core() -> Core {
     let external_sender = fixture("EXTERNAL_SENDER", "APPENDING_PROPOSALS");
     let proposals = fixture("APPENDING_PROPOSALS", "REVOKING_PROPOSALS");
@@ -566,6 +566,101 @@ fn prepared_fixture_core() -> Core {
     core.control(Control::Commit(announced_commit)).unwrap();
     assert!(!core.snapshot().ready);
     core
+}
+
+#[cfg(feature = "internal-fuzzing")]
+pub(crate) fn fuzz_control_sequence(input: &[u8]) {
+    if input.len() > 1_048_576 {
+        return;
+    }
+    let Some((&initial, mut remaining)) = input.split_first() else {
+        return;
+    };
+    let mut core = match initial % 3 {
+        0 => Core::new(FIXTURE_MY_USER_ID, FIXTURE_CHANNEL_ID)
+            .expect("fixed fuzz identity creates a DAVE session"),
+        1 => prepared_fixture_core(),
+        _ => ready_fixture_core(),
+    };
+    let mut output = Vec::new();
+
+    for _ in 0..64 {
+        let Some((&action, tail)) = remaining.split_first() else {
+            break;
+        };
+        if tail.len() < 2 {
+            break;
+        }
+        let declared = usize::from(u16::from_be_bytes([tail[0], tail[1]]));
+        remaining = &tail[2..];
+        let length = declared.min(remaining.len());
+        let payload = &remaining[..length];
+        remaining = &remaining[length..];
+
+        let _result = match action % 10 {
+            0 => core.control(Control::PrepareTransition {
+                protocol_version: prefix_u16(payload, 0),
+                id: prefix_u16(payload, 2),
+            }),
+            1 => core.control(Control::ExecuteTransition {
+                id: prefix_u16(payload, 0),
+            }),
+            2 => core.control(Control::PrepareEpoch {
+                protocol_version: prefix_u16(payload, 0),
+                epoch: prefix_u64(payload, 2),
+            }),
+            3 => core.control(Control::ExternalSender(payload.to_vec())),
+            4 => core.control(Control::Proposals(payload.to_vec())),
+            5 => core.control(Control::Commit(payload.to_vec())),
+            6 => core.control(Control::Welcome(payload.to_vec())),
+            7 => core.control(Control::Roster(
+                payload
+                    .chunks_exact(8)
+                    .map(|chunk| prefix_u64(chunk, 0))
+                    .collect(),
+            )),
+            8 => core.control(Control::MemberDisconnected(prefix_u64(payload, 0))),
+            _ => {
+                let frame = &payload[..payload.len().min(1_275)];
+                output.clear();
+                let encrypted = core.encrypt_into(frame, &mut output);
+                if encrypted.is_err() {
+                    assert!(output.is_empty());
+                }
+                Ok(Vec::new())
+            }
+        };
+
+        let snapshot = core.snapshot();
+        assert!(snapshot.active_version <= MAX_PROTOCOL_VERSION);
+        assert!(!snapshot.ready || snapshot.active_version == MAX_PROTOCOL_VERSION);
+        if !snapshot.ready {
+            output.clear();
+            assert!(matches!(
+                core.encrypt_into(b"must remain fail-closed", &mut output),
+                Err(Failure::InvalidState)
+            ));
+            assert!(output.is_empty());
+        }
+    }
+}
+
+#[cfg(feature = "internal-fuzzing")]
+fn prefix_u16(input: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes([
+        input.get(offset).copied().unwrap_or(0),
+        input.get(offset + 1).copied().unwrap_or(0),
+    ])
+}
+
+#[cfg(feature = "internal-fuzzing")]
+fn prefix_u64(input: &[u8], offset: usize) -> u64 {
+    let mut bytes = [0; 8];
+    if let Some(available) = input.get(offset..) {
+        let length = available.len().min(bytes.len());
+        bytes[..length].copy_from_slice(&available[..length]);
+    }
+    u64::from_be_bytes(bytes)
 }
 
 #[cfg(test)]

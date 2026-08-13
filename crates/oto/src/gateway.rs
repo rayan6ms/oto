@@ -189,6 +189,24 @@ fn decode_dave_binary_envelope(
     Ok((sequence, control))
 }
 
+#[cfg(feature = "internal-fuzzing")]
+pub(crate) fn fuzz_dave_binary_envelope(input: &[u8]) {
+    let exact_body = input.len().saturating_sub(3);
+    for maximum in [0, exact_body.saturating_sub(1), exact_body, 1_048_576] {
+        match decode_dave_binary_envelope(input, maximum) {
+            Err(DaveBinaryEnvelopeError::Malformed) => assert!(input.len() < 3),
+            Err(DaveBinaryEnvelopeError::BodyTooLarge) => {
+                assert!(input.len() >= 3 && exact_body > maximum);
+            }
+            Ok((sequence, control)) => {
+                assert!(input.len() >= 3 && exact_body <= maximum);
+                assert_eq!(sequence, u16::from_be_bytes([input[0], input[1]]));
+                assert_eq!(control.is_some(), matches!(input[2], 25 | 27 | 29 | 30));
+            }
+        }
+    }
+}
+
 struct DiscoveryCompletion {
     generation: ConnectionGeneration,
     ssrc: u32,

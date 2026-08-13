@@ -16,6 +16,18 @@ mod model;
 mod pacer;
 mod transport;
 
+#[cfg(feature = "internal-fuzzing")]
+#[doc(hidden)]
+pub mod __fuzzing {
+    pub fn dave_binary_envelope(input: &[u8]) {
+        crate::gateway::fuzz_dave_binary_envelope(input);
+    }
+
+    pub fn dave_control_sequence(input: &[u8]) {
+        crate::dave::fuzz_control_sequence(input);
+    }
+}
+
 pub use audio::{FrameSource, FrameStatus, PacedAudioSender};
 pub use config::{Oto, OtoBuilder, ResourceLimits};
 pub use connection::{EventSubscriber, VoiceConnection};
