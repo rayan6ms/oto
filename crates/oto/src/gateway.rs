@@ -2944,6 +2944,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_dave_binary_controls_fail_before_backend_end_to_end() {
+        for (case, opcode, payload) in [
+            ("short-external-sender", 25, vec![1, 2, 3]),
+            ("short-proposals", 27, vec![0]),
+            ("invalid-proposals-operation", 27, vec![2, 9]),
+            ("short-commit", 29, vec![0, 7]),
+            ("short-welcome", 30, vec![0, 7]),
+        ] {
+            let mut config = FakeVoiceGatewayConfig::local();
+            config.dave_protocol_version = 1;
+            let gateway = TestGateway::start(config).await.expect("gateway starts");
+            let oto = test_oto(&gateway, ResourceLimits::default());
+            let connection = oto
+                .connect(voice_info(&gateway, case, "dave-token"))
+                .await
+                .expect("transport reaches DAVE establishment");
+
+            gateway
+                .try_dispatch_binary(opcode, payload)
+                .expect("malformed DAVE control queues");
+            eventually(|| connection.state().phase() == ConnectionPhase::Failed).await;
+
+            let state = connection.state();
+            let failure = state.failure().expect("protocol failure persists");
+            assert_eq!(failure.kind(), ErrorKind::GatewayProtocol, "case {case}");
+            assert_eq!(failure.operation(), Operation::Connect, "case {case}");
+            assert_eq!(
+                failure.retry_disposition(),
+                RetryDisposition::Fatal,
+                "case {case}"
+            );
+            assert!(
+                gateway.dave_client_records().is_empty(),
+                "case {case} must fail before DAVE backend output"
+            );
+
+            gateway.shutdown().await.expect("gateway shuts down");
+        }
+    }
+
+    #[tokio::test]
     async fn dave_resume_retains_session_but_fresh_identify_and_replacement_reset_it() {
         let mut config = FakeVoiceGatewayConfig::local();
         config.dave_protocol_version = 1;
