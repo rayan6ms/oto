@@ -20,7 +20,7 @@ use crate::{
 
 use super::{
     cryptor::{
-        AES_GCM_128_KEY_BYTES, Codec, MediaType,
+        AES_GCM_128_KEY_BYTES, Codec, MediaType, OPUS_ENCRYPTION_BUFFER_OVERHEAD_BYTES,
         decryptor::{DecryptionStats, Decryptor},
         encryptor::{EncryptionStats, Encryptor},
         hash_ratchet::HashRatchet,
@@ -817,33 +817,59 @@ impl DaveSession {
         codec: Codec,
         packet: &'a [u8],
     ) -> Result<Cow<'a, [u8]>, EncryptError> {
+        let mut encrypted_buffer = Vec::new();
+        self.encrypt_into(media_type, codec, packet, &mut encrypted_buffer)?;
+
+        Ok(Cow::Owned(encrypted_buffer))
+    }
+
+    /// End-to-end encrypt a packet into caller-owned reusable storage.
+    pub fn encrypt_into(
+        &mut self,
+        media_type: MediaType,
+        codec: Codec,
+        packet: &[u8],
+        encrypted_buffer: &mut Vec<u8>,
+    ) -> Result<(), EncryptError> {
+        encrypted_buffer.clear();
         if !self.is_ready {
             return Err(EncryptError::NotReady);
         }
 
-        let mut out_size: usize = 0;
-        let mut encrypted_buffer =
-            vec![0u8; Encryptor::get_max_ciphertext_byte_size(codec, packet)];
-
-        let success = self.encryptor.encrypt(
-            &media_type,
-            codec,
-            packet,
-            &mut encrypted_buffer,
-            &mut out_size,
-        );
-        if !success {
+        let maximum = if codec == Codec::OPUS {
+            packet
+                .len()
+                .checked_add(OPUS_ENCRYPTION_BUFFER_OVERHEAD_BYTES)
+                .ok_or(EncryptError::EncryptionFailed)?
+        } else {
+            Encryptor::get_max_ciphertext_byte_size(codec, packet)
+        };
+        encrypted_buffer.resize(maximum, 0);
+        let mut out_size = 0;
+        if !self
+            .encryptor
+            .encrypt(&media_type, codec, packet, encrypted_buffer, &mut out_size)
+        {
+            encrypted_buffer.clear();
             return Err(EncryptError::EncryptionFailed);
         }
-        encrypted_buffer.resize(out_size, 0);
-
-        Ok(Cow::Owned(encrypted_buffer))
+        encrypted_buffer.truncate(out_size);
+        Ok(())
     }
 
     /// End-to-end encrypt an opus packet.
     /// This is the shorthand for `encrypt(MediaType.AUDIO, Codec.OPUS, packet)`
     pub fn encrypt_opus<'a>(&mut self, packet: &'a [u8]) -> Result<Cow<'a, [u8]>, EncryptError> {
         self.encrypt(MediaType::AUDIO, Codec::OPUS, packet)
+    }
+
+    /// End-to-end encrypt an Opus packet into caller-owned reusable storage.
+    pub fn encrypt_opus_into(
+        &mut self,
+        packet: &[u8],
+        encrypted_buffer: &mut Vec<u8>,
+    ) -> Result<(), EncryptError> {
+        self.encrypt_into(MediaType::AUDIO, Codec::OPUS, packet, encrypted_buffer)
     }
 
     /// Get encryption stats.
@@ -977,6 +1003,27 @@ mod oto_conformance_tests {
             decrypt(&OLD_SECRET, &encrypted).unwrap(),
             OPUS_SILENCE_PACKET
         );
+    }
+
+    #[test]
+    fn reusable_opus_output_clears_on_failure_and_reuses_capacity() {
+        let mut session = session();
+        let mut output = vec![0xAA; 32];
+        assert!(matches!(
+            session.encrypt_opus_into(b"not ready", &mut output),
+            Err(EncryptError::NotReady)
+        ));
+        assert!(output.is_empty());
+
+        session.pending_encryptor_ratchet = Some(HashRatchet::new(OLD_SECRET.to_vec()));
+        session.execute_transition().unwrap();
+        let frame = vec![0x55; 1_275];
+        session.encrypt_opus_into(&frame, &mut output).unwrap();
+        assert_eq!(decrypt(&OLD_SECRET, &output).unwrap(), frame);
+        let capacity = output.capacity();
+        session.encrypt_opus_into(&frame, &mut output).unwrap();
+        assert_eq!(output.capacity(), capacity);
+        assert_eq!(decrypt(&OLD_SECRET, &output).unwrap(), frame);
     }
 
     #[test]

@@ -97,6 +97,7 @@ pub(crate) struct InstalledTransport {
     pub(crate) encoder: TransportEncoder,
     pub(crate) dave_protocol_version: u16,
     pub(crate) dave: Option<dave::Handle>,
+    pub(crate) dave_media: Option<dave::MediaEncryptor>,
 }
 
 impl std::fmt::Debug for InstalledTransport {
@@ -378,6 +379,7 @@ struct Executor {
     commands: mpsc::Receiver<AudioCommand>,
     store: AudioStore,
     frame: Vec<u8>,
+    dave_frame: Vec<u8>,
     packet: Vec<u8>,
     speaking: bool,
     active_timeline: bool,
@@ -419,6 +421,7 @@ async fn run_audio(
             counters,
         },
         frame: vec![0; input.max_frame_bytes],
+        dave_frame: Vec::new(),
         packet: Vec::with_capacity(input.max_datagram_bytes),
         speaking: false,
         active_timeline: false,
@@ -433,6 +436,9 @@ async fn run_audio(
         executor.store.phase(AudioPhase::Stopped);
     }
     let _ = executor.pacer.unregister().await;
+    if executor.speaking {
+        let _ = executor.set_speaking(false).await;
+    }
     executor.detach_transport().await;
     input.active.store(false, Ordering::Release);
     let result = match failure {
@@ -749,12 +755,28 @@ impl Executor {
     }
 
     async fn send_payload(&mut self, len: usize, silence: bool) -> Result<SendOutcome, Error> {
-        let dave = self
+        let dave_media = self
             .transport
-            .as_ref()
-            .and_then(|transport| transport.dave.clone());
-        let encrypted = if let Some(dave) = dave {
-            Some(dave.encrypt(&self.frame[..len]).await.map_err(|source| {
+            .as_mut()
+            .and_then(|transport| transport.dave_media.as_mut());
+        let dave_payload = if let Some(dave_media) = dave_media {
+            let frame = std::mem::take(&mut self.frame);
+            let output = std::mem::take(&mut self.dave_frame);
+            let buffers = dave_media
+                .encrypt_buffered(frame, len, output)
+                .await
+                .map_err(|source| {
+                    audio_error(
+                        ErrorKind::DaveTransition,
+                        Operation::StartAudio,
+                        RetryDisposition::Fatal,
+                        "DAVE media encryption owner failed",
+                    )
+                    .with_source(source)
+                })?;
+            self.frame = buffers.frame;
+            self.dave_frame = buffers.output;
+            buffers.result.map_err(|source| {
                 audio_error(
                     ErrorKind::DaveTransition,
                     Operation::StartAudio,
@@ -762,11 +784,12 @@ impl Executor {
                     "DAVE media encryption failed",
                 )
                 .with_source(source)
-            })?)
+            })?;
+            Some(self.dave_frame.as_slice())
         } else {
             None
         };
-        let payload = encrypted.as_deref().unwrap_or(&self.frame[..len]);
+        let payload = dave_payload.unwrap_or(&self.frame[..len]);
         let Some(transport) = self.transport.as_mut() else {
             return Ok(SendOutcome::Renewing);
         };
@@ -952,6 +975,7 @@ mod tests {
     use super::*;
     use crate::pacer::Pacer;
     use crate::transport::TransportMode;
+    use oto_testkit::{TransportMode as OracleMode, decrypt_transport_packet};
 
     struct ReadySource;
 
@@ -962,8 +986,30 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn failed_speaking_write_never_crosses_the_first_udp_packet_barrier() {
+    struct OneFrameSource {
+        frame: Option<Vec<u8>>,
+    }
+
+    impl FrameSource for OneFrameSource {
+        fn poll_frame(&mut self, _cx: &mut Context<'_>, output: &mut [u8]) -> Poll<FrameStatus> {
+            let Some(frame) = self.frame.take() else {
+                return Poll::Ready(FrameStatus::Ended);
+            };
+            output[..frame.len()].copy_from_slice(&frame);
+            Poll::Ready(FrameStatus::Frame { len: frame.len() })
+        }
+    }
+
+    struct MaximumFrameSource;
+
+    impl FrameSource for MaximumFrameSource {
+        fn poll_frame(&mut self, _cx: &mut Context<'_>, output: &mut [u8]) -> Poll<FrameStatus> {
+            output.fill(0x55);
+            Poll::Ready(FrameStatus::Frame { len: output.len() })
+        }
+    }
+
+    async fn connected_udp_pair() -> (tokio::net::UdpSocket, tokio::net::UdpSocket) {
         let sink = tokio::net::UdpSocket::bind("127.0.0.1:0")
             .await
             .expect("UDP sink binds");
@@ -974,6 +1020,21 @@ mod tests {
             .connect(sink.local_addr().expect("sink address"))
             .await
             .expect("UDP sender connects");
+        (sink, socket)
+    }
+
+    fn connected_state() -> (
+        watch::Sender<ConnectionSnapshot>,
+        watch::Receiver<ConnectionSnapshot>,
+    ) {
+        let mut connection = ConnectionSnapshot::initial();
+        connection.set_phase(ConnectionPhase::Connected);
+        watch::channel(connection)
+    }
+
+    #[tokio::test]
+    async fn failed_speaking_write_never_crosses_the_first_udp_packet_barrier() {
+        let (sink, socket) = connected_udp_pair().await;
         let encoder = TransportEncoder::new(
             TransportMode::Aes256GcmRtpSize,
             &[0x42; 32],
@@ -982,13 +1043,12 @@ mod tests {
             2_048,
         )
         .expect("transport encoder initializes");
-        let pacer = Pacer::new().register().await.expect("pacer registers");
+        let pacer_owner = Pacer::new();
+        let pacer = pacer_owner.register().await.expect("pacer registers");
         let (gateway, gateway_rx) = mpsc::channel(1);
         drop(gateway_rx);
         let (_transport_updates, transport_updates) = mpsc::channel(1);
-        let mut connection = ConnectionSnapshot::initial();
-        connection.set_phase(ConnectionPhase::Connected);
-        let (_connection_tx, connection_state) = watch::channel(connection);
+        let (_connection_tx, connection_state) = connected_state();
         let (_connection_shutdown_tx, connection_shutdown) = watch::channel(false);
         let (events, _) = broadcast::channel(8);
         let active = Arc::new(AtomicBool::new(true));
@@ -1001,6 +1061,7 @@ mod tests {
                 encoder,
                 dave_protocol_version: 0,
                 dave: None,
+                dave_media: None,
             },
             transport_updates,
             pacer,
@@ -1029,5 +1090,355 @@ mod tests {
                 .is_err(),
             "no UDP packet may cross a failed Speaking barrier"
         );
+    }
+
+    #[tokio::test]
+    async fn complete_paced_path_dave_encrypts_maximum_opus_and_all_terminal_silence() {
+        const KEY: [u8; 32] = [0x42; 32];
+        let normal_frame = vec![0x55; 1_275];
+        let (sink, socket) = connected_udp_pair().await;
+        let encoder = TransportEncoder::new(
+            TransportMode::Aes256GcmRtpSize,
+            &KEY,
+            7,
+            1_275 + dave::OPUS_MAX_ENCRYPTION_OVERHEAD_BYTES,
+            2_048,
+        )
+        .expect("transport encoder includes DAVE expansion");
+        let dave = dave::Handle::spawn_ready_fixture(8);
+        let dave_media = dave.media_encryptor();
+        let pacer_owner = Pacer::new();
+        let pacer = pacer_owner.register().await.expect("pacer registers");
+        let (gateway, mut gateway_rx) = mpsc::channel(8);
+        let speaking = Arc::new(Mutex::new(Vec::new()));
+        let speaking_observer = speaking.clone();
+        let gateway_task = tokio::spawn(async move {
+            while let Some(command) = gateway_rx.recv().await {
+                match command {
+                    GatewayCommand::Speaking {
+                        speaking, reply, ..
+                    } => {
+                        speaking_observer
+                            .lock()
+                            .expect("speaking record mutex")
+                            .push(speaking);
+                        let _ = reply.send(Ok(()));
+                    }
+                    GatewayCommand::DetachAudio { reply, .. } => {
+                        let _ = reply.send(());
+                        break;
+                    }
+                    _ => panic!("unexpected gateway command in paced DAVE test"),
+                }
+            }
+        });
+        let (transport_updates_tx, transport_updates) = mpsc::channel(1);
+        let (connection_tx, connection_state) = connected_state();
+        let (connection_shutdown_tx, connection_shutdown) = watch::channel(false);
+        let (events, _) = broadcast::channel(8);
+        let active = Arc::new(AtomicBool::new(true));
+        let control = AudioControl::spawn(SpawnAudio {
+            id: 1,
+            source: Box::new(OneFrameSource {
+                frame: Some(normal_frame.clone()),
+            }),
+            transport: InstalledTransport {
+                generation: ConnectionGeneration::FIRST,
+                socket: Arc::new(socket),
+                encoder,
+                dave_protocol_version: 1,
+                dave: Some(dave),
+                dave_media: Some(dave_media),
+            },
+            transport_updates,
+            pacer,
+            gateway_commands: gateway,
+            connection_state,
+            connection_shutdown,
+            events,
+            command_capacity: 8,
+            max_frame_bytes: 1_275,
+            max_datagram_bytes: 2_048,
+            active,
+        });
+
+        let mut observed = Vec::new();
+        let mut packet = [0_u8; 2_048];
+        for index in 0..1 + usize::from(SILENCE_FRAMES) {
+            let length = match timeout(Duration::from_secs(2), sink.recv(&mut packet)).await {
+                Ok(result) => result.expect("UDP packet is readable"),
+                Err(_) => panic!(
+                    "paced packet {index} did not arrive; sender state: {:?}",
+                    control.snapshot()
+                ),
+            };
+            let decoded = decrypt_transport_packet(
+                OracleMode::Aes256GcmRtpSize,
+                &KEY,
+                &packet[..length],
+                1_275 + dave::OPUS_MAX_ENCRYPTION_OVERHEAD_BYTES,
+            )
+            .expect("transport layer decrypts");
+            observed.push(decoded.payload);
+        }
+
+        assert_ne!(observed[0], normal_frame);
+        assert!(observed[0].len() > normal_frame.len());
+        for encrypted_silence in &observed[1..] {
+            assert_ne!(encrypted_silence.as_slice(), SILENCE);
+            assert!(encrypted_silence.len() > SILENCE.len());
+        }
+        assert!(
+            observed
+                .iter()
+                .all(|payload| payload.ends_with(&[0xFA, 0xFA]))
+        );
+        assert!(
+            timeout(Duration::from_millis(40), sink.recv(&mut packet))
+                .await
+                .is_err(),
+            "the terminal drain is exactly five silence frames"
+        );
+        timeout(Duration::from_secs(1), async {
+            while control.snapshot().stats().silence_frames_sent() != u64::from(SILENCE_FRAMES) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("silence drain completes");
+        control.stop().await.expect("sender stops cleanly");
+        gateway_task.await.expect("gateway responder completes");
+        drop((
+            transport_updates_tx,
+            connection_tx,
+            connection_shutdown_tx,
+            pacer_owner,
+        ));
+        assert_eq!(
+            *speaking.lock().expect("speaking record mutex"),
+            [true, false]
+        );
+    }
+
+    #[tokio::test]
+    async fn dave_encryption_failure_emits_no_plaintext_udp_and_clears_speaking() {
+        let (sink, socket) = connected_udp_pair().await;
+        let encoder = TransportEncoder::new(
+            TransportMode::Aes256GcmRtpSize,
+            &[0x42; 32],
+            7,
+            1_275 + dave::OPUS_MAX_ENCRYPTION_OVERHEAD_BYTES,
+            2_048,
+        )
+        .expect("transport encoder initializes");
+        let dave = dave::Handle::spawn(7, 9, 8).expect("unready DAVE owner starts");
+        let dave_media = dave.media_encryptor();
+        let pacer_owner = Pacer::new();
+        let pacer = pacer_owner.register().await.expect("pacer registers");
+        let (gateway, mut gateway_rx) = mpsc::channel(8);
+        let speaking = Arc::new(Mutex::new(Vec::new()));
+        let speaking_observer = speaking.clone();
+        let gateway_task = tokio::spawn(async move {
+            while let Some(command) = gateway_rx.recv().await {
+                match command {
+                    GatewayCommand::Speaking {
+                        speaking, reply, ..
+                    } => {
+                        speaking_observer
+                            .lock()
+                            .expect("speaking record mutex")
+                            .push(speaking);
+                        let _ = reply.send(Ok(()));
+                    }
+                    GatewayCommand::DetachAudio { reply, .. } => {
+                        let _ = reply.send(());
+                        break;
+                    }
+                    _ => panic!("unexpected gateway command in DAVE failure test"),
+                }
+            }
+        });
+        let (transport_updates_tx, transport_updates) = mpsc::channel(1);
+        let (connection_tx, connection_state) = connected_state();
+        let (connection_shutdown_tx, connection_shutdown) = watch::channel(false);
+        let (events, _) = broadcast::channel(8);
+        let control = AudioControl::spawn(SpawnAudio {
+            id: 2,
+            source: Box::new(ReadySource),
+            transport: InstalledTransport {
+                generation: ConnectionGeneration::FIRST,
+                socket: Arc::new(socket),
+                encoder,
+                dave_protocol_version: 1,
+                dave: Some(dave),
+                dave_media: Some(dave_media),
+            },
+            transport_updates,
+            pacer,
+            gateway_commands: gateway,
+            connection_state,
+            connection_shutdown,
+            events,
+            command_capacity: 8,
+            max_frame_bytes: 1_275,
+            max_datagram_bytes: 2_048,
+            active: Arc::new(AtomicBool::new(true)),
+        });
+
+        timeout(Duration::from_secs(1), async {
+            while control.snapshot().phase() != AudioPhase::Failed {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("DAVE encryption failure is terminal");
+        assert_eq!(
+            control.snapshot().failure(),
+            Some(ErrorKind::DaveTransition)
+        );
+        let mut packet = [0_u8; 2_048];
+        assert!(
+            timeout(Duration::from_millis(40), sink.recv(&mut packet))
+                .await
+                .is_err(),
+            "failed DAVE encryption cannot fall back to plaintext UDP"
+        );
+        gateway_task.await.expect("gateway responder completes");
+        drop((
+            transport_updates_tx,
+            connection_tx,
+            connection_shutdown_tx,
+            pacer_owner,
+        ));
+        assert_eq!(
+            *speaking.lock().expect("speaking record mutex"),
+            [true, false]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "release-only P08 complete paced DAVE path performance evidence"]
+    async fn p08_complete_paced_dave_path_benchmark() {
+        let warmup = Duration::from_millis(
+            std::env::var("OTO_P08_WARMUP_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(1_000),
+        );
+        let measurement = Duration::from_millis(
+            std::env::var("OTO_P08_MEASURE_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(3_000),
+        );
+        let (sink, socket) = connected_udp_pair().await;
+        let received = Arc::new(AtomicU64::new(0));
+        let received_observer = received.clone();
+        let sink_task = tokio::spawn(async move {
+            let mut packet = [0_u8; 2_048];
+            while sink.recv(&mut packet).await.is_ok() {
+                AudioCounters::increment(&received_observer);
+            }
+        });
+        let encoder = TransportEncoder::new(
+            TransportMode::Aes256GcmRtpSize,
+            &[0x42; 32],
+            7,
+            1_275 + dave::OPUS_MAX_ENCRYPTION_OVERHEAD_BYTES,
+            2_048,
+        )
+        .expect("transport encoder initializes");
+        let dave = dave::Handle::spawn_ready_fixture(8);
+        let dave_media = dave.media_encryptor();
+        let pacer_owner = Pacer::new();
+        let pacer = pacer_owner.register().await.expect("pacer registers");
+        let (gateway, mut gateway_rx) = mpsc::channel(8);
+        let gateway_task = tokio::spawn(async move {
+            while let Some(command) = gateway_rx.recv().await {
+                match command {
+                    GatewayCommand::Speaking { reply, .. } => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    GatewayCommand::DetachAudio { reply, .. } => {
+                        let _ = reply.send(());
+                        break;
+                    }
+                    _ => panic!("unexpected gateway command in paced DAVE benchmark"),
+                }
+            }
+        });
+        let (transport_updates_tx, transport_updates) = mpsc::channel(1);
+        let (connection_tx, connection_state) = connected_state();
+        let (connection_shutdown_tx, connection_shutdown) = watch::channel(false);
+        let (events, _) = broadcast::channel(8);
+        let control = AudioControl::spawn(SpawnAudio {
+            id: 3,
+            source: Box::new(MaximumFrameSource),
+            transport: InstalledTransport {
+                generation: ConnectionGeneration::FIRST,
+                socket: Arc::new(socket),
+                encoder,
+                dave_protocol_version: 1,
+                dave: Some(dave),
+                dave_media: Some(dave_media),
+            },
+            transport_updates,
+            pacer,
+            gateway_commands: gateway,
+            connection_state,
+            connection_shutdown,
+            events,
+            command_capacity: 8,
+            max_frame_bytes: 1_275,
+            max_datagram_bytes: 2_048,
+            active: Arc::new(AtomicBool::new(true)),
+        });
+
+        tokio::time::sleep(warmup).await;
+        let frames_before = control.snapshot().stats().frames_sent();
+        let udp_before = received.load(Ordering::Relaxed);
+        let region = stats_alloc::Region::new(crate::TEST_ALLOCATOR);
+        let started = StdInstant::now();
+        tokio::time::sleep(measurement).await;
+        let elapsed = started.elapsed();
+        let allocation = region.change();
+        let frames = control
+            .snapshot()
+            .stats()
+            .frames_sent()
+            .saturating_sub(frames_before);
+        let udp_packets = received.load(Ordering::Relaxed).saturating_sub(udp_before);
+        let result = serde_json::json!({
+            "schemaVersion": 1,
+            "benchmarkId": "oto-p08-complete-paced-dave",
+            "profile": "release",
+            "warmupMs": warmup.as_millis(),
+            "measurementMs": elapsed.as_millis(),
+            "frames": frames,
+            "udpPackets": udp_packets,
+            "boundaryDifference": frames.abs_diff(udp_packets),
+            "allocation": {
+                "allocations": allocation.allocations,
+                "reallocations": allocation.reallocations,
+                "bytesAllocated": allocation.bytes_allocated,
+                "allocationsPerFrame": allocation.allocations as f64 / frames.max(1) as f64,
+                "reallocationsPerFrame": allocation.reallocations as f64 / frames.max(1) as f64,
+                "bytesAllocatedPerFrame": allocation.bytes_allocated as f64 / frames.max(1) as f64,
+            },
+            "maxSenderLatenessNanos": control.snapshot().stats().max_lateness().as_nanos(),
+        });
+        println!("P08_COMPLETE_PATH_BENCHMARK={result}");
+        assert!(frames > 0);
+        assert!(frames.abs_diff(udp_packets) <= 1);
+
+        control.stop().await.expect("benchmark sender stops");
+        gateway_task.await.expect("gateway responder completes");
+        sink_task.abort();
+        drop((
+            transport_updates_tx,
+            connection_tx,
+            connection_shutdown_tx,
+            pacer_owner,
+        ));
     }
 }

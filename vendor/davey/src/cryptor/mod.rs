@@ -21,6 +21,9 @@ pub const RATCHET_GENERATION_SHIFT_BITS: usize =
     8 * (AES_GCM_128_TRUNCATED_SYNC_NONCE_BYTES - RATCHET_GENERATION_BYTES);
 pub const SUPPLEMENTAL_BYTES: usize = AES_GCM_127_TRUNCATED_TAG_BYTES + 1 + 2;
 pub const TRANSFORM_PADDING_BYTES: usize = 64;
+/// Scratch capacity required beyond an Opus frame for encrypted output.
+pub const OPUS_ENCRYPTION_BUFFER_OVERHEAD_BYTES: usize =
+    AES_GCM_127_TRUNCATED_TAG_BYTES + 5 + 1 + MARKER_BYTES.len() + TRANSFORM_PADDING_BYTES;
 
 /** Timing constants */
 pub const CIPHER_EXPIRY: Duration = Duration::new(10, 0);

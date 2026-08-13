@@ -900,7 +900,7 @@ async fn run_session(
                                     mode,
                                     &description.secret_key,
                                     active.ssrc,
-                                    config.limits.encoded_opus_frame_bytes(),
+                                    config.limits.transport_payload_bytes(),
                                     config.limits.udp_datagram_bytes(),
                                 ) {
                                     Ok(encoder) => encoder,
@@ -953,6 +953,10 @@ async fn run_session(
                                     encoder,
                                     dave_protocol_version: description.dave_protocol_version,
                                     dave: active.dave.clone(),
+                                    dave_media: active
+                                        .dave
+                                        .as_ref()
+                                        .map(dave::Handle::media_encryptor),
                                 };
                                 if let Some((_, updates)) = audio_attachment.as_ref() {
                                     match deliver_transport(updates, installed).await {
@@ -1285,6 +1289,7 @@ fn attach_audio(
         encoder,
         dave_protocol_version: active.dave_protocol_version,
         dave: active.dave.clone(),
+        dave_media: active.dave.as_ref().map(dave::Handle::media_encryptor),
     };
     match reply.send(Ok(installed)) {
         Ok(()) => *attachment = Some((audio_id, updates)),
@@ -1809,9 +1814,9 @@ mod tests {
     use std::task::{Context, Poll, Waker};
 
     use oto_testkit::{
-        FakeUdpServer, FakeUdpServerConfig, FakeVoiceGateway, FakeVoiceGatewayConfig, FaultAction,
-        GatewayCloseStage, GatewayRecord, ManualClock, ScriptedClose, TestTls,
-        TransportMode as OracleMode, VoiceClose,
+        DaveClientRecord, FakeUdpServer, FakeUdpServerConfig, FakeVoiceGateway,
+        FakeVoiceGatewayConfig, FaultAction, GatewayCloseStage, GatewayRecord, ManualClock,
+        ScriptedClose, TestTls, TransportMode as OracleMode, VoiceClose,
     };
 
     use super::*;
@@ -2608,6 +2613,102 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::DaveRequired);
         assert_eq!(gateway.udp.capture().len(), 1);
         assert!(gateway.speaking().is_empty());
+
+        connection.shutdown().await.expect("connection shuts down");
+        gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn dave_resume_retains_session_but_fresh_identify_and_replacement_reset_it() {
+        let mut config = FakeVoiceGatewayConfig::local();
+        config.dave_protocol_version = 1;
+        config.heartbeat_interval = Duration::from_secs(300);
+        let gateway = TestGateway::start(config).await.expect("gateway starts");
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        let connection = oto
+            .connect(voice_info(&gateway, "dave-reset-1", "dave-token-1"))
+            .await
+            .expect("transport reaches DAVE establishment");
+        let key_packages = || {
+            gateway
+                .dave_client_records()
+                .iter()
+                .filter(|record| matches!(record, DaveClientRecord::KeyPackage(_)))
+                .count()
+        };
+        let selects = || {
+            gateway
+                .records()
+                .iter()
+                .filter(|record| matches!(record, GatewayRecord::SelectProtocol(_)))
+                .count()
+        };
+
+        gateway
+            .try_dave_external_sender(crate::dave::test_external_sender_fixture())
+            .expect("external sender queues");
+        eventually(|| key_packages() == 1).await;
+
+        gateway
+            .try_close(VoiceClose {
+                code: 4015,
+                reason: "resumable DAVE interruption".to_owned(),
+            })
+            .expect("resumable close queues");
+        eventually(|| connection.state().stats().resume_successes() == 1).await;
+        gateway
+            .try_dave_prepare_epoch(1, 1)
+            .expect("post-resume epoch queues");
+        eventually(|| key_packages() == 2).await;
+        assert_eq!(selects(), 1, "successful Resume reuses the transport");
+
+        gateway
+            .try_close(VoiceClose {
+                code: 4006,
+                reason: "fresh identify required".to_owned(),
+            })
+            .expect("fresh-identify close queues");
+        eventually(|| selects() == 2).await;
+        let unknown_before = connection.state().stats().unknown_opcodes();
+        gateway
+            .try_dave_prepare_epoch(1, 1)
+            .expect("new-session epoch queues");
+        gateway
+            .try_dispatch_json(250, json!({"barrier": "fresh"}), true)
+            .expect("ordered barrier queues");
+        eventually(|| connection.state().stats().unknown_opcodes() > unknown_before).await;
+        assert_eq!(
+            key_packages(),
+            2,
+            "fresh Identify must not retain the prior external sender"
+        );
+        gateway
+            .try_dave_external_sender(crate::dave::test_external_sender_fixture())
+            .expect("replacement external sender queues");
+        eventually(|| key_packages() == 3).await;
+
+        let generation = connection
+            .replace_voice_info(voice_info(&gateway, "dave-reset-2", "dave-token-2"))
+            .await
+            .expect("replacement is accepted");
+        eventually(|| connection.state().generation() == generation && selects() == 3).await;
+        let unknown_before = connection.state().stats().unknown_opcodes();
+        gateway
+            .try_dave_prepare_epoch(1, 1)
+            .expect("replacement epoch queues");
+        gateway
+            .try_dispatch_json(251, json!({"barrier": "replacement"}), true)
+            .expect("replacement barrier queues");
+        eventually(|| connection.state().stats().unknown_opcodes() > unknown_before).await;
+        assert_eq!(
+            key_packages(),
+            3,
+            "generation replacement must reset the DAVE session"
+        );
+        gateway
+            .try_dave_external_sender(crate::dave::test_external_sender_fixture())
+            .expect("new-generation external sender queues");
+        eventually(|| key_packages() == 4).await;
 
         connection.shutdown().await.expect("connection shuts down");
         gateway.shutdown().await.expect("gateway shuts down");
@@ -3585,6 +3686,16 @@ mod tests {
             )
             .build()
             .expect_err("impossible UDP datagram bound is rejected");
+        assert_eq!(error.kind(), ErrorKind::InvalidConfiguration);
+
+        let error = Oto::builder()
+            .resource_limits(
+                ResourceLimits::default()
+                    .with_encoded_opus_frame_bytes(1_275)
+                    .with_udp_datagram_bytes(1_275 + 32),
+            )
+            .build()
+            .expect_err("datagram bound must include DAVE expansion before transport AEAD");
         assert_eq!(error.kind(), ErrorKind::InvalidConfiguration);
 
         let token = VoiceToken::new("never-print-this");

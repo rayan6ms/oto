@@ -9,6 +9,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
 
 pub(crate) const MAX_PROTOCOL_VERSION: u16 = 1;
+// DAVE v1 Opus encrypts the entire frame and appends an 8-byte tag, a
+// worst-case 5-byte LEB128 nonce, one supplemental-length byte, and FA FA.
+pub(crate) const OPUS_MAX_ENCRYPTION_OVERHEAD_BYTES: usize = 16;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,13 +109,37 @@ enum Command {
     },
     Encrypt {
         frame: Vec<u8>,
-        reply: oneshot::Sender<Result<Vec<u8>, Failure>>,
+        len: usize,
+        output: Vec<u8>,
+        reply: mpsc::Sender<EncryptedBuffers>,
     },
+}
+
+pub(crate) struct EncryptedBuffers {
+    pub(crate) frame: Vec<u8>,
+    pub(crate) output: Vec<u8>,
+    pub(crate) result: Result<(), Failure>,
+}
+
+pub(crate) struct MediaEncryptor {
+    commands: mpsc::Sender<Command>,
+    reply: mpsc::Sender<EncryptedBuffers>,
+    responses: mpsc::Receiver<EncryptedBuffers>,
+}
+
+impl std::fmt::Debug for MediaEncryptor {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("DaveMediaEncryptor").finish()
+    }
 }
 
 impl Handle {
     pub(crate) fn spawn(user_id: u64, channel_id: u64, capacity: usize) -> Result<Self, Failure> {
         let core = Core::new(user_id, channel_id)?;
+        Ok(Self::spawn_core(core, capacity))
+    }
+
+    fn spawn_core(core: Core, capacity: usize) -> Self {
         let (commands, mut receiver) = mpsc::channel(capacity);
         let (state_tx, state) = watch::channel(core.snapshot());
         let task = tokio::spawn(async move {
@@ -124,23 +151,44 @@ impl Handle {
                         state_tx.send_replace(core.snapshot());
                         let _ = reply.send(result);
                     }
-                    Command::Encrypt { frame, reply } => {
-                        let _ = reply.send(core.encrypt(&frame));
+                    Command::Encrypt {
+                        frame,
+                        len,
+                        mut output,
+                        reply,
+                    } => {
+                        let result = core.encrypt_into(&frame[..len], &mut output);
+                        let _ = reply
+                            .send(EncryptedBuffers {
+                                frame,
+                                output,
+                                result,
+                            })
+                            .await;
                     }
                 }
             }
         });
-        Ok(Self {
+        Self {
             inner: Arc::new(Owner {
                 commands,
                 state,
                 task: Mutex::new(Some(task)),
             }),
-        })
+        }
     }
 
     pub(crate) fn snapshot(&self) -> Snapshot {
         *self.inner.state.borrow()
+    }
+
+    pub(crate) fn media_encryptor(&self) -> MediaEncryptor {
+        let (reply, responses) = mpsc::channel(1);
+        MediaEncryptor {
+            commands: self.inner.commands.clone(),
+            reply,
+            responses,
+        }
     }
 
     pub(crate) async fn control(&self, control: Control) -> Result<Vec<Outbound>, Failure> {
@@ -159,23 +207,41 @@ impl Handle {
             .map_err(|_| Failure::Overloaded)?
             .map_err(|_| Failure::Closed)?
     }
+}
 
-    pub(crate) async fn encrypt(&self, frame: &[u8]) -> Result<Vec<u8>, Failure> {
-        let (reply, response) = oneshot::channel();
+impl MediaEncryptor {
+    pub(crate) async fn encrypt_buffered(
+        &mut self,
+        frame: Vec<u8>,
+        len: usize,
+        output: Vec<u8>,
+    ) -> Result<EncryptedBuffers, Failure> {
+        if len > frame.len() {
+            return Err(Failure::Malformed);
+        }
         timeout(
             COMMAND_TIMEOUT,
-            self.inner.commands.send(Command::Encrypt {
-                frame: frame.to_vec(),
-                reply,
+            self.commands.send(Command::Encrypt {
+                frame,
+                len,
+                output,
+                reply: self.reply.clone(),
             }),
         )
         .await
         .map_err(|_| Failure::Overloaded)?
         .map_err(|_| Failure::Closed)?;
-        timeout(COMMAND_TIMEOUT, response)
+        timeout(COMMAND_TIMEOUT, self.responses.recv())
             .await
             .map_err(|_| Failure::Overloaded)?
-            .map_err(|_| Failure::Closed)?
+            .ok_or(Failure::Closed)
+    }
+}
+
+#[cfg(test)]
+impl Handle {
+    pub(crate) fn spawn_ready_fixture(capacity: usize) -> Self {
+        Self::spawn_core(ready_fixture_core(), capacity)
     }
 }
 
@@ -394,11 +460,18 @@ impl Core {
         Ok(actions)
     }
 
+    #[cfg(test)]
     fn encrypt(&mut self, frame: &[u8]) -> Result<Vec<u8>, Failure> {
+        let mut output = Vec::new();
+        self.encrypt_into(frame, &mut output)?;
+        Ok(output)
+    }
+
+    fn encrypt_into(&mut self, frame: &[u8], output: &mut Vec<u8>) -> Result<(), Failure> {
         if self.active_version != MAX_PROTOCOL_VERSION || !self.backend.is_ready() {
             return Err(Failure::InvalidState);
         }
-        guarded(|| self.backend.encrypt_opus(frame)).map(|encrypted| encrypted.into_owned())
+        guarded(|| self.backend.encrypt_opus_into(frame, output))
     }
 }
 
@@ -424,28 +497,107 @@ fn guarded<T, E>(operation: impl FnOnce() -> Result<T, E>) -> Result<T, Failure>
 }
 
 #[cfg(test)]
+const UPSTREAM_FIXTURES: &str =
+    include_str!("../../../vendor/davey/fixtures/upstream_session_fixtures.py");
+#[cfg(test)]
+const FIXTURE_MY_USER_ID: u64 = 158_049_329_150_427_136;
+#[cfg(test)]
+const FIXTURE_OTHER_USER_ID: u64 = 158_533_742_254_751_744;
+#[cfg(test)]
+const FIXTURE_CHANNEL_ID: u64 = 927_310_423_890_473_011;
+
+#[cfg(test)]
+fn fixture(name: &str, next_name: &str) -> Vec<u8> {
+    let section = UPSTREAM_FIXTURES
+        .split_once(name)
+        .expect("fixture name exists")
+        .1
+        .split_once(next_name)
+        .expect("next fixture name exists")
+        .0;
+    section
+        .split(|character: char| !character.is_ascii_hexdigit() && character != 'x')
+        .filter_map(|token| token.strip_prefix("0x"))
+        .map(|token| u8::from_str_radix(token, 16).expect("valid fixture byte"))
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn test_external_sender_fixture() -> Vec<u8> {
+    fixture("EXTERNAL_SENDER", "APPENDING_PROPOSALS")
+}
+
+#[cfg(test)]
+fn ready_fixture_core() -> Core {
+    let mut core = prepared_fixture_core();
+    core.control(Control::ExecuteTransition { id: 7 }).unwrap();
+    assert!(core.snapshot().ready);
+    core
+}
+
+#[cfg(test)]
+fn prepared_fixture_core() -> Core {
+    let external_sender = fixture("EXTERNAL_SENDER", "APPENDING_PROPOSALS");
+    let proposals = fixture("APPENDING_PROPOSALS", "REVOKING_PROPOSALS");
+    let mut core = Core::new(FIXTURE_MY_USER_ID, FIXTURE_CHANNEL_ID).unwrap();
+    core.control(Control::Roster(vec![
+        FIXTURE_MY_USER_ID,
+        FIXTURE_OTHER_USER_ID,
+    ]))
+    .unwrap();
+    core.control(Control::PrepareTransition {
+        protocol_version: 1,
+        id: 7,
+    })
+    .unwrap();
+    core.control(Control::ExternalSender(external_sender))
+        .unwrap();
+    let response = core
+        .backend
+        .process_proposals(
+            davey::ProposalsOperationType::APPEND,
+            &proposals,
+            Some(&[FIXTURE_MY_USER_ID, FIXTURE_OTHER_USER_ID]),
+        )
+        .unwrap()
+        .expect("fixture creates a commit");
+    let mut announced_commit = 7_u16.to_be_bytes().to_vec();
+    announced_commit.extend_from_slice(&response.commit);
+    core.control(Control::Commit(announced_commit)).unwrap();
+    assert!(!core.snapshot().ready);
+    core
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    const UPSTREAM_FIXTURES: &str =
-        include_str!("../../../vendor/davey/fixtures/upstream_session_fixtures.py");
-    const MY_USER_ID: u64 = 158_049_329_150_427_136;
-    const OTHER_USER_ID: u64 = 158_533_742_254_751_744;
-    const CHANNEL_ID: u64 = 927_310_423_890_473_011;
+    fn benchmark_env(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(default)
+    }
 
-    fn fixture(name: &str, next_name: &str) -> Vec<u8> {
-        let section = UPSTREAM_FIXTURES
-            .split_once(name)
-            .expect("fixture name exists")
-            .1
-            .split_once(next_name)
-            .expect("next fixture name exists")
-            .0;
-        section
-            .split(|character: char| !character.is_ascii_hexdigit() && character != 'x')
-            .filter_map(|token| token.strip_prefix("0x"))
-            .map(|token| u8::from_str_radix(token, 16).expect("valid fixture byte"))
-            .collect()
+    fn percentile(samples: &mut [u64], permille: usize) -> u64 {
+        samples.sort_unstable();
+        let index = (samples.len().saturating_sub(1) * permille) / 1_000;
+        samples[index]
+    }
+
+    fn process_pss_kib() -> usize {
+        std::fs::read_to_string("/proc/self/smaps_rollup")
+            .ok()
+            .and_then(|contents| {
+                contents.lines().find_map(|line| {
+                    line.strip_prefix("Pss:")?
+                        .split_whitespace()
+                        .next()?
+                        .parse()
+                        .ok()
+                })
+            })
+            .unwrap_or(0)
     }
 
     #[test]
@@ -510,46 +662,224 @@ mod tests {
             core.control(Control::Proposals(vec![0])),
             Err(Failure::Malformed)
         ));
+        assert!(matches!(
+            core.control(Control::Proposals(vec![2, 1])),
+            Err(Failure::Malformed)
+        ));
+        for truncated in [vec![], vec![0], vec![0, 7]] {
+            assert!(matches!(
+                core.control(Control::Commit(truncated.clone())),
+                Err(Failure::Malformed)
+            ));
+            assert!(matches!(
+                core.control(Control::Welcome(truncated)),
+                Err(Failure::Malformed)
+            ));
+        }
+        assert!(!core.snapshot().ready);
+    }
+
+    #[test]
+    fn invalid_commit_resets_group_and_emits_invalid_then_fresh_package() {
+        let mut core = ready_fixture_core();
+        let actions = core
+            .control(Control::PrepareTransition {
+                protocol_version: 1,
+                id: 8,
+            })
+            .unwrap();
+        assert!(matches!(
+            actions.as_slice(),
+            [Outbound::Json { opcode: 23, .. }]
+        ));
+
+        let actions = core.control(Control::Commit(vec![0, 8, 0])).unwrap();
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                Outbound::Json { opcode: 31, .. },
+                Outbound::Binary(package)
+            ] if package.first() == Some(&26)
+        ));
+        assert_eq!(
+            core.snapshot(),
+            Snapshot {
+                active_version: 0,
+                transition_id: None,
+                ready: false,
+            }
+        );
+        assert!(matches!(
+            core.encrypt(b"must not escape"),
+            Err(Failure::InvalidState)
+        ));
+    }
+
+    #[test]
+    fn disconnected_member_is_removed_from_proposal_allowlist() {
+        let mut core = Core::new(FIXTURE_MY_USER_ID, FIXTURE_CHANNEL_ID).unwrap();
+        core.control(Control::Roster(vec![
+            FIXTURE_MY_USER_ID,
+            FIXTURE_OTHER_USER_ID,
+        ]))
+        .unwrap();
+        core.control(Control::ExternalSender(test_external_sender_fixture()))
+            .unwrap();
+        core.control(Control::MemberDisconnected(FIXTURE_OTHER_USER_ID))
+            .unwrap();
+        let mut proposals = vec![0];
+        proposals.extend(fixture("APPENDING_PROPOSALS", "REVOKING_PROPOSALS"));
+        assert!(matches!(
+            core.control(Control::Proposals(proposals)),
+            Err(Failure::Backend)
+        ));
         assert!(!core.snapshot().ready);
     }
 
     #[test]
     fn pinned_mls_fixture_reaches_execute_and_encrypts_participant_silence() {
-        let external_sender = fixture("EXTERNAL_SENDER", "APPENDING_PROPOSALS");
-        let proposals = fixture("APPENDING_PROPOSALS", "REVOKING_PROPOSALS");
-        let mut core = Core::new(MY_USER_ID, CHANNEL_ID).unwrap();
-        core.control(Control::Roster(vec![MY_USER_ID, OTHER_USER_ID]))
-            .unwrap();
-        core.control(Control::PrepareTransition {
-            protocol_version: 1,
-            id: 7,
-        })
-        .unwrap();
-        core.control(Control::ExternalSender(external_sender))
-            .unwrap();
-
-        let response = core
-            .backend
-            .process_proposals(
-                davey::ProposalsOperationType::APPEND,
-                &proposals,
-                Some(&[MY_USER_ID, OTHER_USER_ID]),
-            )
-            .unwrap()
-            .expect("fixture creates a commit");
-        let mut announced_commit = 7_u16.to_be_bytes().to_vec();
-        announced_commit.extend_from_slice(&response.commit);
-        let actions = core.control(Control::Commit(announced_commit)).unwrap();
-        assert!(matches!(
-            actions.as_slice(),
-            [Outbound::Json { opcode: 23, .. }]
-        ));
-        assert!(!core.snapshot().ready);
-
-        core.control(Control::ExecuteTransition { id: 7 }).unwrap();
-        assert!(core.snapshot().ready);
+        let mut core = ready_fixture_core();
         let encrypted = core.encrypt(&davey::OPUS_SILENCE_PACKET).unwrap();
         assert_ne!(encrypted, davey::OPUS_SILENCE_PACKET);
         assert_eq!(&encrypted[encrypted.len() - 2..], &[0xFA, 0xFA]);
+    }
+
+    #[tokio::test]
+    async fn cancelled_media_response_cannot_block_owner_and_last_handle_drop_closes_lane() {
+        let handle = Handle::spawn_ready_fixture(2);
+        let (reply, responses) = mpsc::channel(1);
+        drop(responses);
+        handle
+            .inner
+            .commands
+            .send(Command::Encrypt {
+                frame: vec![1, 2, 3],
+                len: 3,
+                output: Vec::new(),
+                reply,
+            })
+            .await
+            .expect("cancelled media command enters owner");
+        timeout(
+            Duration::from_secs(1),
+            handle.control(Control::Roster(vec![FIXTURE_MY_USER_ID])),
+        )
+        .await
+        .expect("cancelled response cannot block later gateway control")
+        .expect("later gateway control succeeds");
+
+        let mut media = handle.media_encryptor();
+        drop(handle);
+        timeout(Duration::from_secs(1), media.commands.closed())
+            .await
+            .expect("last handle drop aborts the owner task");
+        assert!(matches!(
+            media.encrypt_buffered(vec![1, 2, 3], 3, Vec::new()).await,
+            Err(Failure::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "release-only P08 DAVE adapter performance evidence"]
+    async fn p08_dave_adapter_benchmark() {
+        let sessions = benchmark_env("OTO_P08_SESSIONS", 12).max(1);
+        let encryptions = benchmark_env("OTO_P08_ENCRYPTIONS", 10_000).max(1);
+        let baseline_pss_kib = process_pss_kib();
+        let setup_region = stats_alloc::Region::new(crate::TEST_ALLOCATOR);
+        let mut setup_nanos = Vec::with_capacity(sessions);
+        let mut execute_nanos = Vec::with_capacity(sessions);
+        let mut cores = Vec::with_capacity(sessions);
+        for _ in 0..sessions {
+            let started = std::time::Instant::now();
+            let mut core = prepared_fixture_core();
+            setup_nanos.push(started.elapsed().as_nanos() as u64);
+            let started = std::time::Instant::now();
+            core.control(Control::ExecuteTransition { id: 7 }).unwrap();
+            execute_nanos.push(started.elapsed().as_nanos() as u64);
+            cores.push(core);
+        }
+        let setup_allocation = setup_region.change();
+        let sessions_pss_kib = process_pss_kib();
+
+        let frame = vec![0x55; 1_275];
+        let core = cores.first_mut().expect("at least one benchmark session");
+        let mut direct_output = Vec::new();
+        for _ in 0..100 {
+            core.encrypt_into(&frame, &mut direct_output)
+                .expect("warmup encryption succeeds");
+        }
+        let mut direct_nanos = Vec::with_capacity(encryptions);
+        let direct_region = stats_alloc::Region::new(crate::TEST_ALLOCATOR);
+        for _ in 0..encryptions {
+            let started = std::time::Instant::now();
+            core.encrypt_into(&frame, &mut direct_output)
+                .expect("direct encryption succeeds");
+            direct_nanos.push(started.elapsed().as_nanos() as u64);
+        }
+        let direct_allocation = direct_region.change();
+
+        let owner = Handle::spawn_ready_fixture(8);
+        let mut media = owner.media_encryptor();
+        let mut owner_frame = frame.clone();
+        let mut owner_output = Vec::new();
+        for _ in 0..100 {
+            let buffers = media
+                .encrypt_buffered(owner_frame, frame.len(), owner_output)
+                .await
+                .expect("owner warmup command succeeds");
+            buffers.result.expect("owner warmup encryption succeeds");
+            owner_frame = buffers.frame;
+            owner_output = buffers.output;
+        }
+        let mut owner_nanos = Vec::with_capacity(encryptions);
+        let owner_region = stats_alloc::Region::new(crate::TEST_ALLOCATOR);
+        for _ in 0..encryptions {
+            let started = std::time::Instant::now();
+            let buffers = media
+                .encrypt_buffered(owner_frame, frame.len(), owner_output)
+                .await
+                .expect("owner command succeeds");
+            buffers.result.expect("owner encryption succeeds");
+            owner_frame = buffers.frame;
+            owner_output = buffers.output;
+            owner_nanos.push(started.elapsed().as_nanos() as u64);
+        }
+        let owner_allocation = owner_region.change();
+
+        let result = json!({
+            "schemaVersion": 1,
+            "benchmarkId": "oto-p08-dave-adapter",
+            "profile": "release",
+            "sessions": sessions,
+            "setup": {
+                "p50Nanos": percentile(&mut setup_nanos, 500),
+                "p99Nanos": percentile(&mut setup_nanos, 990),
+                "allocationsPerSession": setup_allocation.allocations as f64 / sessions as f64,
+                "bytesAllocatedPerSession": setup_allocation.bytes_allocated as f64 / sessions as f64,
+                "pssIncrementKiB": sessions_pss_kib.saturating_sub(baseline_pss_kib),
+                "pssIncrementKiBPerSession": sessions_pss_kib.saturating_sub(baseline_pss_kib) as f64 / sessions as f64,
+            },
+            "executeTransition": {
+                "p50Nanos": percentile(&mut execute_nanos, 500),
+                "p99Nanos": percentile(&mut execute_nanos, 990),
+            },
+            "directEncrypt": {
+                "frames": encryptions,
+                "p50Nanos": percentile(&mut direct_nanos, 500),
+                "p99Nanos": percentile(&mut direct_nanos, 990),
+                "allocationsPerFrame": direct_allocation.allocations as f64 / encryptions as f64,
+                "reallocationsPerFrame": direct_allocation.reallocations as f64 / encryptions as f64,
+                "bytesAllocatedPerFrame": direct_allocation.bytes_allocated as f64 / encryptions as f64,
+            },
+            "ownerEncrypt": {
+                "frames": encryptions,
+                "p50Nanos": percentile(&mut owner_nanos, 500),
+                "p99Nanos": percentile(&mut owner_nanos, 990),
+                "allocationsPerFrame": owner_allocation.allocations as f64 / encryptions as f64,
+                "reallocationsPerFrame": owner_allocation.reallocations as f64 / encryptions as f64,
+                "bytesAllocatedPerFrame": owner_allocation.bytes_allocated as f64 / encryptions as f64,
+            }
+        });
+        println!("P08_DAVE_ADAPTER_BENCHMARK={result}");
     }
 }

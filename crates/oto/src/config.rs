@@ -4,6 +4,7 @@ use std::sync::Arc;
 use rustls::ClientConfig;
 
 use crate::connection::VoiceConnection;
+use crate::dave::OPUS_MAX_ENCRYPTION_OVERHEAD_BYTES;
 use crate::error::{Error, ErrorKind, Operation, RetryDisposition};
 use crate::model::VoiceConnectInfo;
 use crate::pacer::Pacer;
@@ -114,7 +115,7 @@ impl ResourceLimits {
             || self.udp_datagram_bytes > usize::from(u16::MAX)
             || self
                 .encoded_opus_frame_bytes
-                .checked_add(32)
+                .checked_add(OPUS_MAX_ENCRYPTION_OVERHEAD_BYTES + 32)
                 .is_none_or(|packet_bytes| packet_bytes > self.udp_datagram_bytes)
             || self.staged_frame_capacity != 1
         {
@@ -128,6 +129,12 @@ impl ResourceLimits {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn transport_payload_bytes(&self) -> usize {
+        self.encoded_opus_frame_bytes
+            .checked_add(OPUS_MAX_ENCRYPTION_OVERHEAD_BYTES)
+            .expect("validated Opus and DAVE payload bounds")
     }
 }
 

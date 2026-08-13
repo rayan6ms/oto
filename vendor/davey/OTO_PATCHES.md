@@ -3,8 +3,8 @@
 Upstream source: `Snazzah/davey` commit
 `a1e2e741bea06bc3b7167a5c3792844b8975993c` (`rs-0.1.4`).
 
-Oto carries two narrow sender-conformance corrections while the upstream Rust
-API lacks them:
+Oto carries narrow sender-conformance and allocation corrections while the
+upstream Rust API lacks them:
 
 - exact participant Opus silence (`F8 FF FE`) follows the ordinary outbound
   DAVE encryptor path; only the receive-side SFU silence exception remains;
@@ -15,6 +15,9 @@ API lacks them:
 - Python and Node binding-only optional dependencies are removed from the
   Rust-only vendored package so inactive vulnerable bindings do not enter the
   frozen production lockfile.
+- a caller-owned reusable encryption-output method avoids reconstructing Opus
+  sizing scratch state and allocating the result buffer on every media frame;
+  the existing allocating API remains source-compatible.
 
 The MLS and media cryptographic implementations are otherwise unchanged.
 
