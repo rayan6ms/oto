@@ -21,7 +21,7 @@ pub(crate) struct Snapshot {
     pub(crate) ready: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Failure {
     UnsupportedVersion,
     RequiredDowngrade,
@@ -893,6 +893,45 @@ mod tests {
             core.encrypt(b"after replacement").unwrap(),
             b"after replacement"
         );
+    }
+
+    #[test]
+    fn rejected_versions_preserve_active_encrypted_sender() {
+        let mut core = ready_fixture_core();
+        let ready = Snapshot {
+            active_version: 1,
+            transition_id: None,
+            ready: true,
+        };
+
+        for (version, expected) in [
+            (0, Failure::RequiredDowngrade),
+            (MAX_PROTOCOL_VERSION + 1, Failure::UnsupportedVersion),
+        ] {
+            assert_eq!(
+                core.control(Control::PrepareTransition {
+                    protocol_version: version,
+                    id: 8,
+                })
+                .unwrap_err(),
+                expected
+            );
+            assert_eq!(core.snapshot(), ready);
+
+            assert_eq!(
+                core.control(Control::PrepareEpoch {
+                    protocol_version: version,
+                    epoch: 1,
+                })
+                .unwrap_err(),
+                expected
+            );
+            assert_eq!(core.snapshot(), ready);
+            assert_ne!(
+                core.encrypt(b"still protected").unwrap(),
+                b"still protected"
+            );
+        }
     }
 
     #[test]
