@@ -572,6 +572,21 @@ fn prepared_fixture_core() -> Core {
 mod tests {
     use super::*;
 
+    fn mutation_bytes(seed: &mut u64, maximum_len: usize) -> Vec<u8> {
+        *seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let length = (*seed as usize) % (maximum_len + 1);
+        (0..length)
+            .map(|_| {
+                *seed = seed
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (*seed >> 32) as u8
+            })
+            .collect()
+    }
+
     fn benchmark_env(name: &str, default: usize) -> usize {
         std::env::var(name)
             .ok()
@@ -677,6 +692,60 @@ mod tests {
             ));
         }
         assert!(!core.snapshot().ready);
+    }
+
+    #[test]
+    fn deterministic_malformed_control_mutations_are_contained_and_fail_closed() {
+        let external_sender = fixture("EXTERNAL_SENDER", "APPENDING_PROPOSALS");
+        let mut seed = 0xD4A6_E001_5EED_C0DE;
+        let mut contained_backend_panics = 0;
+
+        for case in 0..256_u16 {
+            let mut core = Core::new(FIXTURE_MY_USER_ID, FIXTURE_CHANNEL_ID).unwrap();
+            let mut payload = mutation_bytes(&mut seed, 192);
+            let result = match case % 4 {
+                0 => core.control(Control::ExternalSender(payload)),
+                1 => {
+                    core.control(Control::ExternalSender(external_sender.clone()))
+                        .expect("pinned external sender is valid");
+                    payload.insert(0, (case & 0x03) as u8);
+                    core.control(Control::Proposals(payload))
+                }
+                2 | 3 => {
+                    core.control(Control::PrepareTransition {
+                        protocol_version: 1,
+                        id: case,
+                    })
+                    .expect("supported transition prepares");
+                    payload.splice(0..0, case.to_be_bytes());
+                    if case % 4 == 2 {
+                        core.control(Control::Commit(payload))
+                    } else {
+                        core.control(Control::Welcome(payload))
+                    }
+                }
+                _ => unreachable!(),
+            };
+
+            if matches!(&result, Err(Failure::BackendPanic)) {
+                contained_backend_panics += 1;
+            }
+            assert!(matches!(
+                result,
+                Ok(_) | Err(Failure::Malformed | Failure::Backend | Failure::BackendPanic)
+            ));
+            let snapshot = core.snapshot();
+            assert!(snapshot.active_version <= MAX_PROTOCOL_VERSION);
+            assert!(!snapshot.ready);
+            assert!(matches!(
+                core.encrypt(b"must not escape"),
+                Err(Failure::InvalidState)
+            ));
+        }
+        assert!(
+            contained_backend_panics > 0,
+            "mutation corpus must exercise the backend panic boundary"
+        );
     }
 
     #[test]

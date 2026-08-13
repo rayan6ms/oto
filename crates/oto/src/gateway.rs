@@ -161,6 +161,34 @@ struct SessionDescriptionData {
     dave_protocol_version: u16,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DaveBinaryEnvelopeError {
+    Malformed,
+    BodyTooLarge,
+}
+
+fn decode_dave_binary_envelope(
+    bytes: &[u8],
+    max_body_bytes: usize,
+) -> Result<(u16, Option<DaveControl>), DaveBinaryEnvelopeError> {
+    if bytes.len() < 3 {
+        return Err(DaveBinaryEnvelopeError::Malformed);
+    }
+    let sequence = u16::from_be_bytes([bytes[0], bytes[1]]);
+    let body = &bytes[3..];
+    if body.len() > max_body_bytes {
+        return Err(DaveBinaryEnvelopeError::BodyTooLarge);
+    }
+    let control = match bytes[2] {
+        25 => Some(DaveControl::ExternalSender(body.to_vec())),
+        27 => Some(DaveControl::Proposals(body.to_vec())),
+        29 => Some(DaveControl::Commit(body.to_vec())),
+        30 => Some(DaveControl::Welcome(body.to_vec())),
+        _ => None,
+    };
+    Ok((sequence, control))
+}
+
 struct DiscoveryCompletion {
     generation: ConnectionGeneration,
     ssrc: u32,
@@ -1089,21 +1117,19 @@ async fn run_session(
                         if bytes.len() > config.limits.gateway_binary_bytes() {
                             return SessionOutcome::Fatal(resource_error(store.generation()));
                         }
-                        if bytes.len() < 3 {
-                            return SessionOutcome::Fatal(protocol_error(store.generation()));
-                        }
-                        *latest_sequence = Some(Number::from(u16::from_be_bytes([bytes[0], bytes[1]])));
-                        let body = &bytes[3..];
-                        if body.len() > config.limits.dave_binary_body_bytes() {
-                            return SessionOutcome::Fatal(resource_error(store.generation()));
-                        }
-                        let control = match bytes[2] {
-                            25 => Some(DaveControl::ExternalSender(body.to_vec())),
-                            27 => Some(DaveControl::Proposals(body.to_vec())),
-                            29 => Some(DaveControl::Commit(body.to_vec())),
-                            30 => Some(DaveControl::Welcome(body.to_vec())),
-                            _ => None,
+                        let (sequence, control) = match decode_dave_binary_envelope(
+                            &bytes,
+                            config.limits.dave_binary_body_bytes(),
+                        ) {
+                            Ok(decoded) => decoded,
+                            Err(DaveBinaryEnvelopeError::Malformed) => {
+                                return SessionOutcome::Fatal(protocol_error(store.generation()));
+                            }
+                            Err(DaveBinaryEnvelopeError::BodyTooLarge) => {
+                                return SessionOutcome::Fatal(resource_error(store.generation()));
+                            }
                         };
+                        *latest_sequence = Some(Number::from(sequence));
                         if let Some(control) = control {
                             if let Err(error) = run_dave_control(
                                 dave, info, config, control, &mut websocket, store.generation(),
@@ -1835,6 +1861,54 @@ mod tests {
     struct QueueSource {
         state: Arc<Mutex<QueueSourceState>>,
         polls: Arc<AtomicUsize>,
+    }
+
+    #[test]
+    fn dave_binary_envelope_decoder_enforces_structure_opcode_and_body_bound() {
+        for malformed in [&[][..], &[0][..], &[0, 1][..]] {
+            assert!(matches!(
+                decode_dave_binary_envelope(malformed, 4),
+                Err(DaveBinaryEnvelopeError::Malformed)
+            ));
+        }
+
+        let external_sender = decode_dave_binary_envelope(&[0x12, 0x34, 25, 1, 2, 3, 4], 4)
+            .expect("exact body bound is accepted");
+        assert_eq!(external_sender.0, 0x1234);
+        assert!(matches!(
+            external_sender.1,
+            Some(DaveControl::ExternalSender(body)) if body == [1, 2, 3, 4]
+        ));
+        assert!(matches!(
+            decode_dave_binary_envelope(&[0, 1, 30, 1, 2, 3, 4, 5], 4),
+            Err(DaveBinaryEnvelopeError::BodyTooLarge)
+        ));
+        assert!(matches!(
+            decode_dave_binary_envelope(&[0, 2, 255, 9], 1),
+            Ok((2, None))
+        ));
+    }
+
+    #[test]
+    fn dave_binary_envelope_decoder_exhausts_short_lengths_opcodes_and_bounds() {
+        for body_len in 0..=64 {
+            let mut bytes = vec![0xA5, 0x5A, 0];
+            bytes.extend((0..body_len).map(|index| index as u8));
+            for opcode in u8::MIN..=u8::MAX {
+                bytes[2] = opcode;
+                let decoded = decode_dave_binary_envelope(&bytes, body_len)
+                    .expect("exact body bound is always structurally valid");
+                assert_eq!(decoded.0, 0xA55A);
+                assert_eq!(decoded.1.is_some(), matches!(opcode, 25 | 27 | 29 | 30));
+
+                if body_len > 0 {
+                    assert!(matches!(
+                        decode_dave_binary_envelope(&bytes, body_len - 1),
+                        Err(DaveBinaryEnvelopeError::BodyTooLarge)
+                    ));
+                }
+            }
+        }
     }
 
     #[derive(Default)]
