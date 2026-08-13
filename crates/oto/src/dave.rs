@@ -805,6 +805,58 @@ mod tests {
     }
 
     #[test]
+    fn epoch_one_replaces_active_and_pending_group_state() {
+        let mut core = ready_fixture_core();
+        assert_ne!(core.encrypt(b"old group").unwrap(), b"old group");
+
+        let actions = core
+            .control(Control::PrepareTransition {
+                protocol_version: 1,
+                id: 8,
+            })
+            .unwrap();
+        assert!(matches!(
+            actions.as_slice(),
+            [Outbound::Json { opcode: 23, .. }]
+        ));
+        assert_eq!(
+            core.snapshot(),
+            Snapshot {
+                active_version: 1,
+                transition_id: Some(8),
+                ready: true,
+            }
+        );
+
+        let actions = core
+            .control(Control::PrepareEpoch {
+                protocol_version: 1,
+                epoch: 1,
+            })
+            .unwrap();
+        assert!(matches!(
+            actions.as_slice(),
+            [Outbound::Binary(package)] if package.first() == Some(&26)
+        ));
+        assert_eq!(
+            core.snapshot(),
+            Snapshot {
+                active_version: 0,
+                transition_id: None,
+                ready: false,
+            }
+        );
+        assert!(matches!(
+            core.control(Control::ExecuteTransition { id: 8 }),
+            Err(Failure::InvalidState)
+        ));
+        assert!(matches!(
+            core.encrypt(b"must not use old group"),
+            Err(Failure::InvalidState)
+        ));
+    }
+
+    #[test]
     fn malformed_backend_input_is_typed_and_never_ready() {
         let mut core = Core::new(7, 9).unwrap();
         assert!(matches!(
