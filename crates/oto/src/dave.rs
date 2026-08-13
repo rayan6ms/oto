@@ -836,39 +836,47 @@ mod tests {
     }
 
     #[test]
-    fn invalid_commit_resets_group_and_emits_invalid_then_fresh_package() {
-        let mut core = ready_fixture_core();
-        let actions = core
-            .control(Control::PrepareTransition {
-                protocol_version: 1,
-                id: 8,
-            })
-            .unwrap();
-        assert!(matches!(
-            actions.as_slice(),
-            [Outbound::Json { opcode: 23, .. }]
-        ));
+    fn invalid_commit_and_welcome_reset_group_and_emit_fresh_package() {
+        for welcome in [false, true] {
+            let mut core = ready_fixture_core();
+            let actions = core
+                .control(Control::PrepareTransition {
+                    protocol_version: 1,
+                    id: 8,
+                })
+                .unwrap();
+            assert!(matches!(
+                actions.as_slice(),
+                [Outbound::Json { opcode: 23, .. }]
+            ));
 
-        let actions = core.control(Control::Commit(vec![0, 8, 0])).unwrap();
-        assert!(matches!(
-            actions.as_slice(),
-            [
-                Outbound::Json { opcode: 31, .. },
-                Outbound::Binary(package)
-            ] if package.first() == Some(&26)
-        ));
-        assert_eq!(
-            core.snapshot(),
-            Snapshot {
-                active_version: 0,
-                transition_id: None,
-                ready: false,
-            }
-        );
-        assert!(matches!(
-            core.encrypt(b"must not escape"),
-            Err(Failure::InvalidState)
-        ));
+            let payload = vec![0, 8, 0];
+            let control = if welcome {
+                Control::Welcome(payload)
+            } else {
+                Control::Commit(payload)
+            };
+            let actions = core.control(control).unwrap();
+            assert!(matches!(
+                actions.as_slice(),
+                [
+                    Outbound::Json { opcode: 31, .. },
+                    Outbound::Binary(package)
+                ] if package.first() == Some(&26)
+            ));
+            assert_eq!(
+                core.snapshot(),
+                Snapshot {
+                    active_version: 0,
+                    transition_id: None,
+                    ready: false,
+                }
+            );
+            assert!(matches!(
+                core.encrypt(b"must not escape"),
+                Err(Failure::InvalidState)
+            ));
+        }
     }
 
     #[test]
