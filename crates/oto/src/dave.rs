@@ -858,6 +858,31 @@ mod tests {
     }
 
     #[test]
+    fn rejected_external_sender_replacement_preserves_active_group() {
+        let mut core = ready_fixture_core();
+        let ready = Snapshot {
+            active_version: 1,
+            transition_id: None,
+            ready: true,
+        };
+        assert_eq!(core.snapshot(), ready);
+        assert_ne!(
+            core.encrypt(b"before replacement").unwrap(),
+            b"before replacement"
+        );
+
+        assert!(matches!(
+            core.control(Control::ExternalSender(test_external_sender_fixture())),
+            Err(Failure::Backend)
+        ));
+        assert_eq!(core.snapshot(), ready);
+        assert_ne!(
+            core.encrypt(b"after replacement").unwrap(),
+            b"after replacement"
+        );
+    }
+
+    #[test]
     fn epoch_one_replaces_active_and_pending_group_state() {
         let mut core = ready_fixture_core();
         assert_ne!(core.encrypt(b"old group").unwrap(), b"old group");
