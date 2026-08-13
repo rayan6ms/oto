@@ -337,19 +337,17 @@ impl StateStore {
         });
     }
 
-    pub(crate) fn resume_succeeded(&mut self) {
+    pub(crate) fn resume_succeeded(&mut self, phase: ConnectionPhase) {
         self.current.stats_mut().resumed();
-        self.current
-            .set_phase(ConnectionPhase::EstablishingTransport);
+        self.current.set_phase(phase);
         self.commit();
         let generation = self.current.generation();
         let _ = self
             .events
             .send(ConnectionEvent::ResumeSucceeded { generation });
-        let _ = self.events.send(ConnectionEvent::StateChanged {
-            generation,
-            phase: ConnectionPhase::EstablishingTransport,
-        });
+        let _ = self
+            .events
+            .send(ConnectionEvent::StateChanged { generation, phase });
     }
 
     pub(crate) fn reconnecting(&mut self) {
@@ -364,6 +362,11 @@ impl StateStore {
 
     pub(crate) fn unknown_opcode(&mut self) {
         self.current.stats_mut().unknown_opcode();
+        self.commit();
+    }
+
+    pub(crate) fn discarded_udp_datagrams(&mut self, count: u64) {
+        self.current.stats_mut().add_discarded_udp_datagrams(count);
         self.commit();
     }
 

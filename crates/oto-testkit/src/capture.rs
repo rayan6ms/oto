@@ -89,6 +89,11 @@ impl PacketCapture {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    #[must_use]
+    pub fn max_packet_bytes(&self) -> usize {
+        self.max_packet_bytes
+    }
 }
 
 #[cfg(test)]

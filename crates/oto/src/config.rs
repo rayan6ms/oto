@@ -110,7 +110,11 @@ impl ResourceLimits {
             && self.staged_frame_capacity > 0;
         if !all_nonzero
             || self.dave_binary_body_bytes > self.gateway_binary_bytes
-            || self.encoded_opus_frame_bytes > self.udp_datagram_bytes
+            || self.udp_datagram_bytes > usize::from(u16::MAX)
+            || self
+                .encoded_opus_frame_bytes
+                .checked_add(32)
+                .is_none_or(|packet_bytes| packet_bytes > self.udp_datagram_bytes)
             || self.staged_frame_capacity != 1
         {
             return Err(Error::new(

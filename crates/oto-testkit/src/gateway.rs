@@ -733,7 +733,16 @@ async fn handle_text(
             state
                 .lock()
                 .expect("fake gateway state mutex poisoned")
-                .record(GatewayRecord::SelectProtocol(data))?;
+                .record(GatewayRecord::SelectProtocol(data.clone()))?;
+            let Some(mode) = data
+                .get("data")
+                .and_then(|data| data.get("mode"))
+                .and_then(Value::as_str)
+                .filter(|mode| config.modes.iter().any(|offered| offered == mode))
+            else {
+                close_decode_error(websocket).await;
+                return Ok(false);
+            };
             send_numbered_json(
                 websocket,
                 config,
@@ -741,7 +750,7 @@ async fn handle_text(
                 &mut protocol.replay,
                 4,
                 json!({
-                    "mode": config.modes[0],
+                    "mode": mode,
                     "secret_key": config.secret_key,
                     "dave_protocol_version": config.dave_protocol_version,
                 }),

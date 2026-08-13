@@ -89,6 +89,16 @@ impl Error {
         self
     }
 
+    pub(crate) fn for_operation_generation(
+        mut self,
+        operation: Operation,
+        generation: ConnectionGeneration,
+    ) -> Self {
+        self.operation = operation;
+        self.generation = Some(generation);
+        self
+    }
+
     #[must_use]
     pub fn kind(&self) -> ErrorKind {
         self.kind

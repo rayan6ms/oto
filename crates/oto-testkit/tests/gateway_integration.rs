@@ -326,7 +326,21 @@ async fn replay_history_evicts_oldest_and_rejects_an_unavailable_ack() {
         .unwrap();
     assert_eq!(next_json(&mut client).await["seq"], 10);
     client
-        .send(Message::Text(json!({"op": 1, "d": {}}).to_string().into()))
+        .send(Message::Text(
+            json!({
+                "op": 1,
+                "d": {
+                    "protocol": "udp",
+                    "data": {
+                        "address": "203.0.113.10",
+                        "port": 50000,
+                        "mode": "aead_aes256_gcm_rtpsize"
+                    }
+                }
+            })
+            .to_string()
+            .into(),
+        ))
         .await
         .unwrap();
     assert_eq!(next_json(&mut client).await["seq"], 11);

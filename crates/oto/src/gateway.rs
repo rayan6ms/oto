@@ -1,4 +1,5 @@
 use std::future::pending;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,6 +7,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Number, Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, sleep_until, timeout};
 #[cfg(test)]
 use tokio_tungstenite::Connector;
@@ -16,12 +18,18 @@ use crate::config::Config;
 use crate::connection::StateStore;
 use crate::error::{Error, ErrorKind, Operation, RetryDisposition};
 use crate::model::{CloseReason, ConnectionGeneration, ConnectionPhase, VoiceConnectInfo};
+use crate::transport::{
+    DiscoveredAddress, DiscoveredSocket, DiscoveryFailure, TransportEncoder, TransportMode,
+    discover, select_mode,
+};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const MIN_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
 const MAX_RECONNECT_ATTEMPTS: u8 = 4;
+const UDP_DRAIN_BATCH: usize = 32;
+const MAX_TRANSPORT_MODES: usize = 32;
 
 type ClientWebSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -115,6 +123,66 @@ struct InboundEnvelope {
     seq: Option<Number>,
 }
 
+#[derive(Deserialize)]
+struct ReadyData {
+    ssrc: u32,
+    ip: IpAddr,
+    port: u16,
+    modes: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct SessionDescriptionData {
+    mode: String,
+    secret_key: [u8; 32],
+}
+
+struct DiscoveryCompletion {
+    generation: ConnectionGeneration,
+    ssrc: u32,
+    mode: TransportMode,
+    result: Result<DiscoveredSocket, DiscoveryFailure>,
+}
+
+struct DiscoveryTask(Option<JoinHandle<()>>);
+
+impl DiscoveryTask {
+    fn replace(&mut self, task: JoinHandle<()>) {
+        if let Some(previous) = self.0.replace(task) {
+            previous.abort();
+        }
+    }
+
+    fn completed(&mut self) {
+        self.0.take();
+    }
+
+    fn is_running(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+impl Drop for DiscoveryTask {
+    fn drop(&mut self) {
+        if let Some(task) = self.0.take() {
+            task.abort();
+        }
+    }
+}
+
+struct UdpTransport {
+    socket: Arc<tokio::net::UdpSocket>,
+    ssrc: u32,
+    selected_mode: TransportMode,
+    encoder: Option<TransportEncoder>,
+}
+
+impl UdpTransport {
+    fn is_ready(&self) -> bool {
+        self.encoder.is_some()
+    }
+}
+
 pub(crate) async fn run(
     config: Arc<Config>,
     mut info: ValidatedInfo,
@@ -128,6 +196,7 @@ pub(crate) async fn run(
     let mut latest_sequence = None;
     let mut heartbeat_nonce = 0_u64;
     let mut reconnect_attempts = 0_u8;
+    let mut transport = None;
 
     'control: loop {
         if *shutdown.borrow() {
@@ -188,6 +257,7 @@ pub(crate) async fn run(
                             if let Some(replacement) = accept_replacement(&mut store, replacement, reply) {
                                 info = replacement;
                                 latest_sequence = None;
+                                transport = None;
                                 reconnect_attempts = 0;
                                 attempt = Attempt::Identify;
                                 continue 'control;
@@ -229,6 +299,7 @@ pub(crate) async fn run(
                                 BackoffOutcome::Replaced => {
                                     reconnect_attempts = 0;
                                     attempt = Attempt::Identify;
+                                    transport = None;
                                 }
                                 BackoffOutcome::Shutdown => {
                                     finish_shutdown(&mut store, &mut initial);
@@ -265,6 +336,7 @@ pub(crate) async fn run(
             &mut latest_sequence,
             &mut heartbeat_nonce,
             &mut reconnect_attempts,
+            &mut transport,
             &mut commands,
             &mut shutdown,
             &mut store,
@@ -287,9 +359,11 @@ pub(crate) async fn run(
                     terminal(&mut store, &mut initial, error);
                     return;
                 }
-                attempt = if latest_sequence.is_some() {
+                attempt = if latest_sequence.is_some() && transport.is_some() {
                     Attempt::Resume
                 } else {
+                    latest_sequence = None;
+                    transport = None;
                     Attempt::Identify
                 };
                 match backoff_or_command(
@@ -306,6 +380,7 @@ pub(crate) async fn run(
                     BackoffOutcome::Replaced => {
                         reconnect_attempts = 0;
                         attempt = Attempt::Identify;
+                        transport = None;
                     }
                     BackoffOutcome::Shutdown => {
                         finish_shutdown(&mut store, &mut initial);
@@ -315,6 +390,7 @@ pub(crate) async fn run(
             }
             SessionOutcome::FreshIdentify => {
                 latest_sequence = None;
+                transport = None;
                 reconnect_attempts = reconnect_attempts.saturating_add(1);
                 if reconnect_attempts > MAX_RECONNECT_ATTEMPTS {
                     let error = Error::new(
@@ -340,7 +416,10 @@ pub(crate) async fn run(
                 .await
                 {
                     BackoffOutcome::Elapsed => {}
-                    BackoffOutcome::Replaced => reconnect_attempts = 0,
+                    BackoffOutcome::Replaced => {
+                        reconnect_attempts = 0;
+                        transport = None;
+                    }
                     BackoffOutcome::Shutdown => {
                         finish_shutdown(&mut store, &mut initial);
                         return;
@@ -350,6 +429,7 @@ pub(crate) async fn run(
             SessionOutcome::Replace(replacement) => {
                 info = replacement;
                 latest_sequence = None;
+                transport = None;
                 reconnect_attempts = 0;
                 attempt = Attempt::Identify;
             }
@@ -360,6 +440,7 @@ pub(crate) async fn run(
                     Some(replacement) => {
                         info = replacement;
                         latest_sequence = None;
+                        transport = None;
                         reconnect_attempts = 0;
                         attempt = Attempt::Identify;
                     }
@@ -405,6 +486,7 @@ async fn run_session(
     latest_sequence: &mut Option<Number>,
     heartbeat_nonce: &mut u64,
     reconnect_attempts: &mut u8,
+    transport: &mut Option<UdpTransport>,
     commands: &mut mpsc::Receiver<Command>,
     shutdown: &mut watch::Receiver<bool>,
     store: &mut StateStore,
@@ -415,8 +497,13 @@ async fn run_session(
     let mut outstanding = None::<(u64, Instant)>;
     let mut missed_heartbeats = 0_u8;
     let mut pending_pings = Vec::new();
+    let (discovery_sender, mut discovery_receiver) = mpsc::channel::<DiscoveryCompletion>(1);
+    let mut discovery_task = DiscoveryTask(None);
+    let mut udp_receive_buffer = vec![0_u8; config.limits.udp_datagram_bytes() + 1];
 
     loop {
+        let udp_socket = transport.as_ref().map(|transport| transport.socket.clone());
+        let has_udp_socket = udp_socket.is_some();
         tokio::select! {
             biased;
             changed = shutdown.changed() => {
@@ -490,6 +577,57 @@ async fn run_session(
                             return SessionOutcome::Resume;
                         }
                     }
+                }
+            }
+            completion = discovery_receiver.recv(), if discovery_task.is_running() => {
+                let Some(completion) = completion else {
+                    return SessionOutcome::Fatal(udp_discovery_error(store.generation()));
+                };
+                discovery_task.completed();
+                if completion.generation != store.generation() {
+                    continue;
+                }
+                let discovered = match completion.result {
+                    Ok(discovered) => discovered,
+                    Err(failure) => {
+                        return SessionOutcome::Fatal(udp_discovery_error_with_source(
+                            store.generation(), failure
+                        ));
+                    }
+                };
+                let select = select_protocol_payload(discovered.public, completion.mode);
+                *transport = Some(UdpTransport {
+                    socket: discovered.socket,
+                    ssrc: completion.ssrc,
+                    selected_mode: completion.mode,
+                    encoder: None,
+                });
+                if let Err(error) = timed_send(&mut websocket, select).await {
+                    return SessionOutcome::Fatal(error_for_generation(
+                        error, Operation::Connect, store.generation()
+                    ));
+                }
+            }
+            readiness = async move {
+                match udp_socket {
+                    Some(socket) => Some(socket.readable().await),
+                    None => pending::<Option<Result<(), std::io::Error>>>().await,
+                }
+            }, if has_udp_socket => {
+                match readiness {
+                    Some(Ok(())) => match drain_udp(
+                        transport.as_ref().expect("readiness requires UDP transport"),
+                        &mut udp_receive_buffer,
+                    ) {
+                        Ok(discarded) => {
+                            if discarded != 0 {
+                                store.discarded_udp_datagrams(discarded as u64);
+                            }
+                        }
+                        Err(_) => return SessionOutcome::FreshIdentify,
+                    },
+                    Some(Err(_)) => return SessionOutcome::FreshIdentify,
+                    None => unreachable!("UDP readiness branch requires socket"),
                 }
             }
             incoming = websocket.next() => {
@@ -574,10 +712,68 @@ async fn run_session(
                                 heartbeat_deadline = Some(Instant::now() + interval);
                             }
                             2 if attempt == Attempt::Identify => {
-                                if !valid_ready(&data) {
+                                let ready = match parse_ready(data, store.generation()) {
+                                    Ok(ready) => ready,
+                                    Err(error) => return SessionOutcome::Fatal(error),
+                                };
+                                let Some(mode) = select_mode(&ready.modes) else {
+                                    return SessionOutcome::Fatal(unsupported_transport_error(
+                                        store.generation()
+                                    ));
+                                };
+                                let generation = store.generation();
+                                let remote = SocketAddr::new(ready.ip, ready.port);
+                                let max_datagram_bytes = config.limits.udp_datagram_bytes();
+                                let sender = discovery_sender.clone();
+                                *transport = None;
+                                discovery_task.replace(tokio::spawn(async move {
+                                    let result = discover(remote, ready.ssrc, max_datagram_bytes).await;
+                                    let _ = sender.send(DiscoveryCompletion {
+                                        generation,
+                                        ssrc: ready.ssrc,
+                                        mode,
+                                        result,
+                                    }).await;
+                                }));
+                                store.phase_to(ConnectionPhase::EstablishingTransport);
+                                *reconnect_attempts = 0;
+                            }
+                            4 => {
+                                let Some(active) = transport.as_mut() else {
+                                    return SessionOutcome::Fatal(protocol_error(store.generation()));
+                                };
+                                if active.encoder.is_some() {
                                     return SessionOutcome::Fatal(protocol_error(store.generation()));
                                 }
-                                store.phase_to(ConnectionPhase::EstablishingTransport);
+                                let description: SessionDescriptionData = match serde_json::from_value(data) {
+                                    Ok(description) => description,
+                                    Err(source) => return SessionOutcome::Fatal(
+                                        protocol_error(store.generation()).with_source(source)
+                                    ),
+                                };
+                                let Some(mode) = TransportMode::parse(&description.mode) else {
+                                    return SessionOutcome::Fatal(unsupported_transport_error(
+                                        store.generation()
+                                    ));
+                                };
+                                if mode != active.selected_mode {
+                                    return SessionOutcome::Fatal(protocol_error(store.generation()));
+                                }
+                                let encoder = match TransportEncoder::new(
+                                    mode,
+                                    &description.secret_key,
+                                    active.ssrc,
+                                    config.limits.encoded_opus_frame_bytes(),
+                                    config.limits.udp_datagram_bytes(),
+                                ) {
+                                    Ok(encoder) => encoder,
+                                    Err(_) => return SessionOutcome::Fatal(transport_crypto_error(
+                                        store.generation()
+                                    )),
+                                };
+                                debug_assert_eq!(encoder.mode(), mode);
+                                active.encoder = Some(encoder);
+                                store.phase_to(ConnectionPhase::EstablishingDave);
                                 *reconnect_attempts = 0;
                                 if let Some(sender) = initial.take() {
                                     let _ = sender.send(Ok(()));
@@ -601,7 +797,12 @@ async fn run_session(
                             }
                             9 if attempt == Attempt::Resume => {
                                 *reconnect_attempts = 0;
-                                store.resume_succeeded();
+                                let phase = if transport.as_ref().is_some_and(UdpTransport::is_ready) {
+                                    ConnectionPhase::EstablishingDave
+                                } else {
+                                    ConnectionPhase::EstablishingTransport
+                                };
+                                store.resume_succeeded(phase);
                             }
                             _ => store.unknown_opcode(),
                         }
@@ -666,6 +867,32 @@ fn resume_payload(info: &ValidatedInfo, latest_sequence: Option<&Number>) -> Mes
     }))
 }
 
+fn select_protocol_payload(public: DiscoveredAddress, mode: TransportMode) -> Message {
+    json_message(json!({
+        "op": 1,
+        "d": {
+            "protocol": "udp",
+            "data": {
+                "address": public.address.to_string(),
+                "port": public.port,
+                "mode": mode.name(),
+            }
+        }
+    }))
+}
+
+fn drain_udp(transport: &UdpTransport, buffer: &mut [u8]) -> Result<usize, std::io::Error> {
+    let mut discarded = 0;
+    while discarded < UDP_DRAIN_BATCH {
+        match transport.socket.try_recv(buffer) {
+            Ok(_) => discarded += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(discarded)
+}
+
 async fn send_heartbeat(
     websocket: &mut ClientWebSocket,
     latest_sequence: &Option<Number>,
@@ -725,20 +952,13 @@ fn json_message(value: Value) -> Message {
     Message::Text(value.to_string().into())
 }
 
-fn valid_ready(data: &Value) -> bool {
-    data.get("ssrc").and_then(Value::as_u64).is_some()
-        && data
-            .get("ip")
-            .and_then(Value::as_str)
-            .is_some_and(|ip| !ip.is_empty())
-        && data
-            .get("port")
-            .and_then(Value::as_u64)
-            .is_some_and(|port| port <= u64::from(u16::MAX))
-        && data
-            .get("modes")
-            .and_then(Value::as_array)
-            .is_some_and(|modes| !modes.is_empty())
+fn parse_ready(data: Value, generation: ConnectionGeneration) -> Result<ReadyData, Error> {
+    let ready: ReadyData = serde_json::from_value(data)
+        .map_err(|source| protocol_error(generation).with_source(source))?;
+    if ready.port == 0 || ready.modes.is_empty() || ready.modes.len() > MAX_TRANSPORT_MODES {
+        return Err(protocol_error(generation));
+    }
+    Ok(ready)
 }
 
 fn next_deadline(previous: Instant, interval: Duration, now: Instant) -> Instant {
@@ -931,6 +1151,46 @@ fn protocol_error(generation: ConnectionGeneration) -> Error {
     )
 }
 
+fn udp_discovery_error(generation: ConnectionGeneration) -> Error {
+    Error::new(
+        ErrorKind::UdpDiscovery,
+        Operation::Connect,
+        Some(generation),
+        RetryDisposition::Fatal,
+        None,
+        "UDP discovery failed after bounded retries",
+    )
+}
+
+fn udp_discovery_error_with_source(
+    generation: ConnectionGeneration,
+    failure: DiscoveryFailure,
+) -> Error {
+    udp_discovery_error(generation).with_source(failure)
+}
+
+fn unsupported_transport_error(generation: ConnectionGeneration) -> Error {
+    Error::new(
+        ErrorKind::UnsupportedTransport,
+        Operation::Connect,
+        Some(generation),
+        RetryDisposition::Fatal,
+        None,
+        "voice gateway offered no supported transport mode",
+    )
+}
+
+fn transport_crypto_error(generation: ConnectionGeneration) -> Error {
+    Error::new(
+        ErrorKind::TransportCrypto,
+        Operation::Connect,
+        Some(generation),
+        RetryDisposition::Fatal,
+        None,
+        "transport cipher initialization failed",
+    )
+}
+
 fn resource_error(generation: ConnectionGeneration) -> Error {
     Error::new(
         ErrorKind::ResourceLimit,
@@ -958,14 +1218,7 @@ fn error_for_generation(
     operation: Operation,
     generation: ConnectionGeneration,
 ) -> Error {
-    Error::new(
-        error.kind(),
-        operation,
-        Some(generation),
-        error.retry_disposition(),
-        error.safe_code(),
-        "voice gateway I/O failed",
-    )
+    error.for_operation_generation(operation, generation)
 }
 
 fn fail_pending_pings(
@@ -1019,12 +1272,69 @@ fn finish_shutdown(
 #[cfg(test)]
 mod tests {
     use oto_testkit::{
-        FakeVoiceGateway, FakeVoiceGatewayConfig, GatewayCloseStage, GatewayRecord, ScriptedClose,
-        TestTls, VoiceClose,
+        FakeUdpServer, FakeUdpServerConfig, FakeVoiceGateway, FakeVoiceGatewayConfig, FaultAction,
+        GatewayCloseStage, GatewayRecord, ManualClock, ScriptedClose, TestTls, VoiceClose,
     };
 
     use super::*;
     use crate::{ConnectionPhase, ErrorKind, EventReceiveError, Oto, ResourceLimits, VoiceToken};
+
+    struct TestGateway {
+        gateway: FakeVoiceGateway,
+        udp: FakeUdpServer,
+        clock: ManualClock,
+    }
+
+    impl std::ops::Deref for TestGateway {
+        type Target = FakeVoiceGateway;
+
+        fn deref(&self) -> &Self::Target {
+            &self.gateway
+        }
+    }
+
+    impl TestGateway {
+        async fn start(
+            mut config: FakeVoiceGatewayConfig,
+        ) -> Result<Self, oto_testkit::GatewayError> {
+            let clock = ManualClock::new(Duration::ZERO);
+            let udp = FakeUdpServer::start(FakeUdpServerConfig::localhost(clock.clone()))
+                .await
+                .expect("fake UDP peer starts");
+            config.voice_ip = udp.local_addr().ip().to_string();
+            config.voice_port = udp.local_addr().port();
+            let gateway = FakeVoiceGateway::start(config).await?;
+            Ok(Self {
+                gateway,
+                udp,
+                clock,
+            })
+        }
+
+        async fn start_with_tls(
+            mut config: FakeVoiceGatewayConfig,
+            tls: TestTls,
+        ) -> Result<Self, oto_testkit::GatewayError> {
+            let clock = ManualClock::new(Duration::ZERO);
+            let udp = FakeUdpServer::start(FakeUdpServerConfig::localhost(clock.clone()))
+                .await
+                .expect("fake UDP peer starts");
+            config.voice_ip = udp.local_addr().ip().to_string();
+            config.voice_port = udp.local_addr().port();
+            let gateway = FakeVoiceGateway::start_with_tls(config, tls).await?;
+            Ok(Self {
+                gateway,
+                udp,
+                clock,
+            })
+        }
+
+        async fn shutdown(self) -> Result<(), oto_testkit::GatewayError> {
+            self.gateway.shutdown().await?;
+            self.udp.shutdown().await.expect("fake UDP peer shuts down");
+            Ok(())
+        }
+    }
 
     fn voice_info(gateway: &FakeVoiceGateway, session: &str, token: &str) -> VoiceConnectInfo {
         VoiceConnectInfo::new(
@@ -1071,9 +1381,7 @@ mod tests {
         let mut config = FakeVoiceGatewayConfig::local();
         config.heartbeat_interval = Duration::from_millis(50);
         config.sequence_start = u16::MAX;
-        let gateway = FakeVoiceGateway::start(config)
-            .await
-            .expect("gateway starts");
+        let gateway = TestGateway::start(config).await.expect("gateway starts");
         let oto = test_oto(&gateway, ResourceLimits::default());
         let info = voice_info(&gateway, "session-a", "super-secret-token");
         assert!(!format!("{info:?}").contains("super-secret-token"));
@@ -1081,7 +1389,7 @@ mod tests {
         let connection = oto.connect(info).await.expect("gateway connects");
         assert_eq!(
             connection.state().phase(),
-            ConnectionPhase::EstablishingTransport
+            ConnectionPhase::EstablishingDave
         );
         assert!(connection.ping().await.expect("ping is acknowledged") < Duration::from_secs(1));
 
@@ -1102,6 +1410,19 @@ mod tests {
             .expect("heartbeat RTT is durable");
         assert!(rtt < Duration::from_secs(1));
 
+        eventually(|| {
+            gateway.records().iter().any(|record| {
+                matches!(
+                    record,
+                    GatewayRecord::Heartbeat {
+                        seq_ack: Some(2),
+                        ..
+                    }
+                )
+            })
+        })
+        .await;
+
         let records = gateway.records();
         assert!(
             records
@@ -1117,7 +1438,7 @@ mod tests {
             matches!(
                 record,
                 GatewayRecord::Heartbeat {
-                    seq_ack: Some(1),
+                    seq_ack: Some(2),
                     ..
                 }
             )
@@ -1130,14 +1451,139 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn transport_mode_preference_fallback_and_rejection_are_end_to_end() {
+        for (modes, expected) in [
+            (
+                vec![
+                    "aead_xchacha20_poly1305_rtpsize".to_owned(),
+                    "future_mode".to_owned(),
+                    "aead_aes256_gcm_rtpsize".to_owned(),
+                ],
+                "aead_aes256_gcm_rtpsize",
+            ),
+            (
+                vec!["aead_xchacha20_poly1305_rtpsize".to_owned()],
+                "aead_xchacha20_poly1305_rtpsize",
+            ),
+        ] {
+            let mut config = FakeVoiceGatewayConfig::local();
+            config.modes = modes;
+            let gateway = TestGateway::start(config).await.expect("gateway starts");
+            let oto = test_oto(&gateway, ResourceLimits::default());
+            let connection = oto
+                .connect(voice_info(&gateway, "mode-session", "mode-token"))
+                .await
+                .expect("supported transport negotiates");
+            assert!(gateway.records().iter().any(|record| {
+                matches!(record, GatewayRecord::SelectProtocol(data)
+                    if data.get("data")
+                        .and_then(|data| data.get("mode"))
+                        .and_then(Value::as_str) == Some(expected))
+            }));
+            connection.shutdown().await.expect("connection shuts down");
+            gateway.shutdown().await.expect("gateway shuts down");
+        }
+
+        let mut config = FakeVoiceGatewayConfig::local();
+        config.modes = vec!["xsalsa20_poly1305_lite_rtpsize".to_owned()];
+        let gateway = TestGateway::start(config).await.expect("gateway starts");
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        let error = oto
+            .connect(voice_info(&gateway, "legacy-session", "legacy-token"))
+            .await
+            .expect_err("discontinued-only offer is rejected");
+        assert_eq!(error.kind(), ErrorKind::UnsupportedTransport);
+        assert!(gateway.udp.capture().is_empty());
+        gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn connected_transport_continuously_drains_bounded_inbound_udp() {
+        let gateway = TestGateway::start(FakeVoiceGatewayConfig::local())
+            .await
+            .expect("gateway starts");
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        let connection = oto
+            .connect(voice_info(&gateway, "drain-session", "drain-token"))
+            .await
+            .expect("transport connects");
+
+        for packet in 0_u8..8 {
+            gateway
+                .udp
+                .try_send_to_client(vec![packet; 64])
+                .expect("bounded inbound datagram queues");
+        }
+        eventually(|| connection.state().stats().discarded_udp_datagrams() >= 8).await;
+        assert_eq!(
+            connection.state().phase(),
+            ConnectionPhase::EstablishingDave
+        );
+
+        connection.shutdown().await.expect("connection shuts down");
+        gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn replacement_cancels_stale_udp_discovery_without_crossing_generations() {
+        let gateway = TestGateway::start(FakeVoiceGatewayConfig::local())
+            .await
+            .expect("gateway starts");
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        let connection = oto
+            .connect(voice_info(&gateway, "generation-one", "token-one"))
+            .await
+            .expect("first generation connects");
+
+        gateway
+            .udp
+            .push_fault(FaultAction::Delay(Duration::from_secs(30)))
+            .expect("next discovery response is delayed");
+        let second = connection
+            .replace_voice_info(voice_info(&gateway, "generation-two", "token-two"))
+            .await
+            .expect("second generation is accepted");
+        assert_eq!(second.get(), 2);
+        yield_eventually("second generation UDP discovery", || {
+            gateway.udp.capture().len() >= 2
+        })
+        .await;
+
+        let third = connection
+            .replace_voice_info(voice_info(&gateway, "generation-three", "token-three"))
+            .await
+            .expect("third generation supersedes discovery");
+        assert_eq!(third.get(), 3);
+        eventually(|| {
+            connection.state().generation() == third
+                && connection.state().phase() == ConnectionPhase::EstablishingDave
+        })
+        .await;
+
+        gateway
+            .clock
+            .advance(Duration::from_secs(30))
+            .expect("delayed stale response is released");
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(connection.state().generation(), third);
+        assert_eq!(
+            connection.state().phase(),
+            ConnectionPhase::EstablishingDave
+        );
+
+        connection.shutdown().await.expect("connection shuts down");
+        gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
     async fn dropped_and_delayed_heartbeat_ack_trigger_bounded_resume_and_rtt() {
         let mut config = FakeVoiceGatewayConfig::local();
         config.heartbeat_interval = Duration::from_millis(100);
         config.drop_heartbeat_acks = 1;
         config.heartbeat_ack_delay = Duration::from_millis(3);
-        let gateway = FakeVoiceGateway::start(config)
-            .await
-            .expect("gateway starts");
+        let gateway = TestGateway::start(config).await.expect("gateway starts");
         let oto = test_oto(&gateway, ResourceLimits::default());
         let connection = oto
             .connect(voice_info(&gateway, "session-heartbeat", "token-a"))
@@ -1223,9 +1669,7 @@ mod tests {
                 reason: "resume buffer unavailable".to_owned(),
             },
         });
-        let gateway = FakeVoiceGateway::start(config)
-            .await
-            .expect("gateway starts");
+        let gateway = TestGateway::start(config).await.expect("gateway starts");
         let oto = test_oto(&gateway, ResourceLimits::default());
         let connection = oto
             .connect(voice_info(&gateway, "session-replay", "token-a"))
@@ -1246,7 +1690,7 @@ mod tests {
             let records = gateway.records();
             let resumes = records
                 .iter()
-                .filter(|record| matches!(record, GatewayRecord::Resume { seq_ack: 0 }))
+                .filter(|record| matches!(record, GatewayRecord::Resume { seq_ack: 1 }))
                 .count();
             let identifies = records
                 .iter()
@@ -1265,9 +1709,7 @@ mod tests {
     async fn buffered_resume_replays_messages_after_last_ack_without_new_generation() {
         let mut config = FakeVoiceGatewayConfig::local();
         config.heartbeat_interval = Duration::from_millis(100);
-        let gateway = FakeVoiceGateway::start(config)
-            .await
-            .expect("gateway starts");
+        let gateway = TestGateway::start(config).await.expect("gateway starts");
         let oto = test_oto(&gateway, ResourceLimits::default());
         let connection = oto
             .connect(voice_info(&gateway, "session-buffer", "token"))
@@ -1293,7 +1735,7 @@ mod tests {
             gateway
                 .records()
                 .iter()
-                .any(|record| { matches!(record, GatewayRecord::Resume { seq_ack: 0 }) })
+                .any(|record| { matches!(record, GatewayRecord::Resume { seq_ack: 1 }) })
         );
 
         connection.shutdown().await.expect("shutdown succeeds");
@@ -1315,9 +1757,7 @@ mod tests {
                     reason: "bad token".to_owned(),
                 },
             });
-            let gateway = FakeVoiceGateway::start(config)
-                .await
-                .expect("gateway starts");
+            let gateway = TestGateway::start(config).await.expect("gateway starts");
             let oto = test_oto(&gateway, ResourceLimits::default());
             let error = oto
                 .connect(voice_info(&gateway, "session-close", "invalid-token"))
@@ -1340,28 +1780,20 @@ mod tests {
                 reason: "bad token".to_owned(),
             },
         });
-        let gateway = FakeVoiceGateway::start(config)
-            .await
-            .expect("gateway starts");
+        let gateway = TestGateway::start(config).await.expect("gateway starts");
         let oto = test_oto(&gateway, ResourceLimits::default());
-        let connection = oto
+        let error = oto
             .connect(voice_info(&gateway, "session-ready-close", "invalid-token"))
             .await
-            .expect("Ready can win the connect completion race");
-        eventually(|| connection.state().phase() == ConnectionPhase::Failed).await;
-        let failure = connection
-            .state()
-            .failure()
-            .cloned()
-            .expect("failure is durable");
-        assert_eq!(failure.kind(), ErrorKind::CredentialsRejected);
-        assert_eq!(failure.safe_code(), Some(4004));
+            .expect_err("connect waits for transport establishment after Ready");
+        assert_eq!(error.kind(), ErrorKind::CredentialsRejected);
+        assert_eq!(error.safe_code(), Some(4004));
         gateway.shutdown().await.expect("gateway shuts down");
     }
 
     #[tokio::test]
     async fn replacement_storm_rejects_stale_generation_even_on_same_endpoint_new_token() {
-        let gateway = FakeVoiceGateway::start(FakeVoiceGatewayConfig::local())
+        let gateway = TestGateway::start(FakeVoiceGatewayConfig::local())
             .await
             .expect("gateway starts");
         let oto = test_oto(&gateway, ResourceLimits::default());
@@ -1410,16 +1842,15 @@ mod tests {
     #[tokio::test]
     async fn stale_slow_endpoint_completion_cannot_overwrite_new_generation() {
         let tls = TestTls::generate().expect("shared TLS material generates");
-        let initial =
-            FakeVoiceGateway::start_with_tls(FakeVoiceGatewayConfig::local(), tls.clone())
-                .await
-                .expect("initial gateway starts");
+        let initial = TestGateway::start_with_tls(FakeVoiceGatewayConfig::local(), tls.clone())
+            .await
+            .expect("initial gateway starts");
         let mut slow_config = FakeVoiceGatewayConfig::local();
         slow_config.hello_delay = Duration::from_millis(150);
-        let slow = FakeVoiceGateway::start_with_tls(slow_config, tls.clone())
+        let slow = TestGateway::start_with_tls(slow_config, tls.clone())
             .await
             .expect("slow gateway starts");
-        let fast = FakeVoiceGateway::start_with_tls(FakeVoiceGatewayConfig::local(), tls)
+        let fast = TestGateway::start_with_tls(FakeVoiceGatewayConfig::local(), tls)
             .await
             .expect("fast gateway starts");
         let oto = test_oto(&initial, ResourceLimits::default());
@@ -1456,7 +1887,7 @@ mod tests {
         assert_eq!(connection.state().generation().get(), 3);
         assert_eq!(
             connection.state().phase(),
-            ConnectionPhase::EstablishingTransport
+            ConnectionPhase::EstablishingDave
         );
         assert!(
             !slow
@@ -1476,7 +1907,7 @@ mod tests {
 
     #[tokio::test]
     async fn needs_fresh_voice_info_waits_without_spinning_and_accepts_replacement() {
-        let gateway = FakeVoiceGateway::start(FakeVoiceGatewayConfig::local())
+        let gateway = TestGateway::start(FakeVoiceGatewayConfig::local())
             .await
             .expect("gateway starts");
         let oto = test_oto(&gateway, ResourceLimits::default());
@@ -1504,7 +1935,7 @@ mod tests {
         assert_eq!(generation.get(), 2);
         eventually(|| {
             connection.state().generation() == generation
-                && connection.state().phase() == ConnectionPhase::EstablishingTransport
+                && connection.state().phase() == ConnectionPhase::EstablishingDave
         })
         .await;
 
@@ -1514,7 +1945,7 @@ mod tests {
 
     #[tokio::test]
     async fn text_and_binary_message_limits_accept_edge_and_reject_one_byte_over() {
-        let text_gateway = FakeVoiceGateway::start(FakeVoiceGatewayConfig::local())
+        let text_gateway = TestGateway::start(FakeVoiceGatewayConfig::local())
             .await
             .expect("text gateway starts");
         let text_limit = 256;
@@ -1559,7 +1990,7 @@ mod tests {
             .await
             .expect("text gateway shuts down");
 
-        let binary_gateway = FakeVoiceGateway::start(FakeVoiceGatewayConfig::local())
+        let binary_gateway = TestGateway::start(FakeVoiceGatewayConfig::local())
             .await
             .expect("binary gateway starts");
         let limits = ResourceLimits::default()
@@ -1594,7 +2025,7 @@ mod tests {
 
     #[tokio::test]
     async fn command_saturation_and_slow_observer_never_hide_durable_final_state() {
-        let gateway = FakeVoiceGateway::start(FakeVoiceGatewayConfig::local())
+        let gateway = TestGateway::start(FakeVoiceGatewayConfig::local())
             .await
             .expect("gateway starts");
         let limits = ResourceLimits::default()
@@ -1665,7 +2096,7 @@ mod tests {
     async fn cancelled_connect_and_last_handle_drop_leave_no_live_connection_owner() {
         let mut slow_config = FakeVoiceGatewayConfig::local();
         slow_config.hello_delay = Duration::from_secs(5);
-        let slow = FakeVoiceGateway::start(slow_config)
+        let slow = TestGateway::start(slow_config)
             .await
             .expect("slow gateway starts");
         let oto = test_oto(&slow, ResourceLimits::default());
@@ -1680,7 +2111,7 @@ mod tests {
             .expect("cancelled connect leaves no blocking owner")
             .expect("slow gateway shuts down");
 
-        let gateway = FakeVoiceGateway::start(FakeVoiceGatewayConfig::local())
+        let gateway = TestGateway::start(FakeVoiceGatewayConfig::local())
             .await
             .expect("gateway starts");
         let oto = test_oto(&gateway, ResourceLimits::default());
@@ -1709,6 +2140,14 @@ mod tests {
             .resource_limits(ResourceLimits::default().with_gateway_command_capacity(0))
             .build()
             .expect_err("zero capacity is rejected");
+        assert_eq!(error.kind(), ErrorKind::InvalidConfiguration);
+
+        let error = Oto::builder()
+            .resource_limits(
+                ResourceLimits::default().with_udp_datagram_bytes(usize::from(u16::MAX) + 1),
+            )
+            .build()
+            .expect_err("impossible UDP datagram bound is rejected");
         assert_eq!(error.kind(), ErrorKind::InvalidConfiguration);
 
         let token = VoiceToken::new("never-print-this");

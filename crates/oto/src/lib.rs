@@ -6,6 +6,7 @@ mod connection;
 mod error;
 mod gateway;
 mod model;
+mod transport;
 
 pub use config::{Oto, OtoBuilder, ResourceLimits};
 pub use connection::{EventSubscriber, VoiceConnection};

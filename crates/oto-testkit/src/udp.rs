@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -6,7 +7,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 use tokio::net::UdpSocket;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::{
@@ -163,6 +164,7 @@ pub struct FakeUdpServerConfig {
     pub fault_capacity: usize,
     pub mutation_capacity: usize,
     pub pending_delivery_capacity: usize,
+    pub outbound_capacity: usize,
 }
 
 impl FakeUdpServerConfig {
@@ -177,6 +179,7 @@ impl FakeUdpServerConfig {
             fault_capacity: 32,
             mutation_capacity: 16,
             pending_delivery_capacity: 32,
+            outbound_capacity: 16,
         }
     }
 
@@ -188,6 +191,7 @@ impl FakeUdpServerConfig {
             || self.fault_capacity == 0
             || self.mutation_capacity == 0
             || self.pending_delivery_capacity == 0
+            || self.outbound_capacity == 0
         {
             return Err(UdpTestkitError::InvalidConfig);
         }
@@ -240,6 +244,10 @@ pub enum UdpTestkitError {
     PendingDeliveryFull { capacity: usize },
     #[error("captured UDP packet index {index} does not exist")]
     CapturedPacketMissing { index: usize },
+    #[error("no client UDP peer has been discovered")]
+    ClientPeerMissing,
+    #[error("fake UDP outbound queue is full at capacity {capacity}")]
+    OutboundQueueFull { capacity: usize },
     #[error(transparent)]
     TransportCrypto(#[from] TransportCryptoError),
     #[error("fake UDP task failed to join: {0}")]
@@ -253,12 +261,23 @@ struct PendingDelivery {
     bytes: Vec<u8>,
 }
 
+struct UdpServerShared {
+    capture: PacketCapture,
+    faults: Arc<Mutex<FaultInjector>>,
+    mutations: Arc<Mutex<VecDeque<DiscoveryResponseMutation>>>,
+    stats: FakeUdpStats,
+    last_peer: Arc<Mutex<Option<SocketAddr>>>,
+}
+
 pub struct FakeUdpServer {
     local_addr: SocketAddr,
     capture: PacketCapture,
     faults: Arc<Mutex<FaultInjector>>,
     mutations: Arc<Mutex<VecDeque<DiscoveryResponseMutation>>>,
     mutation_capacity: usize,
+    outbound: mpsc::Sender<Vec<u8>>,
+    outbound_capacity: usize,
+    last_peer: Arc<Mutex<Option<SocketAddr>>>,
     stats: FakeUdpStats,
     shutdown: watch::Sender<bool>,
     task: JoinHandle<Result<(), UdpTestkitError>>,
@@ -289,14 +308,22 @@ impl FakeUdpServer {
         )));
         let stats = FakeUdpStats(Arc::new(FakeUdpStatsInner::default()));
         let (shutdown, shutdown_rx) = watch::channel(false);
+        let (outbound, outbound_rx) = mpsc::channel(config.outbound_capacity);
+        let last_peer = Arc::new(Mutex::new(None));
+
+        let shared = UdpServerShared {
+            capture: capture.clone(),
+            faults: faults.clone(),
+            mutations: mutations.clone(),
+            stats: stats.clone(),
+            last_peer: last_peer.clone(),
+        };
 
         let task = tokio::spawn(run_udp_server(
             socket,
             config.clone(),
-            capture.clone(),
-            faults.clone(),
-            mutations.clone(),
-            stats.clone(),
+            shared,
+            outbound_rx,
             shutdown_rx,
         ));
 
@@ -306,6 +333,9 @@ impl FakeUdpServer {
             faults,
             mutations,
             mutation_capacity: config.mutation_capacity,
+            outbound,
+            outbound_capacity: config.outbound_capacity,
+            last_peer,
             stats,
             shutdown,
             task,
@@ -372,6 +402,32 @@ impl FakeUdpServer {
         )?)
     }
 
+    pub fn try_send_to_client(&self, packet: Vec<u8>) -> Result<(), UdpTestkitError> {
+        if packet.len() > self.capture.max_packet_bytes() {
+            return Err(UdpTestkitError::Capture(CaptureError::PacketTooLarge {
+                actual: packet.len(),
+                maximum: self.capture.max_packet_bytes(),
+            }));
+        }
+        if self
+            .last_peer
+            .lock()
+            .expect("fake UDP peer mutex poisoned")
+            .is_none()
+        {
+            return Err(UdpTestkitError::ClientPeerMissing);
+        }
+        self.outbound.try_send(packet).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => UdpTestkitError::OutboundQueueFull {
+                capacity: self.outbound_capacity,
+            },
+            mpsc::error::TrySendError::Closed(_) => UdpTestkitError::Io(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "fake UDP task is closed",
+            )),
+        })
+    }
+
     pub async fn shutdown(self) -> Result<(), UdpTestkitError> {
         self.shutdown.send_replace(true);
         self.task.await??;
@@ -382,10 +438,8 @@ impl FakeUdpServer {
 async fn run_udp_server(
     socket: UdpSocket,
     config: FakeUdpServerConfig,
-    capture: PacketCapture,
-    faults: Arc<Mutex<FaultInjector>>,
-    mutations: Arc<Mutex<VecDeque<DiscoveryResponseMutation>>>,
-    stats: FakeUdpStats,
+    shared: UdpServerShared,
+    mut outbound: mpsc::Receiver<Vec<u8>>,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), UdpTestkitError> {
     let mut clock_updates = config.clock.subscribe();
@@ -393,7 +447,7 @@ async fn run_udp_server(
     let mut pending = Vec::<PendingDelivery>::with_capacity(config.pending_delivery_capacity);
 
     loop {
-        flush_due(&socket, config.clock.now(), &mut pending, &stats).await?;
+        flush_due(&socket, config.clock.now(), &mut pending, &shared.stats).await?;
         tokio::select! {
             result = shutdown.changed() => {
                 if result.is_err() || *shutdown.borrow() {
@@ -405,21 +459,33 @@ async fn run_udp_server(
                     return Ok(());
                 }
             }
+            packet = outbound.recv() => {
+                let Some(packet) = packet else { return Ok(()); };
+                let peer = *shared.last_peer
+                    .lock()
+                    .expect("fake UDP peer mutex poisoned");
+                if let Some(peer) = peer {
+                    socket.send_to(&packet, peer).await?;
+                }
+            }
             received = socket.recv_from(&mut receive_buffer) => {
                 let (length, peer) = received?;
+                *shared.last_peer
+                    .lock()
+                    .expect("fake UDP peer mutex poisoned") = Some(peer);
                 if length > config.max_datagram_bytes {
-                    stats.0.oversized_dropped.fetch_add(1, Ordering::Relaxed);
+                    shared.stats.0.oversized_dropped.fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
                 let packet = receive_buffer[..length].to_vec();
-                capture.record(PacketRecord {
+                shared.capture.record(PacketRecord {
                     at: config.clock.now(),
                     peer,
                     bytes: packet.clone(),
                 })?;
 
                 let Ok(ssrc) = parse_discovery_request(&packet) else {
-                    stats.0.malformed_discovery_dropped.fetch_add(1, Ordering::Relaxed);
+                    shared.stats.0.malformed_discovery_dropped.fetch_add(1, Ordering::Relaxed);
                     continue;
                 };
                 let mut response = build_discovery_response(
@@ -427,14 +493,14 @@ async fn run_udp_server(
                     config.public_address,
                     config.public_port,
                 )?;
-                if let Some(mutation) = mutations
+                if let Some(mutation) = shared.mutations
                     .lock()
                     .expect("fake UDP mutation mutex poisoned")
                     .pop_front()
                 {
                     apply_mutation(&mut response, mutation);
                 }
-                let scheduled = faults
+                let scheduled = shared.faults
                     .lock()
                     .expect("fake UDP fault mutex poisoned")
                     .apply(config.clock.now(), response)?;

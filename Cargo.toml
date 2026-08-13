@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 aes-gcm = "0.11.0"
 chacha20poly1305 = "0.11.0"
 futures-util = { version = "0.3.33", default-features = false, features = ["sink", "std"] }
+getrandom = "0.4.3"
 rcgen = "0.14.9"
 rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }

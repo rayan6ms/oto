@@ -164,6 +164,7 @@ pub struct ConnectionStats {
     heartbeat_timeouts: u64,
     unknown_opcodes: u64,
     event_lagged: u64,
+    discarded_udp_datagrams: u64,
 }
 
 impl ConnectionStats {
@@ -191,6 +192,10 @@ impl ConnectionStats {
     pub fn event_lagged(self) -> u64 {
         self.event_lagged
     }
+    #[must_use]
+    pub fn discarded_udp_datagrams(self) -> u64 {
+        self.discarded_udp_datagrams
+    }
 
     pub(crate) fn reconnecting(&mut self) {
         self.reconnect_attempts += 1;
@@ -209,6 +214,9 @@ impl ConnectionStats {
     }
     pub(crate) fn set_event_lagged(&mut self, count: u64) {
         self.event_lagged = count;
+    }
+    pub(crate) fn add_discarded_udp_datagrams(&mut self, count: u64) {
+        self.discarded_udp_datagrams = self.discarded_udp_datagrams.saturating_add(count);
     }
 }
 
