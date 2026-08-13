@@ -468,6 +468,7 @@ impl Core {
     }
 
     fn encrypt_into(&mut self, frame: &[u8], output: &mut Vec<u8>) -> Result<(), Failure> {
+        output.clear();
         if self.active_version != MAX_PROTOCOL_VERSION || !self.backend.is_ready() {
             return Err(Failure::InvalidState);
         }
@@ -563,8 +564,20 @@ fn prepared_fixture_core() -> Core {
         .expect("fixture creates a commit");
     let mut announced_commit = 7_u16.to_be_bytes().to_vec();
     announced_commit.extend_from_slice(&response.commit);
-    core.control(Control::Commit(announced_commit)).unwrap();
-    assert!(!core.snapshot().ready);
+    let actions = core.control(Control::Commit(announced_commit)).unwrap();
+    assert!(matches!(
+        actions.as_slice(),
+        [Outbound::Json { opcode: 23, data }]
+            if data == &json!({"transition_id": 7})
+    ));
+    assert_eq!(
+        core.snapshot(),
+        Snapshot {
+            active_version: 0,
+            transition_id: Some(7),
+            ready: false,
+        }
+    );
     core
 }
 
@@ -1130,6 +1143,33 @@ mod tests {
         let encrypted = core.encrypt(&davey::OPUS_SILENCE_PACKET).unwrap();
         assert_ne!(encrypted, davey::OPUS_SILENCE_PACKET);
         assert_eq!(&encrypted[encrypted.len() - 2..], &[0xFA, 0xFA]);
+    }
+
+    #[test]
+    fn successful_commit_stages_sender_and_clears_blocked_output() {
+        let mut core = prepared_fixture_core();
+        let mut output = vec![0xAA; 32];
+        assert!(matches!(
+            core.encrypt_into(b"before execute", &mut output),
+            Err(Failure::InvalidState)
+        ));
+        assert!(output.is_empty());
+
+        assert!(
+            core.control(Control::ExecuteTransition { id: 7 })
+                .unwrap()
+                .is_empty()
+        );
+        core.encrypt_into(b"after execute", &mut output).unwrap();
+        assert_ne!(output, b"after execute");
+        assert_eq!(
+            core.snapshot(),
+            Snapshot {
+                active_version: 1,
+                transition_id: None,
+                ready: true,
+            }
+        );
     }
 
     #[tokio::test]
