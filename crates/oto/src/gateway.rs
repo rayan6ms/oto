@@ -1148,9 +1148,9 @@ async fn run_session(
                                         return SessionOutcome::Fatal(resource_error(store.generation()));
                                     }
                                 };
-                                if dave.is_some()
+                                if let Some(dave) = dave.as_ref()
                                     && let Err(error) = run_dave_control(
-                                        dave, info, config, DaveControl::Roster(users),
+                                        dave, config, DaveControl::Roster(users),
                                         &mut websocket, store.generation(),
                                     ).await
                                 {
@@ -1162,9 +1162,9 @@ async fn run_session(
                                     .and_then(parse_dave_user_id) else {
                                     return SessionOutcome::Fatal(protocol_error(store.generation()));
                                 };
-                                if dave.is_some()
+                                if let Some(dave) = dave.as_ref()
                                     && let Err(error) = run_dave_control(
-                                        dave, info, config, DaveControl::MemberDisconnected(user),
+                                        dave, config, DaveControl::MemberDisconnected(user),
                                         &mut websocket, store.generation(),
                                     ).await
                                 {
@@ -1175,12 +1175,15 @@ async fn run_session(
                                 let Some(control) = decode_dave_json_control(envelope.op, &data) else {
                                     return SessionOutcome::Fatal(protocol_error(store.generation()));
                                 };
+                                let Some(dave) = dave.as_ref() else {
+                                    return SessionOutcome::Fatal(protocol_error(store.generation()));
+                                };
                                 if let Err(error) = run_dave_control(
-                                    dave, info, config, control, &mut websocket, store.generation(),
+                                    dave, config, control, &mut websocket, store.generation(),
                                 ).await {
                                     return SessionOutcome::Fatal(error);
                                 }
-                                if dave.as_ref().is_some_and(|handle| handle.snapshot().ready) {
+                                if dave.snapshot().ready {
                                     store.phase_to(ConnectionPhase::Connected);
                                 }
                             }
@@ -1205,8 +1208,11 @@ async fn run_session(
                         };
                         *latest_sequence = Some(Number::from(sequence));
                         if let Some(control) = control {
+                            let Some(dave) = dave.as_ref() else {
+                                return SessionOutcome::Fatal(protocol_error(store.generation()));
+                            };
                             if let Err(error) = run_dave_control(
-                                dave, info, config, control, &mut websocket, store.generation(),
+                                dave, config, control, &mut websocket, store.generation(),
                             ).await {
                                 return SessionOutcome::Fatal(error);
                             }
@@ -1294,37 +1300,35 @@ fn u16_field(data: &Value, field: &str) -> Option<u16> {
 }
 
 async fn run_dave_control(
-    dave: &mut Option<dave::Handle>,
-    info: &ValidatedInfo,
+    dave: &dave::Handle,
     config: &Config,
     control: DaveControl,
     websocket: &mut ClientWebSocket,
     generation: ConnectionGeneration,
 ) -> Result<(), Error> {
-    if dave.is_none() {
-        *dave = Some(
-            dave::Handle::spawn(
-                info.info.user_id(),
-                info.info.channel_id(),
-                config.limits.gateway_command_capacity(),
-            )
-            .map_err(|source| dave_error(generation).with_source(source))?,
-        );
-    }
     let actions = dave
-        .as_ref()
-        .expect("DAVE handle initialized")
         .control(control)
         .await
         .map_err(|source| dave_error(generation).with_source(source))?;
-    for action in actions {
-        let message =
-            dave_outbound_message(action, config.limits.gateway_binary_bytes(), generation)?;
+    let messages =
+        dave_outbound_messages(actions, config.limits.gateway_binary_bytes(), generation)?;
+    for message in messages {
         timed_send(websocket, message)
             .await
             .map_err(|error| error.for_operation_generation(Operation::Connect, generation))?;
     }
     Ok(())
+}
+
+fn dave_outbound_messages(
+    actions: Vec<DaveOutbound>,
+    maximum_binary_bytes: usize,
+    generation: ConnectionGeneration,
+) -> Result<Vec<Message>, Error> {
+    actions
+        .into_iter()
+        .map(|action| dave_outbound_message(action, maximum_binary_bytes, generation))
+        .collect()
 }
 
 fn dave_outbound_message(
@@ -1335,6 +1339,9 @@ fn dave_outbound_message(
     match action {
         DaveOutbound::Json { opcode, data } => Ok(json_message(json!({"op": opcode, "d": data}))),
         DaveOutbound::Binary(bytes) => {
+            if bytes.is_empty() {
+                return Err(dave_error(generation));
+            }
             if bytes.len() > maximum_binary_bytes {
                 return Err(resource_error(generation));
             }
@@ -2130,6 +2137,14 @@ mod tests {
         assert_eq!(error.operation(), Operation::Connect);
         assert_eq!(error.generation(), Some(ConnectionGeneration::FIRST));
 
+        let error = dave_outbound_message(
+            DaveOutbound::Binary(Vec::new()),
+            4,
+            ConnectionGeneration::FIRST,
+        )
+        .expect_err("an outbound DAVE binary message requires an opcode");
+        assert_eq!(error.kind(), ErrorKind::DaveTransition);
+
         assert!(matches!(
             dave_outbound_message(
                 DaveOutbound::Json {
@@ -2141,6 +2156,20 @@ mod tests {
             ),
             Ok(Message::Text(_))
         ));
+
+        let error = dave_outbound_messages(
+            vec![
+                DaveOutbound::Json {
+                    opcode: 31,
+                    data: json!({"transition_id": 7}),
+                },
+                DaveOutbound::Binary(vec![26, 1, 2, 3, 4]),
+            ],
+            4,
+            ConnectionGeneration::FIRST,
+        )
+        .expect_err("the complete outbound action batch is validated before writes");
+        assert_eq!(error.kind(), ErrorKind::ResourceLimit);
     }
 
     #[derive(Default)]
@@ -2928,6 +2957,85 @@ mod tests {
         assert_eq!(error.kind(), ErrorKind::DaveUnsupported);
         assert_eq!(error.operation(), Operation::Connect);
         assert_eq!(error.retry_disposition(), RetryDisposition::Fatal);
+        assert!(gateway.dave_client_records().is_empty());
+        assert_eq!(gateway.udp.capture().len(), 1);
+
+        gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn unnegotiated_dave_controls_cannot_activate_dave_lazily() {
+        enum ControlCase {
+            Json(u8, Value),
+            Binary(u8, Vec<u8>),
+        }
+
+        for (case, control) in [
+            (
+                "json-transition",
+                ControlCase::Json(21, json!({"protocol_version": 1, "transition_id": 7})),
+            ),
+            (
+                "binary-external-sender",
+                ControlCase::Binary(25, crate::dave::test_external_sender_fixture()),
+            ),
+        ] {
+            let gateway = TestGateway::start(FakeVoiceGatewayConfig::local())
+                .await
+                .expect("gateway starts");
+            let oto = test_oto(&gateway, ResourceLimits::default());
+            let connection = oto
+                .connect(voice_info(&gateway, case, "dave-token"))
+                .await
+                .expect("version zero fixture connects");
+            assert_eq!(connection.state().phase(), ConnectionPhase::Connected);
+
+            match control {
+                ControlCase::Json(opcode, data) => gateway
+                    .try_dispatch_json(opcode, data, true)
+                    .expect("unnegotiated JSON DAVE control queues"),
+                ControlCase::Binary(opcode, data) => gateway
+                    .try_dispatch_binary(opcode, data)
+                    .expect("unnegotiated binary DAVE control queues"),
+            }
+            eventually(|| connection.state().phase() == ConnectionPhase::Failed).await;
+
+            let state = connection.state();
+            let failure = state.failure().expect("protocol failure persists");
+            assert_eq!(failure.kind(), ErrorKind::GatewayProtocol, "case {case}");
+            assert_eq!(failure.operation(), Operation::Connect, "case {case}");
+            assert!(gateway.dave_client_records().is_empty(), "case {case}");
+            assert_eq!(gateway.udp.capture().len(), 1, "case {case}");
+
+            gateway.shutdown().await.expect("gateway shuts down");
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_generated_dave_output_fails_before_any_partial_response() {
+        let external_sender = crate::dave::test_external_sender_fixture();
+        let maximum_message_bytes = external_sender.len() + 3;
+        let limits = ResourceLimits::default()
+            .with_gateway_binary_bytes(maximum_message_bytes)
+            .with_dave_binary_body_bytes(external_sender.len());
+        let mut config = FakeVoiceGatewayConfig::local();
+        config.dave_protocol_version = 1;
+        let gateway = TestGateway::start(config).await.expect("gateway starts");
+        let oto = test_oto(&gateway, limits);
+        let connection = oto
+            .connect(voice_info(&gateway, "dave-output-limit", "dave-token"))
+            .await
+            .expect("transport reaches DAVE establishment");
+
+        gateway
+            .try_dave_external_sender(external_sender)
+            .expect("exact-limit external sender queues");
+        eventually(|| connection.state().phase() == ConnectionPhase::Failed).await;
+
+        let state = connection.state();
+        let failure = state.failure().expect("resource failure persists");
+        assert_eq!(failure.kind(), ErrorKind::ResourceLimit);
+        assert_eq!(failure.operation(), Operation::Connect);
         assert!(gateway.dave_client_records().is_empty());
         assert_eq!(gateway.udp.capture().len(), 1);
 
