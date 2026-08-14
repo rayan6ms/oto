@@ -239,10 +239,14 @@ fn decode_dave_roster(data: &Value, max_members: usize) -> Result<Vec<u64>, Dave
         .iter()
         .map(|user| {
             user.as_str()
-                .and_then(|user| user.parse::<u64>().ok())
+                .and_then(parse_dave_user_id)
                 .ok_or(DaveRosterError::Malformed)
         })
         .collect()
+}
+
+fn parse_dave_user_id(user: &str) -> Option<u64> {
+    user.parse::<u64>().ok().filter(|user| *user != 0)
 }
 
 #[cfg(fuzzing)]
@@ -1153,7 +1157,7 @@ async fn run_session(
                             }
                             13 => {
                                 let Some(user) = data.get("user_id").and_then(Value::as_str)
-                                    .and_then(|user| user.parse::<u64>().ok()) else {
+                                    .and_then(parse_dave_user_id) else {
                                     return SessionOutcome::Fatal(protocol_error(store.generation()));
                                 };
                                 if dave.is_some()
@@ -2083,6 +2087,7 @@ mod tests {
             json!({"user_ids": null}),
             json!({"user_ids": "1"}),
             json!({"user_ids": [1]}),
+            json!({"user_ids": ["0"]}),
             json!({"user_ids": ["18446744073709551616"]}),
         ] {
             assert_eq!(
@@ -3026,6 +3031,53 @@ mod tests {
             gateway
                 .try_dispatch_json(opcode, data, true)
                 .expect("malformed DAVE control queues");
+            eventually(|| connection.state().phase() == ConnectionPhase::Failed).await;
+
+            let state = connection.state();
+            let failure = state.failure().expect("protocol failure persists");
+            assert_eq!(failure.kind(), ErrorKind::GatewayProtocol, "case {case}");
+            assert_eq!(failure.operation(), Operation::Connect, "case {case}");
+            assert_eq!(
+                failure.retry_disposition(),
+                RetryDisposition::Fatal,
+                "case {case}"
+            );
+            assert!(
+                gateway.dave_client_records().is_empty(),
+                "case {case} must fail before DAVE backend output"
+            );
+
+            gateway.shutdown().await.expect("gateway shuts down");
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_dave_membership_controls_fail_before_backend_end_to_end() {
+        for (case, opcode, data) in [
+            ("roster-not-array", 12, json!({"user_ids": "1"})),
+            ("roster-numeric-id", 12, json!({"user_ids": [1]})),
+            ("roster-zero-id", 12, json!({"user_ids": ["0"]})),
+            ("disconnect-missing-id", 13, json!({})),
+            ("disconnect-numeric-id", 13, json!({"user_id": 1})),
+            ("disconnect-zero-id", 13, json!({"user_id": "0"})),
+            (
+                "disconnect-overflow-id",
+                13,
+                json!({"user_id": "18446744073709551616"}),
+            ),
+        ] {
+            let mut config = FakeVoiceGatewayConfig::local();
+            config.dave_protocol_version = 1;
+            let gateway = TestGateway::start(config).await.expect("gateway starts");
+            let oto = test_oto(&gateway, ResourceLimits::default());
+            let connection = oto
+                .connect(voice_info(&gateway, case, "dave-token"))
+                .await
+                .expect("transport reaches DAVE establishment");
+
+            gateway
+                .try_dispatch_json(opcode, data, true)
+                .expect("malformed DAVE membership control queues");
             eventually(|| connection.state().phase() == ConnectionPhase::Failed).await;
 
             let state = connection.state();
