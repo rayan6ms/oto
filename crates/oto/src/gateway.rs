@@ -1044,7 +1044,9 @@ async fn run_session(
                                 };
                                 debug_assert_eq!(encoder.mode(), mode);
                                 if description.dave_protocol_version > dave::MAX_PROTOCOL_VERSION {
-                                    return SessionOutcome::Fatal(dave_error(store.generation()));
+                                    return SessionOutcome::Fatal(dave_unsupported_error(
+                                        store.generation(),
+                                    ));
                                 }
                                 if description.dave_protocol_version != 0 && dave.is_none() {
                                     *dave = match dave::Handle::spawn(
@@ -1785,6 +1787,17 @@ fn dave_error(generation: ConnectionGeneration) -> Error {
         RetryDisposition::Fatal,
         None,
         "DAVE setup or transition failed",
+    )
+}
+
+fn dave_unsupported_error(generation: ConnectionGeneration) -> Error {
+    Error::new(
+        ErrorKind::DaveUnsupported,
+        Operation::Connect,
+        Some(generation),
+        RetryDisposition::Fatal,
+        None,
+        "voice gateway selected an unsupported DAVE protocol version",
     )
 }
 
@@ -2898,6 +2911,26 @@ mod tests {
         assert!(gateway.speaking().is_empty());
 
         connection.shutdown().await.expect("connection shuts down");
+        gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn unsupported_initial_dave_version_is_typed_before_transport_installation() {
+        let mut config = FakeVoiceGatewayConfig::local();
+        config.dave_protocol_version = dave::MAX_PROTOCOL_VERSION + 1;
+        let gateway = TestGateway::start(config).await.expect("gateway starts");
+        let oto = test_oto(&gateway, ResourceLimits::default());
+
+        let error = oto
+            .connect(voice_info(&gateway, "unsupported-dave", "dave-token"))
+            .await
+            .expect_err("unsupported initial DAVE version rejects connection");
+        assert_eq!(error.kind(), ErrorKind::DaveUnsupported);
+        assert_eq!(error.operation(), Operation::Connect);
+        assert_eq!(error.retry_disposition(), RetryDisposition::Fatal);
+        assert!(gateway.dave_client_records().is_empty());
+        assert_eq!(gateway.udp.capture().len(), 1);
+
         gateway.shutdown().await.expect("gateway shuts down");
     }
 
