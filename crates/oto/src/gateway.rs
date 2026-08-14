@@ -2985,6 +2985,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn malformed_dave_json_controls_fail_before_backend_end_to_end() {
+        for (case, opcode, data) in [
+            ("prepare-missing-version", 21, json!({"transition_id": 7})),
+            (
+                "prepare-string-version",
+                21,
+                json!({"protocol_version": "1", "transition_id": 7}),
+            ),
+            (
+                "prepare-transition-overflow",
+                21,
+                json!({"protocol_version": 1, "transition_id": u64::from(u16::MAX) + 1}),
+            ),
+            (
+                "execute-negative-transition",
+                22,
+                json!({"transition_id": -1}),
+            ),
+            (
+                "epoch-fractional-version",
+                24,
+                json!({"protocol_version": 1.5, "epoch": 1}),
+            ),
+            (
+                "epoch-string-value",
+                24,
+                json!({"protocol_version": 1, "epoch": "1"}),
+            ),
+        ] {
+            let mut config = FakeVoiceGatewayConfig::local();
+            config.dave_protocol_version = 1;
+            let gateway = TestGateway::start(config).await.expect("gateway starts");
+            let oto = test_oto(&gateway, ResourceLimits::default());
+            let connection = oto
+                .connect(voice_info(&gateway, case, "dave-token"))
+                .await
+                .expect("transport reaches DAVE establishment");
+
+            gateway
+                .try_dispatch_json(opcode, data, true)
+                .expect("malformed DAVE control queues");
+            eventually(|| connection.state().phase() == ConnectionPhase::Failed).await;
+
+            let state = connection.state();
+            let failure = state.failure().expect("protocol failure persists");
+            assert_eq!(failure.kind(), ErrorKind::GatewayProtocol, "case {case}");
+            assert_eq!(failure.operation(), Operation::Connect, "case {case}");
+            assert_eq!(
+                failure.retry_disposition(),
+                RetryDisposition::Fatal,
+                "case {case}"
+            );
+            assert!(
+                gateway.dave_client_records().is_empty(),
+                "case {case} must fail before DAVE backend output"
+            );
+
+            gateway.shutdown().await.expect("gateway shuts down");
+        }
+    }
+
+    #[tokio::test]
     async fn dave_resume_retains_session_but_fresh_identify_and_replacement_reset_it() {
         let mut config = FakeVoiceGatewayConfig::local();
         config.dave_protocol_version = 1;
