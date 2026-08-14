@@ -3943,7 +3943,7 @@ mod tests {
             .expect("binary gateway starts");
         let limits = ResourceLimits::default()
             .with_gateway_binary_bytes(8)
-            .with_dave_binary_body_bytes(8);
+            .with_dave_binary_body_bytes(5);
         let oto = test_oto(&binary_gateway, limits);
         let binary_connection = oto
             .connect(voice_info(&binary_gateway, "binary-limits", "token"))
@@ -4133,6 +4133,16 @@ mod tests {
             .resource_limits(ResourceLimits::default().with_dave_roster_members(0))
             .build()
             .expect_err("zero DAVE roster capacity is rejected");
+        assert_eq!(error.kind(), ErrorKind::InvalidConfiguration);
+
+        let error = Oto::builder()
+            .resource_limits(
+                ResourceLimits::default()
+                    .with_gateway_binary_bytes(8)
+                    .with_dave_binary_body_bytes(6),
+            )
+            .build()
+            .expect_err("DAVE body and envelope must fit the gateway binary bound");
         assert_eq!(error.kind(), ErrorKind::InvalidConfiguration);
 
         let error = Oto::builder()

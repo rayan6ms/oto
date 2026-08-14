@@ -119,7 +119,10 @@ impl ResourceLimits {
             && self.sender_command_capacity > 0
             && self.staged_frame_capacity > 0;
         if !all_nonzero
-            || self.dave_binary_body_bytes > self.gateway_binary_bytes
+            || self
+                .dave_binary_body_bytes
+                .checked_add(3)
+                .is_none_or(|message_bytes| message_bytes > self.gateway_binary_bytes)
             || self.udp_datagram_bytes > usize::from(u16::MAX)
             || self
                 .encoded_opus_frame_bytes
