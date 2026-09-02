@@ -186,7 +186,7 @@ impl AudioControl {
         let (reply, response) = oneshot::channel();
         self.send(AudioCommand::Stop { reply }, Operation::StopAudio)
             .await?;
-        let result = response.await.unwrap_or_else(|_| {
+        let mut result = response.await.unwrap_or_else(|_| {
             Err(audio_error(
                 ErrorKind::Shutdown,
                 Operation::StopAudio,
@@ -197,6 +197,9 @@ impl AudioControl {
         let task = self.task.lock().expect("audio task mutex poisoned").take();
         if let Some(task) = task {
             let _ = task.await;
+        }
+        if let Ok(snapshot) = &mut result {
+            snapshot.set_stats(self.counters.snapshot());
         }
         result
     }

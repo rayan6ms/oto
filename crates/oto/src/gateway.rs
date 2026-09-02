@@ -347,6 +347,7 @@ pub(crate) async fn run(
     let mut transport = None;
     let mut audio_attachment = None;
     let mut dave = None;
+    let mut dave_roster = Vec::new();
 
     'control: loop {
         if *shutdown.borrow() {
@@ -409,6 +410,7 @@ pub(crate) async fn run(
                                 latest_sequence = None;
                                 transport = None;
                                 dave = None;
+                                dave_roster.clear();
                                 reconnect_attempts = 0;
                                 attempt = Attempt::Identify;
                                 continue 'control;
@@ -476,6 +478,7 @@ pub(crate) async fn run(
                                     attempt = Attempt::Identify;
                                     transport = None;
                                     dave = None;
+                                    dave_roster.clear();
                                 }
                                 BackoffOutcome::Shutdown => {
                                     finish_shutdown(&mut store, &mut initial);
@@ -515,6 +518,7 @@ pub(crate) async fn run(
             &mut transport,
             &mut audio_attachment,
             &mut dave,
+            &mut dave_roster,
             &mut commands,
             &mut shutdown,
             &mut store,
@@ -543,6 +547,7 @@ pub(crate) async fn run(
                     latest_sequence = None;
                     transport = None;
                     dave = None;
+                    dave_roster.clear();
                     Attempt::Identify
                 };
                 match backoff_or_command(
@@ -565,6 +570,7 @@ pub(crate) async fn run(
                         attempt = Attempt::Identify;
                         transport = None;
                         dave = None;
+                        dave_roster.clear();
                     }
                     BackoffOutcome::Shutdown => {
                         finish_shutdown(&mut store, &mut initial);
@@ -576,6 +582,7 @@ pub(crate) async fn run(
                 latest_sequence = None;
                 transport = None;
                 dave = None;
+                dave_roster.clear();
                 reconnect_attempts = reconnect_attempts.saturating_add(1);
                 if reconnect_attempts > MAX_RECONNECT_ATTEMPTS {
                     let error = Error::new(
@@ -609,6 +616,7 @@ pub(crate) async fn run(
                         reconnect_attempts = 0;
                         transport = None;
                         dave = None;
+                        dave_roster.clear();
                     }
                     BackoffOutcome::Shutdown => {
                         finish_shutdown(&mut store, &mut initial);
@@ -621,6 +629,7 @@ pub(crate) async fn run(
                 latest_sequence = None;
                 transport = None;
                 dave = None;
+                dave_roster.clear();
                 reconnect_attempts = 0;
                 attempt = Attempt::Identify;
             }
@@ -633,6 +642,7 @@ pub(crate) async fn run(
                         latest_sequence = None;
                         transport = None;
                         dave = None;
+                        dave_roster.clear();
                         reconnect_attempts = 0;
                         attempt = Attempt::Identify;
                     }
@@ -681,6 +691,7 @@ async fn run_session(
     transport: &mut Option<UdpTransport>,
     audio_attachment: &mut Option<(u64, mpsc::Sender<InstalledTransport>)>,
     dave: &mut Option<dave::Handle>,
+    dave_roster: &mut Vec<u64>,
     commands: &mut mpsc::Receiver<Command>,
     shutdown: &mut watch::Receiver<bool>,
     store: &mut StateStore,
@@ -1059,6 +1070,18 @@ async fn run_session(
                                             dave_error(store.generation()).with_source(source)
                                         ),
                                     };
+                                    if !dave_roster.is_empty()
+                                        && let Err(error) = run_dave_control(
+                                            dave.as_ref().expect("DAVE handle was just installed"),
+                                            config,
+                                            DaveControl::Roster(dave_roster.clone()),
+                                            &mut websocket,
+                                            store.generation(),
+                                        )
+                                        .await
+                                    {
+                                        return SessionOutcome::Fatal(error);
+                                    }
                                 }
                                 if description.dave_protocol_version == 0 {
                                     *dave = None;
@@ -1135,7 +1158,7 @@ async fn run_session(
                                 );
                                 store.resume_succeeded(phase);
                             }
-                            12 => {
+                            11 => {
                                 let users = match decode_dave_roster(
                                     &data,
                                     config.limits.dave_roster_members(),
@@ -1148,6 +1171,7 @@ async fn run_session(
                                         return SessionOutcome::Fatal(resource_error(store.generation()));
                                     }
                                 };
+                                *dave_roster = users.clone();
                                 if let Some(dave) = dave.as_ref()
                                     && let Err(error) = run_dave_control(
                                         dave, config, DaveControl::Roster(users),
@@ -1162,6 +1186,7 @@ async fn run_session(
                                     .and_then(parse_dave_user_id) else {
                                     return SessionOutcome::Fatal(protocol_error(store.generation()));
                                 };
+                                dave_roster.retain(|candidate| *candidate != user);
                                 if let Some(dave) = dave.as_ref()
                                     && let Err(error) = run_dave_control(
                                         dave, config, DaveControl::MemberDisconnected(user),
@@ -1215,6 +1240,9 @@ async fn run_session(
                                 dave, config, control, &mut websocket, store.generation(),
                             ).await {
                                 return SessionOutcome::Fatal(error);
+                            }
+                            if dave.snapshot().ready {
+                                store.phase_to(ConnectionPhase::Connected);
                             }
                         } else {
                             store.unknown_opcode();
@@ -2782,6 +2810,9 @@ mod tests {
         );
         let stopped = sender.stop().await.expect("sender stops");
         assert_eq!(stopped.phase(), AudioPhase::Stopped);
+        assert_eq!(stopped.stats().frames_sent(), 1);
+        assert_eq!(stopped.stats().silence_frames_sent(), 5);
+        assert_eq!(stopped.stats().send_failures(), 0);
 
         let (second_source, second_handle) = QueueSource::pair();
         second_handle.end();
@@ -3195,9 +3226,9 @@ mod tests {
     #[tokio::test]
     async fn malformed_dave_membership_controls_fail_before_backend_end_to_end() {
         for (case, opcode, data) in [
-            ("roster-not-array", 12, json!({"user_ids": "1"})),
-            ("roster-numeric-id", 12, json!({"user_ids": [1]})),
-            ("roster-zero-id", 12, json!({"user_ids": ["0"]})),
+            ("roster-not-array", 11, json!({"user_ids": "1"})),
+            ("roster-numeric-id", 11, json!({"user_ids": [1]})),
+            ("roster-zero-id", 11, json!({"user_ids": ["0"]})),
             ("disconnect-missing-id", 13, json!({})),
             ("disconnect-numeric-id", 13, json!({"user_id": 1})),
             ("disconnect-zero-id", 13, json!({"user_id": "0"})),
@@ -4236,7 +4267,7 @@ mod tests {
             .expect("gateway connects");
 
         gateway
-            .try_dispatch_json(12, json!({"user_ids": ["1", "2"]}), true)
+            .try_dispatch_json(11, json!({"user_ids": ["1", "2"]}), true)
             .expect("exact roster queues");
         gateway
             .try_dispatch_json(250, json!({"barrier": "exact-roster"}), true)
@@ -4245,7 +4276,7 @@ mod tests {
         assert_eq!(connection.state().phase(), ConnectionPhase::Connected);
 
         gateway
-            .try_dispatch_json(12, json!({"user_ids": ["1", "2", "3"]}), true)
+            .try_dispatch_json(11, json!({"user_ids": ["1", "2", "3"]}), true)
             .expect("one-over roster queues");
         eventually(|| connection.state().phase() == ConnectionPhase::Failed).await;
         assert_eq!(

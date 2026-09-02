@@ -427,8 +427,19 @@ impl Core {
         }
         let id = u16::from_be_bytes([payload[0], payload[1]]);
         let body = &payload[2..];
-        let matches = self.pending.is_some_and(|pending| pending.id == id);
-        if !matches {
+        let initial = id == 0
+            && self.pending.is_none()
+            && self.active_version == 0
+            && self.external_sender
+            && !self.backend.is_ready();
+        if initial {
+            self.pending = Some(PendingTransition {
+                id,
+                protocol_version: MAX_PROTOCOL_VERSION,
+                prepared: false,
+                sender_ratchet_pending: false,
+            });
+        } else if !self.pending.is_some_and(|pending| pending.id == id) {
             return Err(Failure::InvalidState);
         }
         let result = if welcome {
@@ -442,6 +453,9 @@ impl Core {
         let pending = self.pending.as_mut().expect("matching transition exists");
         pending.prepared = true;
         pending.sender_ratchet_pending = true;
+        if id == 0 {
+            return self.execute_transition(id);
+        }
         Ok(vec![ready(id)])
     }
 
@@ -800,6 +814,44 @@ mod tests {
             ready_core.encrypt(b"still encrypted").unwrap(),
             b"still encrypted"
         );
+    }
+
+    #[test]
+    fn initial_commit_zero_activates_without_ready_round_trip() {
+        let external_sender = fixture("EXTERNAL_SENDER", "APPENDING_PROPOSALS");
+        let proposals = fixture("APPENDING_PROPOSALS", "REVOKING_PROPOSALS");
+        let mut core = Core::new(FIXTURE_MY_USER_ID, FIXTURE_CHANNEL_ID).unwrap();
+        core.control(Control::Roster(vec![FIXTURE_OTHER_USER_ID]))
+            .unwrap();
+        core.control(Control::ExternalSender(external_sender))
+            .unwrap();
+        let response = core
+            .backend
+            .process_proposals(
+                davey::ProposalsOperationType::APPEND,
+                &proposals,
+                Some(&[FIXTURE_MY_USER_ID, FIXTURE_OTHER_USER_ID]),
+            )
+            .unwrap()
+            .expect("fixture creates an initial commit");
+        let mut announced_commit = 0_u16.to_be_bytes().to_vec();
+        announced_commit.extend_from_slice(&response.commit);
+
+        assert!(
+            core.control(Control::Commit(announced_commit))
+                .unwrap()
+                .is_empty(),
+            "transition zero never sends a ready acknowledgement"
+        );
+        assert_eq!(
+            core.snapshot(),
+            Snapshot {
+                active_version: 1,
+                transition_id: None,
+                ready: true,
+            }
+        );
+        assert_ne!(core.encrypt(b"protected").unwrap(), b"protected");
     }
 
     #[test]

@@ -98,6 +98,15 @@ async fn main() -> Result<(), Box<dyn Error>> {
             connected.phase()
         );
         if connected.phase() != ConnectionPhase::Connected {
+            if let Some(failure) = connected.failure() {
+                eprintln!(
+                    "failure: kind={:?} operation={:?} retry={:?} safe_code={:?}",
+                    failure.kind(),
+                    failure.operation(),
+                    failure.retry_disposition(),
+                    failure.safe_code()
+                );
+            }
             return Err("connection left Connected during idle observation".into());
         }
 
