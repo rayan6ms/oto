@@ -1060,11 +1060,27 @@ async fn run_session(
                                     ));
                                 }
                                 if description.dave_protocol_version != 0 && dave.is_none() {
-                                    *dave = match dave::Handle::spawn(
+                                    #[cfg(test)]
+                                    let spawned = if config.ready_dave_fixture.load(
+                                        std::sync::atomic::Ordering::Acquire,
+                                    ) {
+                                        Ok(dave::Handle::spawn_ready_fixture(
+                                            config.limits.gateway_command_capacity(),
+                                        ))
+                                    } else {
+                                        dave::Handle::spawn(
+                                            info.info.user_id(),
+                                            info.info.channel_id(),
+                                            config.limits.gateway_command_capacity(),
+                                        )
+                                    };
+                                    #[cfg(not(test))]
+                                    let spawned = dave::Handle::spawn(
                                         info.info.user_id(),
                                         info.info.channel_id(),
                                         config.limits.gateway_command_capacity(),
-                                    ) {
+                                    );
+                                    *dave = match spawned {
                                         Ok(handle) => Some(handle),
                                         Err(source) => return SessionOutcome::Fatal(
                                             dave_error(store.generation()).with_source(source)
@@ -1208,9 +1224,18 @@ async fn run_session(
                                 ).await {
                                     return SessionOutcome::Fatal(error);
                                 }
-                                if dave.snapshot().ready {
-                                    store.phase_to(ConnectionPhase::Connected);
-                                }
+                                // DAVE controls can move an established session back to
+                                // a non-ready state (for example PrepareEpoch starts a
+                                // fresh MLS epoch). Reflect that transition immediately so
+                                // attached audio pauses before attempting media encryption;
+                                // otherwise the sender would observe Connected, attempt to
+                                // encrypt with an unready context, and fail instead of
+                                // waiting for Execute Transition.
+                                store.phase_to(if dave.snapshot().ready {
+                                    ConnectionPhase::Connected
+                                } else {
+                                    ConnectionPhase::EstablishingDave
+                                });
                             }
                             _ => store.unknown_opcode(),
                         }
@@ -1241,9 +1266,11 @@ async fn run_session(
                             ).await {
                                 return SessionOutcome::Fatal(error);
                             }
-                            if dave.snapshot().ready {
-                                store.phase_to(ConnectionPhase::Connected);
-                            }
+                            store.phase_to(if dave.snapshot().ready {
+                                ConnectionPhase::Connected
+                            } else {
+                                ConnectionPhase::EstablishingDave
+                            });
                         } else {
                             store.unknown_opcode();
                         }
@@ -2947,6 +2974,241 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_playback_survives_resumable_websocket_loss_without_catch_up() {
+        let mut config = FakeVoiceGatewayConfig::local();
+        config.heartbeat_interval = Duration::from_secs(300);
+        let gateway = TestGateway::start(config).await.expect("gateway starts");
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        let connection = oto
+            .connect(voice_info(&gateway, "active-resume", "token"))
+            .await
+            .expect("transport connects");
+        let (source, handle) = BenchmarkSource::pair(false);
+        handle.activate();
+        let sender = connection.start_audio(source).await.expect("audio starts");
+        eventually(|| sender.state().stats().frames_sent() >= 2).await;
+        let before = sender.state().stats().frames_sent();
+        let captured_before = gateway.udp.capture().len();
+
+        gateway
+            .try_close(VoiceClose {
+                code: 4015,
+                reason: "deterministic playback interruption".to_owned(),
+            })
+            .expect("resumable close queues");
+        eventually(|| connection.state().stats().resume_successes() >= 1).await;
+        eventually(|| sender.state().stats().frames_sent() > before).await;
+        assert_eq!(connection.state().generation().get(), 1);
+        assert!(gateway.udp.capture().len() > captured_before);
+        assert_eq!(sender.state().stats().skipped_deadlines(), 0);
+
+        sender.stop().await.expect("sender stops");
+        connection.shutdown().await.expect("connection shuts down");
+        gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn udp_send_failure_is_typed_and_emits_no_partial_media_packet() {
+        let gateway = TestGateway::start(FakeVoiceGatewayConfig::local())
+            .await
+            .expect("gateway starts");
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        oto.config
+            .fail_udp_sends
+            .store(true, std::sync::atomic::Ordering::Release);
+        let connection = oto
+            .connect(voice_info(&gateway, "udp-failure", "token"))
+            .await
+            .expect("transport connects");
+        let (source, handle) = QueueSource::pair();
+        let sender = connection
+            .start_audio(source)
+            .await
+            .expect("audio attaches");
+        handle.push(vec![1, 2, 3, 4]);
+        eventually(|| sender.state().phase() == AudioPhase::Failed).await;
+        let state = sender.state();
+        assert_eq!(state.failure(), Some(ErrorKind::SendIo));
+        assert_eq!(state.stats().send_failures(), 1);
+        assert_eq!(gateway.udp.capture().len(), 1, "discovery only");
+        assert!(
+            !gateway.speaking().is_empty(),
+            "Speaking write precedes failed UDP"
+        );
+        assert_eq!(
+            gateway.speaking()[0]
+                .get("speaking")
+                .and_then(Value::as_u64),
+            Some(1)
+        );
+
+        connection.shutdown().await.expect("connection shuts down");
+        gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn close_during_dave_setup_is_terminal_and_never_starts_media() {
+        let mut config = FakeVoiceGatewayConfig::local();
+        config.dave_protocol_version = 1;
+        let gateway = TestGateway::start(config).await.expect("gateway starts");
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        let connection = oto
+            .connect(voice_info(&gateway, "dave-close", "token"))
+            .await
+            .expect("transport reaches DAVE setup");
+        gateway
+            .try_close(VoiceClose {
+                code: 4004,
+                reason: "close during DAVE setup".to_owned(),
+            })
+            .expect("close queues");
+        eventually(|| connection.state().phase() == ConnectionPhase::Failed).await;
+        assert_eq!(
+            connection
+                .state()
+                .failure()
+                .expect("failure persists")
+                .kind(),
+            ErrorKind::CredentialsRejected
+        );
+        assert_eq!(gateway.udp.capture().len(), 1);
+        assert!(gateway.speaking().is_empty());
+        gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn shutdown_during_resume_cancels_reconnect_without_new_generation() {
+        let mut config = FakeVoiceGatewayConfig::local();
+        config.hello_delay = Duration::from_millis(150);
+        let gateway = TestGateway::start(config).await.expect("gateway starts");
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        let connection = oto
+            .connect(voice_info(&gateway, "resume-shutdown", "token"))
+            .await
+            .expect("transport connects");
+        gateway
+            .try_close(VoiceClose {
+                code: 4015,
+                reason: "resume then shutdown".to_owned(),
+            })
+            .expect("resumable close queues");
+        eventually(|| connection.state().phase() == ConnectionPhase::Resuming).await;
+        let snapshot = timeout(Duration::from_secs(1), connection.shutdown())
+            .await
+            .expect("shutdown is not stranded in resume")
+            .expect("shutdown succeeds");
+        assert_eq!(snapshot.phase(), ConnectionPhase::Closed);
+        assert_eq!(snapshot.generation().get(), 1);
+        gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn fresh_voice_info_during_playback_invalidates_old_transport_before_replacement_media() {
+        let tls = TestTls::generate().expect("shared TLS material generates");
+        let initial = TestGateway::start_with_tls(FakeVoiceGatewayConfig::local(), tls.clone())
+            .await
+            .expect("initial gateway starts");
+        let replacement = TestGateway::start_with_tls(FakeVoiceGatewayConfig::local(), tls)
+            .await
+            .expect("replacement gateway starts");
+        let oto = test_oto(&initial, ResourceLimits::default());
+        let connection = oto
+            .connect(voice_info(&initial, "playback-old", "token-old"))
+            .await
+            .expect("initial transport connects");
+        let (source, handle) = BenchmarkSource::pair(false);
+        handle.activate();
+        let sender = connection.start_audio(source).await.expect("audio starts");
+        eventually(|| sender.state().stats().frames_sent() >= 2).await;
+        let old_before = initial.udp.capture().len();
+        let generation = connection
+            .replace_voice_info(voice_info(&replacement, "playback-new", "token-new"))
+            .await
+            .expect("fresh voice information accepted");
+        assert_eq!(generation.get(), 2);
+        eventually(|| {
+            connection.state().generation() == generation
+                && connection.state().phase() == ConnectionPhase::Connected
+                && replacement.udp.capture().len() >= 2
+        })
+        .await;
+        let old_after = initial.udp.capture().len();
+        assert_eq!(
+            old_after, old_before,
+            "old generation cannot send after replacement"
+        );
+        assert!(
+            sender.state().stats().frames_sent() >= 3,
+            "attached playback resumes on replacement"
+        );
+
+        sender.stop().await.expect("sender stops");
+        connection.shutdown().await.expect("connection shuts down");
+        initial
+            .shutdown()
+            .await
+            .expect("initial gateway shuts down");
+        replacement
+            .shutdown()
+            .await
+            .expect("replacement gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn dave_transport_replacement_pauses_attached_sender_until_dave_is_ready() {
+        let tls = TestTls::generate().expect("shared TLS material generates");
+        let initial = TestGateway::start_with_tls(FakeVoiceGatewayConfig::local(), tls.clone())
+            .await
+            .expect("initial gateway starts");
+        let mut dave_config = FakeVoiceGatewayConfig::local();
+        dave_config.dave_protocol_version = 1;
+        let replacement = TestGateway::start_with_tls(dave_config, tls)
+            .await
+            .expect("DAVE replacement gateway starts");
+        let oto = test_oto(&initial, ResourceLimits::default());
+        let connection = oto
+            .connect(voice_info(&initial, "dave-replace-old", "token-old"))
+            .await
+            .expect("initial transport connects");
+        let (source, handle) = BenchmarkSource::pair(false);
+        handle.activate();
+        let sender = connection.start_audio(source).await.expect("audio starts");
+        eventually(|| sender.state().stats().frames_sent() >= 2).await;
+        let old_before = initial.udp.capture().len();
+        connection
+            .replace_voice_info(voice_info(&replacement, "dave-replace-new", "token-new"))
+            .await
+            .expect("DAVE replacement accepted");
+        eventually(|| connection.state().phase() == ConnectionPhase::EstablishingDave).await;
+        sleep(Duration::from_millis(30)).await;
+        assert_ne!(sender.state().phase(), AudioPhase::Failed);
+        assert_eq!(
+            replacement.udp.capture().len(),
+            1,
+            "DAVE setup has discovery only"
+        );
+        assert_eq!(
+            initial.udp.capture().len(),
+            old_before,
+            "old transport is invalidated"
+        );
+
+        sender
+            .stop()
+            .await
+            .expect("sender stops while DAVE is pending");
+        connection.shutdown().await.expect("connection shuts down");
+        initial
+            .shutdown()
+            .await
+            .expect("initial gateway shuts down");
+        replacement
+            .shutdown()
+            .await
+            .expect("replacement gateway shuts down");
+    }
+
+    #[tokio::test]
     async fn dave_required_transport_refuses_audio_without_plaintext_packet() {
         let mut config = FakeVoiceGatewayConfig::local();
         config.dave_protocol_version = 1;
@@ -2970,6 +3232,87 @@ mod tests {
         assert_eq!(gateway.udp.capture().len(), 1);
         assert!(gateway.speaking().is_empty());
 
+        connection.shutdown().await.expect("connection shuts down");
+        gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn dave_epoch_reset_during_playback_pauses_without_plaintext_or_sender_failure() {
+        let mut config = FakeVoiceGatewayConfig::local();
+        config.dave_protocol_version = 1;
+        config.heartbeat_interval = Duration::from_secs(300);
+        let gateway = TestGateway::start(config).await.expect("gateway starts");
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        oto.config
+            .ready_dave_fixture
+            .store(true, std::sync::atomic::Ordering::Release);
+        let info = voice_info(&gateway, "dave-playback", "dave-token");
+        let connection = oto
+            .connect(info)
+            .await
+            .expect("transport reaches DAVE setup");
+
+        gateway
+            .try_dave_prepare_transition(1, 0)
+            .expect("initial transition queues");
+        eventually(|| connection.state().phase() == ConnectionPhase::Connected).await;
+
+        let (source, handle) = BenchmarkSource::pair(false);
+        handle.activate();
+        let sender = connection.start_audio(source).await.expect("audio starts");
+        eventually(|| sender.state().stats().frames_sent() >= 2).await;
+
+        let before_prepare = sender.state().stats().frames_sent();
+        gateway
+            .try_dave_prepare_transition(1, 8)
+            .expect("playback transition prepares");
+        eventually(|| {
+            gateway
+                .dave_client_records()
+                .iter()
+                .any(|record| matches!(record, DaveClientRecord::Ready { transition_id: 8 }))
+                && sender.state().stats().frames_sent() > before_prepare
+        })
+        .await;
+        let before_execute = sender.state().stats().frames_sent();
+        gateway
+            .try_dave_execute_transition(8)
+            .expect("playback transition executes");
+        eventually(|| sender.state().stats().frames_sent() > before_execute).await;
+        assert_eq!(connection.state().phase(), ConnectionPhase::Connected);
+
+        gateway
+            .try_dave_prepare_epoch(1, 1)
+            .expect("epoch reset queues");
+        eventually(|| connection.state().phase() == ConnectionPhase::EstablishingDave).await;
+        // A frame whose encryption command was ordered before PrepareEpoch may
+        // finish its transport send after the connection snapshot changes. It
+        // belongs wholly to the old epoch. Once that in-flight frame settles,
+        // the paused sender must emit nothing further.
+        sleep(Duration::from_millis(5)).await;
+        let packets_before_reset = gateway.udp.capture().len();
+        sleep(Duration::from_millis(40)).await;
+        assert_ne!(sender.state().phase(), AudioPhase::Failed);
+        assert_eq!(
+            gateway.udp.capture().len(),
+            packets_before_reset,
+            "media pauses while the replacement DAVE epoch is unready"
+        );
+        for index in 1..packets_before_reset {
+            let packet = gateway
+                .udp
+                .decrypt_captured_transport(
+                    index,
+                    OracleMode::Aes256GcmRtpSize,
+                    &[0x42; 32],
+                    1_275 + dave::OPUS_MAX_ENCRYPTION_OVERHEAD_BYTES,
+                )
+                .expect("transport layer decrypts around the DAVE transition");
+            assert_ne!(packet.payload, [0xF8, 0xFF, 0xFE, 0x01]);
+            assert!(packet.payload.ends_with(&[0xFA, 0xFA]));
+        }
+
+        sender.stop().await.expect("sender stops");
         connection.shutdown().await.expect("connection shuts down");
         gateway.shutdown().await.expect("gateway shuts down");
     }

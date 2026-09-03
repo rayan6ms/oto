@@ -443,7 +443,9 @@ impl Core {
             return Err(Failure::InvalidState);
         }
         let result = if welcome {
-            guarded(|| self.backend.process_welcome(body))
+            let mut recognized: Vec<_> = self.roster.iter().copied().collect();
+            recognized.sort_unstable();
+            guarded(|| self.backend.process_welcome(body, Some(&recognized)))
         } else {
             guarded(|| self.backend.process_commit(body))
         };

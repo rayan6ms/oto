@@ -10,6 +10,8 @@ upstream Rust API lacks them:
   DAVE encryptor path; only the receive-side SFU silence exception remains;
 - a ratchet derived while processing Commit/Welcome is staged until the
   matching Execute Transition instead of changing the sender early.
+- Welcome processing rejects group members outside the caller's recognized
+  voice roster, matching current official libdave validation.
 - the unconditional OpenMLS `js` feature is removed from this native Rust
   build; it only enables browser randomness and is not part of Oto's targets.
 - Python and Node binding-only optional dependencies are removed from the

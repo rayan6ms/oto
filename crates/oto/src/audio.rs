@@ -147,6 +147,8 @@ pub(crate) struct SpawnAudio {
     pub(crate) max_frame_bytes: usize,
     pub(crate) max_datagram_bytes: usize,
     pub(crate) active: Arc<AtomicBool>,
+    #[cfg(test)]
+    pub(crate) fail_udp_sends: Arc<AtomicBool>,
 }
 
 impl AudioControl {
@@ -389,6 +391,8 @@ struct Executor {
     silence_sent: u8,
     source_ended: bool,
     stop_reply: Option<oneshot::Sender<Result<AudioSnapshot, Error>>>,
+    #[cfg(test)]
+    fail_udp_sends: Arc<AtomicBool>,
 }
 
 async fn run_audio(
@@ -431,6 +435,8 @@ async fn run_audio(
         silence_sent: 0,
         source_ended: false,
         stop_reply: None,
+        #[cfg(test)]
+        fail_udp_sends: input.fail_udp_sends,
     };
     let failure = executor.run().await.err();
     if let Some(error) = &failure {
@@ -690,12 +696,13 @@ impl Executor {
                 .is_some_and(|dave| dave.snapshot().ready)
         {
             self.transport = Some(update);
-            return Err(audio_error(
-                ErrorKind::DaveRequired,
-                Operation::StartAudio,
-                RetryDisposition::Fatal,
-                "DAVE is required before participant media can be sent",
-            ));
+            // A fresh connection generation can install its transport before
+            // the DAVE control plane reaches Connected. Keep the sender
+            // attached but paused; connection readiness below prevents any
+            // plaintext or prematurely encrypted packet from escaping. The
+            // connection watch will wake us once Execute Transition completes.
+            self.store.phase(AudioPhase::Starting);
+            return Ok(());
         }
         self.transport = Some(update);
         self.try_start().await
@@ -811,6 +818,16 @@ impl Executor {
                     "transport encryption failed",
                 ));
             }
+        }
+        #[cfg(test)]
+        if self.fail_udp_sends.load(Ordering::Acquire) {
+            AudioCounters::increment(&self.store.counters.send_failures);
+            return Err(audio_error(
+                ErrorKind::SendIo,
+                Operation::StartAudio,
+                RetryDisposition::RetryingInternally,
+                "UDP audio send failed or timed out",
+            ));
         }
         match timeout(FRAME_PERIOD, transport.socket.send(&self.packet)).await {
             Ok(Ok(written)) if written == self.packet.len() => {
@@ -1076,6 +1093,7 @@ mod tests {
             max_frame_bytes: 1_275,
             max_datagram_bytes: 2_048,
             active,
+            fail_udp_sends: Arc::new(AtomicBool::new(false)),
         });
 
         timeout(Duration::from_secs(1), async {
@@ -1163,6 +1181,7 @@ mod tests {
             max_frame_bytes: 1_275,
             max_datagram_bytes: 2_048,
             active,
+            fail_udp_sends: Arc::new(AtomicBool::new(false)),
         });
 
         let mut observed = Vec::new();
@@ -1286,6 +1305,7 @@ mod tests {
             max_frame_bytes: 1_275,
             max_datagram_bytes: 2_048,
             active: Arc::new(AtomicBool::new(true)),
+            fail_udp_sends: Arc::new(AtomicBool::new(false)),
         });
 
         timeout(Duration::from_secs(1), async {
@@ -1395,6 +1415,7 @@ mod tests {
             max_frame_bytes: 1_275,
             max_datagram_bytes: 2_048,
             active: Arc::new(AtomicBool::new(true)),
+            fail_udp_sends: Arc::new(AtomicBool::new(false)),
         });
 
         tokio::time::sleep(warmup).await;

@@ -333,6 +333,8 @@ impl VoiceConnection {
             max_frame_bytes: self.inner.config.limits.encoded_opus_frame_bytes(),
             max_datagram_bytes: self.inner.config.limits.udp_datagram_bytes(),
             active: self.inner.audio_active.clone(),
+            #[cfg(test)]
+            fail_udp_sends: self.inner.config.fail_udp_sends.clone(),
         });
         *self
             .inner

@@ -5,6 +5,7 @@
 
 use std::error::Error;
 use std::io::{self, Read};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -19,7 +20,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const AUDIO_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_OBSERVATION: Duration = Duration::from_secs(1);
+const STARVATION_OBSERVATION: Duration = Duration::from_millis(250);
 const PROBE_FRAMES: u8 = 10;
+const TERMINAL_SILENCE_FRAMES: u64 = 5;
+const MAX_SOAK_SECONDS: u64 = 86_400;
 const OPUS_SILENCE: [u8; 3] = [0xF8, 0xFF, 0xFE];
 
 #[derive(Deserialize)]
@@ -67,6 +71,140 @@ impl FrameSource for BoundedProbe {
     }
 }
 
+#[derive(Clone)]
+struct ProbeControl {
+    shared: Arc<Mutex<ProbeState>>,
+}
+
+struct StarvableProbe {
+    shared: Arc<Mutex<ProbeState>>,
+}
+
+#[derive(Default)]
+struct ProbeState {
+    available: u8,
+    ended: bool,
+    waker: Option<std::task::Waker>,
+}
+
+impl StarvableProbe {
+    fn new() -> (Self, ProbeControl) {
+        let shared = Arc::new(Mutex::new(ProbeState::default()));
+        (
+            Self {
+                shared: shared.clone(),
+            },
+            ProbeControl { shared },
+        )
+    }
+}
+
+impl ProbeControl {
+    fn provide(&self, frames: u8) -> Result<(), Box<dyn Error>> {
+        let waker = {
+            let mut state = self.shared.lock().map_err(|_| "probe state poisoned")?;
+            state.available = state
+                .available
+                .checked_add(frames)
+                .ok_or("probe frame count overflow")?;
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        Ok(())
+    }
+
+    fn end(&self) -> Result<(), Box<dyn Error>> {
+        let waker = {
+            let mut state = self.shared.lock().map_err(|_| "probe state poisoned")?;
+            state.ended = true;
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        Ok(())
+    }
+}
+
+impl FrameSource for StarvableProbe {
+    fn poll_frame(&mut self, cx: &mut Context<'_>, output: &mut [u8]) -> Poll<FrameStatus> {
+        let Ok(mut state) = self.shared.lock() else {
+            return Poll::Ready(FrameStatus::Ended);
+        };
+        if state.available > 0 {
+            output[..OPUS_SILENCE.len()].copy_from_slice(&OPUS_SILENCE);
+            state.available -= 1;
+            return Poll::Ready(FrameStatus::Frame {
+                len: OPUS_SILENCE.len(),
+            });
+        }
+        if state.ended {
+            return Poll::Ready(FrameStatus::Ended);
+        }
+        if !state
+            .waker
+            .as_ref()
+            .is_some_and(|waker| waker.will_wake(cx.waker()))
+        {
+            state.waker = Some(cx.waker().clone());
+        }
+        Poll::Pending
+    }
+}
+
+fn soak_duration() -> Result<Duration, Box<dyn Error>> {
+    let Some(value) = std::env::var_os("OTO_LIVE_SOAK_SECONDS") else {
+        return Ok(Duration::ZERO);
+    };
+    let value = value
+        .into_string()
+        .map_err(|_| "OTO_LIVE_SOAK_SECONDS must be valid UTF-8")?;
+    let seconds: u64 = value
+        .parse()
+        .map_err(|_| "OTO_LIVE_SOAK_SECONDS must be an unsigned integer")?;
+    if seconds > MAX_SOAK_SECONDS {
+        return Err(format!("OTO_LIVE_SOAK_SECONDS must not exceed {MAX_SOAK_SECONDS}").into());
+    }
+    Ok(Duration::from_secs(seconds))
+}
+
+async fn wait_for_audio_stop(
+    sender: &oto::PacedAudioSender,
+) -> Result<oto::AudioSnapshot, Box<dyn Error>> {
+    timeout(AUDIO_TIMEOUT, async {
+        loop {
+            let state = sender.state();
+            if matches!(state.phase(), AudioPhase::Stopped | AudioPhase::Failed) {
+                return state;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| "paced DAVE probe timed out".into())
+}
+
+async fn wait_for_frames(
+    sender: &oto::PacedAudioSender,
+    expected: u64,
+) -> Result<(), Box<dyn Error>> {
+    timeout(AUDIO_TIMEOUT, async {
+        loop {
+            let state = sender.state();
+            if state.stats().frames_sent() >= expected || state.phase() == AudioPhase::Failed {
+                return state;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| "paced DAVE frame burst timed out")?
+    .failure()
+    .map_or(Ok(()), |_| Err("paced DAVE frame burst failed".into()))
+}
+
 fn read_voice_info() -> Result<VoiceConnectInfo, Box<dyn Error>> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
@@ -84,6 +222,7 @@ fn read_voice_info() -> Result<VoiceConnectInfo, Box<dyn Error>> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
     let info = read_voice_info()?;
+    let soak = soak_duration()?;
     let oto = Oto::builder().build()?;
     let connection = timeout(CONNECT_TIMEOUT, oto.connect(info))
         .await
@@ -110,24 +249,47 @@ async fn main() -> Result<(), Box<dyn Error>> {
             return Err("connection left Connected during idle observation".into());
         }
 
-        let sender = connection
+        let (starvable, control) = StarvableProbe::new();
+        let sender = connection.start_audio(starvable).await?;
+        sleep(STARVATION_OBSERVATION).await;
+        let initially_starved = sender.state();
+        if initially_starved.stats().frames_sent() != 0
+            || initially_starved.stats().silence_frames_sent() != 0
+        {
+            return Err("initially starved source emitted media".into());
+        }
+
+        control.provide(PROBE_FRAMES)?;
+        wait_for_frames(&sender, u64::from(PROBE_FRAMES)).await?;
+        sleep(STARVATION_OBSERVATION).await;
+        let starved = sender.state();
+        if starved.stats().frames_sent() != u64::from(PROBE_FRAMES)
+            || starved.stats().silence_frames_sent() != 0
+        {
+            return Err("starved source emitted unexpected media".into());
+        }
+
+        control.provide(PROBE_FRAMES)?;
+        control.end()?;
+        let _ = wait_for_audio_stop(&sender).await?;
+        let starvation_cycle = sender.stop().await?;
+
+        let restart = connection
             .start_audio(BoundedProbe {
                 remaining: PROBE_FRAMES,
             })
             .await?;
-        timeout(AUDIO_TIMEOUT, async {
-            loop {
-                let state = sender.state();
-                if matches!(state.phase(), AudioPhase::Stopped | AudioPhase::Failed) {
-                    return state;
-                }
-                sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await
-        .map_err(|_| "paced DAVE probe timed out")?;
+        let _ = wait_for_audio_stop(&restart).await?;
+        let restart_cycle = restart.stop().await?;
 
-        Ok::<_, Box<dyn Error>>(sender.stop().await?)
+        if !soak.is_zero() {
+            sleep(soak).await;
+            if connection.state().phase() != ConnectionPhase::Connected {
+                return Err("connection left Connected during soak".into());
+            }
+        }
+
+        Ok::<_, Box<dyn Error>>((starvation_cycle, restart_cycle))
     }
     .await;
 
@@ -141,23 +303,36 @@ async fn main() -> Result<(), Box<dyn Error>> {
         final_connection.phase(),
         final_connection.close_reason()
     );
-    let audio = probe?;
-    let stats = audio.stats();
+    let (starvation_cycle, restart_cycle) = probe?;
+    let starvation_stats = starvation_cycle.stats();
     println!(
-        "audio: phase={:?} frames={} terminal_silence={} failures={}",
-        audio.phase(),
-        stats.frames_sent(),
-        stats.silence_frames_sent(),
-        stats.send_failures()
+        "audio_starvation_cycle: phase={:?} frames={} terminal_silence={} failures={}",
+        starvation_cycle.phase(),
+        starvation_stats.frames_sent(),
+        starvation_stats.silence_frames_sent(),
+        starvation_stats.send_failures()
+    );
+    let restart_stats = restart_cycle.stats();
+    println!(
+        "audio_restart_cycle: phase={:?} frames={} terminal_silence={} failures={}",
+        restart_cycle.phase(),
+        restart_stats.frames_sent(),
+        restart_stats.silence_frames_sent(),
+        restart_stats.send_failures()
     );
 
     if final_connection.phase() != ConnectionPhase::Closed
         || final_connection.close_reason() != Some(CloseReason::ExplicitShutdown)
-        || audio.phase() != AudioPhase::Stopped
-        || audio.failure().is_some()
-        || stats.frames_sent() != u64::from(PROBE_FRAMES)
-        || stats.silence_frames_sent() != 5
-        || stats.send_failures() != 0
+        || starvation_cycle.phase() != AudioPhase::Stopped
+        || starvation_cycle.failure().is_some()
+        || starvation_stats.frames_sent() != u64::from(PROBE_FRAMES) * 2
+        || starvation_stats.silence_frames_sent() != TERMINAL_SILENCE_FRAMES
+        || starvation_stats.send_failures() != 0
+        || restart_cycle.phase() != AudioPhase::Stopped
+        || restart_cycle.failure().is_some()
+        || restart_stats.frames_sent() != u64::from(PROBE_FRAMES)
+        || restart_stats.silence_frames_sent() != TERMINAL_SILENCE_FRAMES
+        || restart_stats.send_failures() != 0
     {
         return Err("live DAVE smoke did not meet its acceptance criteria".into());
     }

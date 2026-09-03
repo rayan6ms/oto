@@ -138,6 +138,10 @@ pub enum ProcessWelcomeError {
     DeserializeWelcomeFailed(#[from] tls_codec::Error),
     #[error("failed to create staged welcome: {0}")]
     CreatingStagedWelcomeFailed(#[from] WelcomeError<MemoryStorageError>),
+    #[error("failed to convert welcome credential content to user id: {0}")]
+    CredentialContentConvertFailed(TryFromSliceError),
+    #[error("welcome contains an unrecognized user: {0}")]
+    UnrecognizedUser(u64),
     #[error("expected external senders extension in welcome")]
     ExpectedExternalSenderExtension,
     #[error("expected only one external sender in welcome")]

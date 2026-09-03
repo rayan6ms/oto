@@ -540,7 +540,11 @@ impl DaveSession {
 
     /// Process a welcome message from [dave_mls_welcome (30)](https://daveprotocol.com/#dave_mls_welcome-30).
     /// Send a [dave_mls_invalid_commit_welcome (31)](https://daveprotocol.com/#dave_mls_invalid_commit_welcome-31) if the welcome couldn't be processed.
-    pub fn process_welcome(&mut self, welcome: &[u8]) -> Result<(), ProcessWelcomeError> {
+    pub fn process_welcome(
+        &mut self,
+        welcome: &[u8],
+        recognized_user_ids: Option<&[u64]>,
+    ) -> Result<(), ProcessWelcomeError> {
         if self.group.is_some() && self.status == SessionStatus::ACTIVE {
             return Err(ProcessWelcomeError::AlreadyInGroup);
         }
@@ -548,9 +552,6 @@ impl DaveSession {
         let Some(external_sender) = &self.external_sender else {
             return Err(ProcessWelcomeError::NoExternalSender);
         };
-
-        // TODO we are skipping using recognized user IDs in here for now
-        // See https://github.com/discord/libdave/blob/6e5ffbc1cb4eef6be96e8115c4626be598b7e501/cpp/src/dave/mls/session.cpp#L519
 
         debug!("Processing welcome");
 
@@ -565,6 +566,21 @@ impl DaveSession {
             StagedWelcome::build_from_welcome(&self.provider, &mls_group_config, welcome)?
                 .replace_old_group()
                 .build()?;
+
+        if let Some(recognized_user_ids) = recognized_user_ids {
+            for member in staged_join.members() {
+                let user_id = u64::from_be_bytes(
+                    member
+                        .credential
+                        .serialized_content()
+                        .try_into()
+                        .map_err(ProcessWelcomeError::CredentialContentConvertFailed)?,
+                );
+                if !recognized_user_ids.contains(&user_id) {
+                    return Err(ProcessWelcomeError::UnrecognizedUser(user_id));
+                }
+            }
+        }
 
         let external_senders = staged_join.group_context().extensions().external_senders();
         let Some(external_senders) = external_senders else {
@@ -1080,7 +1096,10 @@ mod oto_conformance_tests {
             .expect("add proposal creates commit and welcome");
 
         joiner
-            .process_welcome(&response.welcome.expect("add commit includes welcome"))
+            .process_welcome(
+                &response.welcome.expect("add commit includes welcome"),
+                Some(&[7, 8]),
+            )
             .unwrap();
         assert!(!joiner.is_ready());
         assert!(matches!(
@@ -1092,5 +1111,53 @@ mod oto_conformance_tests {
         assert!(joiner.is_ready());
         let encrypted = joiner.encrypt_opus(b"after execute").unwrap();
         assert_ne!(encrypted.as_ref(), b"after execute");
+    }
+
+    #[test]
+    fn welcome_rejects_group_member_outside_recognized_roster() {
+        let ciphersuite = Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256;
+        let external_signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+        let external_sender = ExternalSender::new(
+            external_signer.public().into(),
+            BasicCredential::new(vec![0, 1, 1, 0]).into(),
+        );
+        let external_sender_bytes = external_sender.tls_serialize_detached().unwrap();
+
+        let mut member = DaveSession::new(NonZeroU16::new(1).unwrap(), 7, 9, None).unwrap();
+        let mut joiner = DaveSession::new(NonZeroU16::new(1).unwrap(), 8, 9, None).unwrap();
+        member.set_external_sender(&external_sender_bytes).unwrap();
+        joiner.set_external_sender(&external_sender_bytes).unwrap();
+
+        let key_package =
+            KeyPackageIn::tls_deserialize_exact_bytes(&joiner.create_key_package().unwrap())
+                .unwrap()
+                .validate(member.provider.crypto(), ProtocolVersion::Mls10)
+                .unwrap();
+        let proposal = ExternalProposal::new_add::<OpenMlsRustCrypto>(
+            key_package,
+            GroupId::from_slice(&9_u64.to_be_bytes()),
+            GroupEpoch::from(0),
+            &external_signer,
+            SenderExtensionIndex::new(0),
+        )
+        .unwrap()
+        .tls_serialize_detached()
+        .unwrap();
+        let proposals = VLBytes::from(proposal).tls_serialize_detached().unwrap();
+        let response = member
+            .process_proposals(ProposalsOperationType::APPEND, &proposals, Some(&[7, 8]))
+            .unwrap()
+            .expect("add proposal creates commit and welcome");
+
+        assert!(matches!(
+            joiner.process_welcome(
+                &response.welcome.expect("add commit includes welcome"),
+                Some(&[8]),
+            ),
+            Err(ProcessWelcomeError::UnrecognizedUser(7))
+        ));
+        assert!(!joiner.is_ready());
+        assert!(joiner.group.is_some());
+        assert_eq!(joiner.status, SessionStatus::PENDING);
     }
 }

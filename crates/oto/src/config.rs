@@ -188,6 +188,10 @@ pub(crate) struct Config {
     pub(crate) tls_config: Option<Arc<ClientConfig>>,
     #[cfg(test)]
     pub(crate) transport_nonce_start: std::sync::Mutex<Option<u32>>,
+    #[cfg(test)]
+    pub(crate) fail_udp_sends: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(test)]
+    pub(crate) ready_dave_fixture: std::sync::atomic::AtomicBool,
 }
 
 impl Oto {
@@ -224,6 +228,10 @@ impl OtoBuilder {
                 tls_config: self.tls_config,
                 #[cfg(test)]
                 transport_nonce_start: std::sync::Mutex::new(self.transport_nonce_start),
+                #[cfg(test)]
+                fail_udp_sends: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                #[cfg(test)]
+                ready_dave_fixture: std::sync::atomic::AtomicBool::new(false),
             }),
         })
     }
