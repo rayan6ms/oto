@@ -1165,7 +1165,12 @@ async fn run_session(
                                     |transport| {
                                         if !transport.is_ready() {
                                             ConnectionPhase::EstablishingTransport
-                                        } else if transport.dave_protocol_version == 0 {
+                                        } else if transport.dave_protocol_version == 0
+                                            || transport
+                                                .dave
+                                                .as_ref()
+                                                .is_some_and(|dave| dave.snapshot().ready)
+                                        {
                                             ConnectionPhase::Connected
                                         } else {
                                             ConnectionPhase::EstablishingDave
@@ -3761,6 +3766,40 @@ mod tests {
             .try_dave_external_sender(crate::dave::test_external_sender_fixture())
             .expect("new-generation external sender queues");
         eventually(|| key_packages() == 4).await;
+
+        connection.shutdown().await.expect("connection shuts down");
+        gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn dave_resume_restores_connected_when_retained_sender_context_is_ready() {
+        let mut config = FakeVoiceGatewayConfig::local();
+        config.dave_protocol_version = 1;
+        config.heartbeat_interval = Duration::from_secs(300);
+        let gateway = TestGateway::start(config).await.expect("gateway starts");
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        oto.config
+            .ready_dave_fixture
+            .store(true, std::sync::atomic::Ordering::Release);
+        let connection = oto
+            .connect(voice_info(&gateway, "dave-ready-resume", "dave-token"))
+            .await
+            .expect("transport reaches DAVE setup");
+
+        gateway
+            .try_dave_prepare_transition(1, 0)
+            .expect("initial transition queues");
+        eventually(|| connection.state().phase() == ConnectionPhase::Connected).await;
+        gateway
+            .try_close(VoiceClose {
+                code: 4015,
+                reason: "resumable ready DAVE interruption".to_owned(),
+            })
+            .expect("resumable close queues");
+
+        eventually(|| connection.state().stats().resume_successes() == 1).await;
+        assert_eq!(connection.state().generation().get(), 1);
+        assert_eq!(connection.state().phase(), ConnectionPhase::Connected);
 
         connection.shutdown().await.expect("connection shuts down");
         gateway.shutdown().await.expect("gateway shuts down");

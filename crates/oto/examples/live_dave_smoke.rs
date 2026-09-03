@@ -17,6 +17,7 @@ use serde::Deserialize;
 use tokio::time::{sleep, timeout};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const RESUME_TIMEOUT: Duration = Duration::from_secs(120);
 const AUDIO_TIMEOUT: Duration = Duration::from_secs(10);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_OBSERVATION: Duration = Duration::from_secs(1);
@@ -205,6 +206,41 @@ async fn wait_for_frames(
     .map_or(Ok(()), |_| Err("paced DAVE frame burst failed".into()))
 }
 
+async fn wait_for_connected(
+    connection: &oto::VoiceConnection,
+) -> Result<oto::ConnectionSnapshot, Box<dyn Error>> {
+    timeout(CONNECT_TIMEOUT, async {
+        loop {
+            let state = connection.state();
+            if state.phase() == ConnectionPhase::Connected || state.failure().is_some() {
+                return state;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| "DAVE-ready connection timed out".into())
+}
+
+async fn wait_for_resume(
+    connection: &oto::VoiceConnection,
+) -> Result<oto::ConnectionSnapshot, Box<dyn Error>> {
+    timeout(RESUME_TIMEOUT, async {
+        loop {
+            let state = connection.state();
+            if (state.stats().resume_successes() >= 1
+                && state.phase() == ConnectionPhase::Connected)
+                || state.failure().is_some()
+            {
+                return state;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .map_err(|_| "buffered DAVE resume timed out".into())
+}
+
 fn read_voice_info() -> Result<VoiceConnectInfo, Box<dyn Error>> {
     let mut input = String::new();
     io::stdin().read_to_string(&mut input)?;
@@ -223,12 +259,26 @@ fn read_voice_info() -> Result<VoiceConnectInfo, Box<dyn Error>> {
 async fn main() -> Result<(), Box<dyn Error>> {
     let info = read_voice_info()?;
     let soak = soak_duration()?;
+    let expect_resume = std::env::var_os("OTO_LIVE_EXPECT_RESUME").is_some();
     let oto = Oto::builder().build()?;
     let connection = timeout(CONNECT_TIMEOUT, oto.connect(info))
         .await
         .map_err(|_| "live connection timed out")??;
 
     let probe = async {
+        let ready = wait_for_connected(&connection).await?;
+        if ready.phase() != ConnectionPhase::Connected {
+            if let Some(failure) = ready.failure() {
+                eprintln!(
+                    "failure: kind={:?} operation={:?} retry={:?} safe_code={:?}",
+                    failure.kind(),
+                    failure.operation(),
+                    failure.retry_disposition(),
+                    failure.safe_code()
+                );
+            }
+            return Err("connection did not reach DAVE-ready Connected state".into());
+        }
         sleep(IDLE_OBSERVATION).await;
         let connected = connection.state();
         println!(
@@ -249,6 +299,28 @@ async fn main() -> Result<(), Box<dyn Error>> {
             return Err("connection left Connected during idle observation".into());
         }
 
+        if expect_resume {
+            let resumed = wait_for_resume(&connection).await?;
+            let stats = resumed.stats();
+            println!(
+                "resume: generation={} phase={:?} attempts={} successes={} heartbeat_timeouts={}",
+                resumed.generation().get(),
+                resumed.phase(),
+                stats.resume_attempts(),
+                stats.resume_successes(),
+                stats.heartbeat_timeouts()
+            );
+            if resumed.generation().get() != 1
+                || resumed.phase() != ConnectionPhase::Connected
+                || resumed.failure().is_some()
+                || stats.resume_attempts() != 1
+                || stats.resume_successes() != 1
+                || stats.heartbeat_timeouts() != 1
+            {
+                return Err("buffered DAVE resume did not meet acceptance criteria".into());
+            }
+        }
+
         let (starvable, control) = StarvableProbe::new();
         let sender = connection.start_audio(starvable).await?;
         sleep(STARVATION_OBSERVATION).await;
@@ -264,9 +336,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         sleep(STARVATION_OBSERVATION).await;
         let starved = sender.state();
         if starved.stats().frames_sent() != u64::from(PROBE_FRAMES)
-            || starved.stats().silence_frames_sent() != 0
+            || starved.stats().silence_frames_sent() != TERMINAL_SILENCE_FRAMES
+            || starved.phase() != AudioPhase::WaitingForSource
         {
-            return Err("starved source emitted unexpected media".into());
+            return Err("starved source did not complete one bounded silence drain".into());
         }
 
         control.provide(PROBE_FRAMES)?;
@@ -326,7 +399,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         || starvation_cycle.phase() != AudioPhase::Stopped
         || starvation_cycle.failure().is_some()
         || starvation_stats.frames_sent() != u64::from(PROBE_FRAMES) * 2
-        || starvation_stats.silence_frames_sent() != TERMINAL_SILENCE_FRAMES
+        || starvation_stats.silence_frames_sent() != TERMINAL_SILENCE_FRAMES * 2
         || starvation_stats.send_failures() != 0
         || restart_cycle.phase() != AudioPhase::Stopped
         || restart_cycle.failure().is_some()
