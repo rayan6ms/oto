@@ -3885,6 +3885,7 @@ mod tests {
         let base_tasks = tokio::runtime::Handle::current()
             .metrics()
             .num_alive_tasks();
+        let baseline_threads = process_thread_count();
         let baseline_pss_kib = process_pss_kib();
 
         let connect_started = std::time::Instant::now();
@@ -3912,6 +3913,7 @@ mod tests {
         let idle_tasks = tokio::runtime::Handle::current()
             .metrics()
             .num_alive_tasks();
+        let idle_threads = process_thread_count();
 
         let mut senders = Vec::with_capacity(sender_count);
         let mut handles = Vec::with_capacity(sender_count);
@@ -3934,6 +3936,7 @@ mod tests {
         let pending_tasks = tokio::runtime::Handle::current()
             .metrics()
             .num_alive_tasks();
+        let pending_threads = process_thread_count();
 
         let synchronized_start = std::time::Instant::now();
         slow_handle.activate();
@@ -3969,6 +3972,7 @@ mod tests {
         let active_tasks = tokio::runtime::Handle::current()
             .metrics()
             .num_alive_tasks();
+        let active_threads = process_thread_count();
         let cpu_before = process_cpu_ticks();
         let measured_started = std::time::Instant::now();
         sleep(measurement).await;
@@ -4013,8 +4017,12 @@ mod tests {
             .max()
             .unwrap_or(0);
         let measurement_pss_kib = process_pss_kib();
+        let p50_lateness = percentile(&mut lateness, 500);
+        let p95_lateness = percentile(&mut lateness, 950);
         let p99_lateness = percentile(&mut lateness, 990);
         let p999_lateness = percentile(&mut lateness, 999);
+        let p50_interval_error = percentile(&mut interval_error, 500);
+        let p95_interval_error = percentile(&mut interval_error, 950);
         let p99_interval_error = percentile(&mut interval_error, 990);
         let p999_interval_error = percentile(&mut interval_error, 999);
 
@@ -4057,6 +4065,12 @@ mod tests {
                 "active": active_tasks,
                 "pacerCoordinators": 4
             },
+            "threads": {
+                "baseline": baseline_threads,
+                "idle": idle_threads,
+                "pending": pending_threads,
+                "active": active_threads
+            },
             "cpu": {
                 "processTicks": cpu_ticks,
                 "clockTicksPerSecond": 100,
@@ -4066,7 +4080,13 @@ mod tests {
                 "senderCounted": sent_frames,
                 "udpPeerReceived": udp_packets,
                 "measurementBoundaryDifference": sent_frames.abs_diff(udp_packets),
+                "deliveryRatio": udp_packets as f64 / sent_frames.max(1) as f64,
                 "portableUdpSendCallsPerFrame": 1
+            },
+            "udpSyscalls": {
+                "exactKernelCount": null,
+                "measurementStatus": "UNAVAILABLE_NO_SYSCALL_TRACER",
+                "sourceObservedSendApiCallsPerFrame": 1
             },
             "allocation": {
                 "allocations": allocation.allocations,
@@ -4076,8 +4096,12 @@ mod tests {
                 "allocationsPerFrame": allocation.allocations as f64 / allocation_frames.max(1) as f64
             },
             "timingNanos": {
+                "p50Lateness": p50_lateness,
+                "p95Lateness": p95_lateness,
                 "p99Lateness": p99_lateness,
                 "p999Lateness": p999_lateness,
+                "p50IntervalError": p50_interval_error,
+                "p95IntervalError": p95_interval_error,
                 "p99IntervalError": p99_interval_error,
                 "p999IntervalError": p999_interval_error,
                 "maxSenderObservedLateness": max_sender_lateness_nanos
@@ -4148,6 +4172,14 @@ mod tests {
             .collect();
         fields[11].parse::<u64>().expect("user ticks")
             + fields[12].parse::<u64>().expect("system ticks")
+    }
+
+    fn process_thread_count() -> usize {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("Linux proc status is readable")
+            .lines()
+            .find_map(|line| line.strip_prefix("Threads:")?.trim().parse().ok())
+            .expect("thread count is present")
     }
 
     fn percentile(samples: &mut [u64], permille: usize) -> u64 {
