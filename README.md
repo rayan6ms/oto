@@ -1,7 +1,8 @@
 
-# Oto implementation specification
+# Oto
 
-Oto is a Rust-native Discord voice media transport library and the intended replacement for Koe.
+Oto is a Rust-native Discord voice media transport library and the intended
+replacement for Koe.
 
 It is deliberately not an audio engine and not a Lavalink server.
 
@@ -115,7 +116,17 @@ RTP timestamp increment = 960
 
 This matches Koe's actual audio poller and the intended Crust/Mantle integration. Variable-duration Opus packets are deferred until a real consumer requires them; Oto should not carry timing genericity merely because Opus can theoretically encode other durations.
 
-## Release evidence
+## Release and distribution
 
-The P15 release-closure package, API examples, current platform claims, Koe
-parity report, Crust integration matrix, performance summary, and dependency
+The current repository release is `v1.0.0`, licensed under MIT or Apache-2.0
+at the consumer's option. Oto is distributed as a repository source release:
+the complete tagged tree includes the narrowly patched `davey` and
+`openmls_rust_crypto` sources required by the validated DAVE implementation.
+
+Both workspace packages retain `publish = false`. They must not be published
+to crates.io in their current form because Cargo would replace path dependencies
+with registry packages, and upstream `davey 0.1.4` does not contain all fixes
+admitted by Oto's correctness and security gates. Consumers should build the
+tagged workspace with Rust 1.97 or newer. See
+the source-package verification procedure and registry-publication unblock
+conditions.

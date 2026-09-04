@@ -4,6 +4,7 @@ exclude = ["fuzz", "vendor/davey", "vendor/openmls_rust_crypto"]
 resolver = "3"
 
 [workspace.package]
+version = "1.0.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.97"
