@@ -23,17 +23,34 @@ const SILENCE: [u8; 3] = [0xF8, 0xFF, 0xFE];
 const SILENCE_FRAMES: u8 = 5;
 const TRANSPORT_INVALIDATED: usize = 1 << (usize::BITS - 1);
 
+/// A non-blocking source of encoded Discord Opus frames.
+///
+/// Each source is polled by one logical sender at a time. A ready frame must be
+/// exactly 20 ms of 48 kHz stereo Opus. When returning [`Poll::Pending`], the
+/// source must register or replace the supplied waker and wake it after a state
+/// change that may make a frame or the end-of-stream marker available.
 pub trait FrameSource: Send + 'static {
+    /// Polls one encoded frame into `output` without blocking.
     fn poll_frame(&mut self, cx: &mut Context<'_>, output: &mut [u8]) -> Poll<FrameStatus>;
 }
 
+/// The result of a ready [`FrameSource`] poll.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum FrameStatus {
-    Frame { len: usize },
+    /// One complete encoded Opus frame was written into the output buffer.
+    Frame {
+        /// Number of initialized frame bytes at the start of the output buffer.
+        len: usize,
+    },
+    /// The source has permanently ended.
     Ended,
 }
 
+/// An attached, restartable 20 ms audio scheduler for one voice connection.
+///
+/// Clones refer to the same sender. Call [`Self::stop`] for graceful silence
+/// drain; dropping all handles only requests best-effort cancellation.
 pub struct PacedAudioSender {
     control: Arc<AudioControl>,
 }
@@ -56,6 +73,7 @@ impl std::fmt::Debug for PacedAudioSender {
 }
 
 impl PacedAudioSender {
+    /// Returns the latest durable audio state and low-cost counters.
     #[must_use]
     pub fn state(&self) -> AudioSnapshot {
         let mut state = self.control.state.borrow().clone();
@@ -63,6 +81,7 @@ impl PacedAudioSender {
         state
     }
 
+    /// Replaces the current source and returns the newly admitted generation.
     pub async fn replace_source<S: FrameSource>(
         &self,
         source: S,
@@ -87,6 +106,7 @@ impl PacedAudioSender {
         })
     }
 
+    /// Gracefully drains terminal silence and stops audio without disconnecting.
     pub async fn stop(&self) -> Result<AudioSnapshot, Error> {
         self.control.stop().await
     }

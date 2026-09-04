@@ -114,3 +114,8 @@ RTP timestamp increment = 960
 ```
 
 This matches Koe's actual audio poller and the intended Crust/Mantle integration. Variable-duration Opus packets are deferred until a real consumer requires them; Oto should not carry timing genericity merely because Opus can theoretically encode other durations.
+
+## Release evidence
+
+The P15 release-closure package, API examples, current platform claims, Koe
+parity report, Crust integration matrix, performance summary, and dependency

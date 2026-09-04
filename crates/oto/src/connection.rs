@@ -17,6 +17,11 @@ use crate::model::{
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// A caller-owned Discord voice connection handle.
+///
+/// Clones refer to the same connection generation. Use [`Self::shutdown`] for
+/// explicit asynchronous cleanup; dropping the last handle only requests
+/// best-effort cancellation.
 #[derive(Clone)]
 pub struct VoiceConnection {
     inner: Arc<Inner>,
@@ -153,6 +158,7 @@ impl VoiceConnection {
         }
     }
 
+    /// Returns the latest durable connection state and counters.
     #[must_use]
     pub fn state(&self) -> ConnectionSnapshot {
         let mut snapshot = self.inner.state.borrow().clone();
@@ -162,6 +168,11 @@ impl VoiceConnection {
         snapshot
     }
 
+    /// Subscribes to bounded transient lifecycle events.
+    ///
+    /// Admission fails with [`ErrorKind::ResourceLimit`] when the configured
+    /// subscriber limit has been reached. Durable final state remains available
+    /// through [`Self::state`] even if the subscriber later lags.
     pub fn subscribe_events(&self) -> Result<EventSubscriber, Error> {
         let mut current = self.inner.subscribers.load(Ordering::Acquire);
         loop {
@@ -192,6 +203,7 @@ impl VoiceConnection {
         })
     }
 
+    /// Measures a numbered Voice Gateway heartbeat round trip.
     pub async fn ping(&self) -> Result<Duration, Error> {
         let (reply, response) = oneshot::channel();
         self.send_command(Command::Ping { reply }, Operation::Ping)
@@ -208,6 +220,10 @@ impl VoiceConnection {
         })
     }
 
+    /// Starts a fresh connection generation from new external voice information.
+    ///
+    /// The old transport is invalidated and its admitted sends are drained
+    /// before the replacement is acknowledged.
     pub async fn replace_voice_info(
         &self,
         info: VoiceConnectInfo,
@@ -233,6 +249,10 @@ impl VoiceConnection {
         })
     }
 
+    /// Attaches the connection's single paced encoded-Opus sender.
+    ///
+    /// A source may initially be pending; Speaking is written and acknowledged
+    /// internally before its first UDP media packet.
     pub async fn start_audio<S: FrameSource>(&self, source: S) -> Result<PacedAudioSender, Error> {
         if self
             .inner
@@ -344,6 +364,7 @@ impl VoiceConnection {
         Ok(control.sender())
     }
 
+    /// Explicitly and idempotently shuts down audio and connection tasks.
     pub async fn shutdown(&self) -> Result<ConnectionSnapshot, Error> {
         let audio = self
             .inner
@@ -398,6 +419,7 @@ impl VoiceConnection {
     }
 }
 
+/// A bounded receiver for transient [`ConnectionEvent`] values.
 pub struct EventSubscriber {
     receiver: broadcast::Receiver<ConnectionEvent>,
     subscribers: Arc<AtomicUsize>,
@@ -419,6 +441,7 @@ impl Drop for EventSubscriber {
 }
 
 impl EventSubscriber {
+    /// Waits for the next event or reports exact lag/closure.
     pub async fn recv(&mut self) -> Result<ConnectionEvent, EventReceiveError> {
         match self.receiver.recv().await {
             Ok(event) => Ok(event),

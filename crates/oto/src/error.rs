@@ -4,55 +4,96 @@ use std::sync::Arc;
 
 use crate::ConnectionGeneration;
 
+/// Stable classifications for Oto-owned failures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ErrorKind {
+    /// Builder inputs are zero, inconsistent, or unsafe.
     InvalidConfiguration,
+    /// Voice connection information is malformed or out of bounds.
     InvalidVoiceInfo,
+    /// The operation requires a running caller-owned Tokio runtime.
     RuntimeUnavailable,
+    /// Endpoint parsing, DNS, WebSocket, or TLS establishment failed.
     EndpointOrTls,
+    /// Discord rejected the supplied voice credentials.
     CredentialsRejected,
+    /// A Voice Gateway message or state transition violated the protocol.
     GatewayProtocol,
+    /// The Voice Gateway heartbeat acknowledgement deadline expired.
     HeartbeatTimeout,
+    /// Discord rejected or could not satisfy buffered Resume.
     ResumeRejected,
+    /// Recovery requires a fresh external voice-state/server update.
     NeedsFreshVoiceInfo,
+    /// UDP IP discovery did not produce a valid route.
     UdpDiscovery,
+    /// Discord offered no current supported transport encryption mode.
     UnsupportedTransport,
+    /// RTP transport encryption, key, nonce, or packet processing failed.
     TransportCrypto,
+    /// The call requires DAVE but no ready encrypted sender is available.
     DaveRequired,
+    /// Discord selected a DAVE version Oto cannot support.
     DaveUnsupported,
+    /// DAVE setup, membership, transition, or media transformation failed.
     DaveTransition,
+    /// A source blocked, returned an invalid length, or violated its frame contract.
     FrameSourceContract,
+    /// Sending a UDP media packet failed.
     SendIo,
+    /// A configured bounded resource limit rejected an operation.
     ResourceLimit,
+    /// A bounded queue or operation deadline remained saturated.
     Overloaded,
+    /// A newer lifecycle operation replaced the requested work.
     Superseded,
+    /// Explicit shutdown or owner cancellation ended the operation.
     Shutdown,
 }
 
+/// What the caller should assume about retry ownership after a failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RetryDisposition {
+    /// Oto is already retrying within the current connection generation.
     RetryingInternally,
+    /// The caller must supply a fresh complete [`crate::VoiceConnectInfo`].
     NeedsFreshVoiceInfo,
+    /// Oto will not retry this failure automatically.
     Fatal,
+    /// The operation ended because the connection is shutting down.
     Shutdown,
 }
 
+/// Public operation labels attached to failures and snapshots.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Operation {
+    /// Connector configuration validation.
     Build,
+    /// Initial voice connection establishment.
     Connect,
+    /// Fresh voice information replacement.
     ReplaceVoiceInfo,
+    /// Internal buffered Resume processing.
     Resume,
+    /// Voice Gateway heartbeat round-trip measurement.
     Ping,
+    /// Paced sender attachment.
     StartAudio,
+    /// Attached source replacement.
     ReplaceSource,
+    /// Graceful paced audio stop.
     StopAudio,
+    /// Explicit connection shutdown.
     Shutdown,
 }
 
+/// An Oto-owned typed failure with redaction-safe metadata.
+///
+/// Dependency error enums are retained only as an optional source and are not
+/// part of the stable classification contract.
 #[derive(Clone)]
 pub struct Error {
     kind: ErrorKind,
@@ -99,26 +140,31 @@ impl Error {
         self
     }
 
+    /// Returns the stable failure classification.
     #[must_use]
     pub fn kind(&self) -> ErrorKind {
         self.kind
     }
 
+    /// Returns the operation that observed the failure.
     #[must_use]
     pub fn operation(&self) -> Operation {
         self.operation
     }
 
+    /// Returns the affected connection generation when one exists.
     #[must_use]
     pub fn generation(&self) -> Option<ConnectionGeneration> {
         self.generation
     }
 
+    /// Returns the retry ownership/disposition.
     #[must_use]
     pub fn retry_disposition(&self) -> RetryDisposition {
         self.retry
     }
 
+    /// Returns a redaction-safe protocol/status code when applicable.
     #[must_use]
     pub fn safe_code(&self) -> Option<u32> {
         self.safe_code

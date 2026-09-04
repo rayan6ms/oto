@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 #![doc = "Oto's transport-only Discord voice connection core."]
+#![warn(missing_docs)]
 
 #[cfg(test)]
 #[global_allocator]
