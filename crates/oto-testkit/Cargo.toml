@@ -1,0 +1,23 @@
+[package]
+name = "oto-testkit"
+version.workspace = true
+description = "Deterministic local protocol and transport test infrastructure for Oto"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+readme = "../../README.md"
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+futures-util.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tokio-tungstenite.workspace = true

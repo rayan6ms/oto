@@ -1,0 +1,34 @@
+[package]
+name = "oto"
+version.workspace = true
+description = "Rust-native Discord Voice Gateway, UDP/RTP, transport encryption, DAVE, and paced Opus transport"
+edition.workspace = true
+homepage.workspace = true
+license.workspace = true
+readme = "../../README.md"
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+testkit = ["dep:rustls"]
+
+[dependencies]
+aes-gcm.workspace = true
+chacha20poly1305.workspace = true
+davey.workspace = true
+futures-util.workspace = true
+getrandom.workspace = true
+rustls = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+
+[dev-dependencies]
+oto-testkit = { path = "../oto-testkit" }
+rustls.workspace = true
+stats_alloc = "0.1.10"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(fuzzing)"] }
