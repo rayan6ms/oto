@@ -9,7 +9,7 @@ use serde_json::{Number, Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep, sleep_until, timeout};
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_tls_with_config};
@@ -362,12 +362,12 @@ pub(crate) async fn run(
             Attempt::Resume => store.resume_started(),
         }
 
-        #[cfg(test)]
+        #[cfg(any(test, feature = "testkit"))]
         let connector = config
             .tls_config
             .as_ref()
             .map(|config| Connector::Rustls(config.clone()));
-        #[cfg(not(test))]
+        #[cfg(not(any(test, feature = "testkit")))]
         let connector = None;
         let websocket_config = WebSocketConfig::default()
             .max_message_size(Some(

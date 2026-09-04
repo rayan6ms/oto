@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "testkit"))]
 use rustls::ClientConfig;
 
 use crate::connection::VoiceConnection;
@@ -165,7 +165,7 @@ impl std::fmt::Debug for Oto {
 
 pub struct OtoBuilder {
     limits: ResourceLimits,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     tls_config: Option<Arc<ClientConfig>>,
     #[cfg(test)]
     transport_nonce_start: Option<u32>,
@@ -176,7 +176,7 @@ impl std::fmt::Debug for OtoBuilder {
         formatter
             .debug_struct("OtoBuilder")
             .field("limits", &self.limits)
-            .field("custom_tls", &cfg!(test))
+            .field("custom_tls", &cfg!(any(test, feature = "testkit")))
             .finish()
     }
 }
@@ -184,7 +184,7 @@ impl std::fmt::Debug for OtoBuilder {
 pub(crate) struct Config {
     pub(crate) limits: ResourceLimits,
     pub(crate) pacer: Pacer,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "testkit"))]
     pub(crate) tls_config: Option<Arc<ClientConfig>>,
     #[cfg(test)]
     pub(crate) transport_nonce_start: std::sync::Mutex<Option<u32>>,
@@ -199,7 +199,7 @@ impl Oto {
     pub fn builder() -> OtoBuilder {
         OtoBuilder {
             limits: ResourceLimits::default(),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "testkit"))]
             tls_config: None,
             #[cfg(test)]
             transport_nonce_start: None,
@@ -224,7 +224,7 @@ impl OtoBuilder {
             config: Arc::new(Config {
                 limits: self.limits,
                 pacer: Pacer::new(),
-                #[cfg(test)]
+                #[cfg(any(test, feature = "testkit"))]
                 tls_config: self.tls_config,
                 #[cfg(test)]
                 transport_nonce_start: std::sync::Mutex::new(self.transport_nonce_start),
@@ -236,8 +236,9 @@ impl OtoBuilder {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn test_tls_config(mut self, config: Arc<ClientConfig>) -> Self {
+    #[cfg(any(test, feature = "testkit"))]
+    #[doc(hidden)]
+    pub fn test_tls_config(mut self, config: Arc<ClientConfig>) -> Self {
         self.tls_config = Some(config);
         self
     }
