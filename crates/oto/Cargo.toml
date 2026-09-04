@@ -3,8 +3,10 @@ name = "oto"
 version.workspace = true
 description = "Rust-native Discord Voice Gateway, UDP/RTP, transport encryption, DAVE, and paced Opus transport"
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
 readme = "../../README.md"
+repository.workspace = true
 rust-version.workspace = true
 publish = false
 

@@ -20,6 +20,9 @@ upstream Rust API lacks them:
 - a caller-owned reusable encryption-output method avoids reconstructing Opus
   sizing scratch state and allocating the result buffer on every media frame;
   the existing allocating API remains source-compatible.
+- trace/debug statements that formatted MLS secrets, sender-ratchet material,
+  or the voice privacy code are removed so consumer logging configuration
+  cannot disclose DAVE security material.
 
 The MLS and media cryptographic implementations are otherwise unchanged.
 

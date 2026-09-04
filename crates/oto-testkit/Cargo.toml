@@ -3,8 +3,10 @@ name = "oto-testkit"
 version.workspace = true
 description = "Deterministic local protocol and transport test infrastructure for Oto"
 edition.workspace = true
+homepage.workspace = true
 license.workspace = true
 readme = "../../README.md"
+repository.workspace = true
 rust-version.workspace = true
 publish = false
 

@@ -5134,6 +5134,19 @@ mod tests {
         let token = VoiceToken::new("never-print-this");
         assert!(!format!("{token:?}").contains("never-print-this"));
 
+        let info = VoiceConnectInfo::new(
+            1,
+            2,
+            3,
+            "never-print-this-session",
+            "voice.example.test",
+            VoiceToken::new("never-print-this-token"),
+        );
+        let debug = format!("{info:?}");
+        assert!(!debug.contains("never-print-this-session"));
+        assert!(!debug.contains("never-print-this-token"));
+        assert_eq!(debug.matches("[REDACTED]").count(), 2);
+
         for endpoint in [
             "ws://voice.example.test",
             "user@voice.example.test",

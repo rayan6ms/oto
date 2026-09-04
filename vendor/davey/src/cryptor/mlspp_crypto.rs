@@ -71,7 +71,6 @@ fn expand_with_label(
         .tls_serialize_detached()
         .expect("failed to serialize kdf label");
     trace!("  serialized info: {:x?}", info);
-    trace!("  secret: {:x?}", secret);
     hkdf_expand(secret, &info, length)
 }
 
@@ -86,8 +85,6 @@ pub fn derive_tree_secret(
         "Derive tree secret with label \"{}\" in generation {} of length {}",
         label, generation, length
     );
-    trace!("Input secret {:x?}", secret);
     let new_secret = expand_with_label(secret, label, &generation.to_be_bytes(), length)?;
-    trace!("Derived secret {:x?}", new_secret);
     Ok(new_secret)
 }

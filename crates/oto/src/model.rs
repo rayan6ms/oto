@@ -28,9 +28,9 @@ impl fmt::Debug for VoiceToken {
 
 /// Complete per-generation Discord voice connection information.
 ///
-/// The token is redacted from `Debug`. Supplying a new value through
-/// [`crate::VoiceConnection::replace_voice_info`] always creates a fresh
-/// connection generation.
+/// The token and voice session identifier are redacted from `Debug`. Supplying
+/// a new value through [`crate::VoiceConnection::replace_voice_info`] always
+/// creates a fresh connection generation.
 #[derive(Clone)]
 pub struct VoiceConnectInfo {
     server_id: u64,
@@ -104,7 +104,7 @@ impl fmt::Debug for VoiceConnectInfo {
             .field("server_id", &self.server_id)
             .field("user_id", &self.user_id)
             .field("channel_id", &self.channel_id)
-            .field("session_id", &self.session_id)
+            .field("session_id", &"[REDACTED]")
             .field("endpoint", &self.endpoint)
             .field("token", &"[REDACTED]")
             .finish()

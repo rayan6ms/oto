@@ -11,7 +11,7 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 #[cfg(feature = "pyo3")]
 use pyo3::prelude::*;
 use std::{borrow::Cow, collections::HashMap, fmt::Debug, num::NonZeroU16};
-use tracing::{debug, trace, warn};
+use tracing::{debug, warn};
 
 use crate::{
     errors::*, generate_key_fingerprint, pairwise_fingerprints_internal,
@@ -782,13 +782,9 @@ impl DaveSession {
         self.pending_encryptor_ratchet = Some(self.get_key_ratchet(user_id)?);
 
         // Update privacy code
-        let old_code = self.privacy_code.clone();
         let epoch_authenticator = self.group.as_ref().unwrap().epoch_authenticator();
         self.privacy_code =
             generate_displayable_code_internal(epoch_authenticator.as_slice(), 30, 5)?;
-        if self.privacy_code != old_code {
-            debug!("New Voice Privacy Code: {:?}", self.privacy_code);
-        }
 
         Ok(())
     }
@@ -822,7 +818,6 @@ impl DaveSession {
             )
             .map_err(UpdateRatchetsError::ExportingSecretFailed)?;
 
-        trace!("Got base secret for user {:?}: {:?}", user_id, base_secret);
         Ok(HashRatchet::new(base_secret))
     }
 

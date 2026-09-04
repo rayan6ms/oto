@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use tracing::{debug, trace};
+use tracing::debug;
 
 use crate::errors::{GetKeyError, InvalidLength};
 
@@ -14,7 +14,6 @@ pub struct HashRatchet {
 
 impl HashRatchet {
     pub fn new(secret: Vec<u8>) -> Self {
-        trace!("Creating hash ratchet with secret: {:x?}", secret);
         Self {
             next_generation: 0,
             next_secret: secret,

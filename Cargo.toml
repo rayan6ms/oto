@@ -6,7 +6,9 @@ resolver = "3"
 [workspace.package]
 version = "1.0.0"
 edition = "2024"
+homepage = "https://github.com/rayan6ms/oto"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/rayan6ms/oto"
 rust-version = "1.97"
 
 [workspace.dependencies]

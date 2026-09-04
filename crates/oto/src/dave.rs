@@ -700,6 +700,41 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn vendored_backend_source_does_not_log_dave_security_material() {
+        const SOURCES: &[(&str, &str)] = &[
+            (
+                "session.rs",
+                include_str!("../../../vendor/davey/src/session.rs"),
+            ),
+            (
+                "hash_ratchet.rs",
+                include_str!("../../../vendor/davey/src/cryptor/hash_ratchet.rs"),
+            ),
+            (
+                "mlspp_crypto.rs",
+                include_str!("../../../vendor/davey/src/cryptor/mlspp_crypto.rs"),
+            ),
+        ];
+        const FORBIDDEN_LOG_FRAGMENTS: &[&str] = &[
+            "Got base secret",
+            "hash ratchet with secret",
+            "Input secret",
+            "Derived secret",
+            "secret: {:x?}",
+            "New Voice Privacy Code",
+        ];
+
+        for (path, source) in SOURCES {
+            for fragment in FORBIDDEN_LOG_FRAGMENTS {
+                assert!(
+                    !source.contains(fragment),
+                    "{path} must not log DAVE security material matching {fragment:?}"
+                );
+            }
+        }
+    }
+
     fn mutation_bytes(seed: &mut u64, maximum_len: usize) -> Vec<u8> {
         *seed = seed
             .wrapping_mul(6_364_136_223_846_793_005)

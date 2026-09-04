@@ -118,15 +118,19 @@ This matches Koe's actual audio poller and the intended Crust/Mantle integration
 
 ## Release and distribution
 
-The current repository release is `v1.0.0`, licensed under MIT or Apache-2.0
-at the consumer's option. Oto is distributed as a repository source release:
-the complete tagged tree includes the narrowly patched `davey` and
+The public `v1.0.0` release is available from
+[`rayan6ms/oto`](https://github.com/rayan6ms/oto), licensed under MIT or
+Apache-2.0 at the consumer's option. Oto is distributed as a repository source
+release: the public tagged tree includes the narrowly patched `davey` and
 `openmls_rust_crypto` sources required by the validated DAVE implementation.
+It uses a parentless sanitized release commit and does not expose this private
+engineering repository's agent instructions, plans, project memory, detailed
+evidence, local environment, or internal Git history.
 
 Both workspace packages retain `publish = false`. They must not be published
 to crates.io in their current form because Cargo would replace path dependencies
 with registry packages, and upstream `davey 0.1.4` does not contain all fixes
 admitted by Oto's correctness and security gates. Consumers should build the
-tagged workspace with Rust 1.97 or newer. See
+public tagged workspace with Rust 1.97 or newer. See
 the source-package verification procedure and registry-publication unblock
 conditions.

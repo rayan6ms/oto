@@ -25,6 +25,10 @@ All notable changes to Oto are documented in this file. The format follows
 - Bounded untrusted inputs and queues, redacted credentials and key material,
   no plaintext fallback for DAVE-required calls, and transport renewal before
   nonce reuse.
+- Voice tokens and ephemeral voice session identifiers are redacted from public
+  debug output.
+- Vendored DAVE trace logging cannot disclose MLS secrets, sender-ratchet
+  material, or voice privacy codes.
 - Source release contains the admitted patched `davey` and OpenMLS RustCrypto
   dependencies; registry publication is disabled until equivalent publishable
   dependency provenance exists.
