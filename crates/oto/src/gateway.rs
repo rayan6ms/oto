@@ -14,7 +14,7 @@ use tokio_tungstenite::Connector;
 use tokio_tungstenite::tungstenite::protocol::{Message, WebSocketConfig};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_tls_with_config};
 
-use crate::audio::InstalledTransport;
+use crate::audio::{InstalledTransport, TransportValidity};
 use crate::config::Config;
 use crate::connection::StateStore;
 use crate::dave::{self, Control as DaveControl, Outbound as DaveOutbound};
@@ -282,6 +282,44 @@ pub(crate) fn fuzz_dave_binary_envelope(input: &[u8]) {
     }
 }
 
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_gateway_json_dispatch(input: &[u8]) {
+    if input.len() > 1_280_000 {
+        return;
+    }
+    let Ok(envelope) = serde_json::from_slice::<InboundEnvelope>(input) else {
+        return;
+    };
+    if let Some(sequence) = envelope.seq {
+        let _ = sequence.is_i64() || sequence.is_u64();
+    }
+    match envelope.op {
+        2 => {
+            let _ = parse_ready(envelope.d, ConnectionGeneration::FIRST);
+        }
+        4 => {
+            let _ = serde_json::from_value::<SessionDescriptionData>(envelope.d);
+        }
+        8 => {
+            let _ = envelope.d.get("heartbeat_interval").and_then(Value::as_u64);
+        }
+        11 => {
+            let _ = decode_dave_roster(&envelope.d, 4_096);
+        }
+        13 => {
+            let _ = envelope
+                .d
+                .get("user_id")
+                .and_then(Value::as_str)
+                .and_then(parse_dave_user_id);
+        }
+        21 | 22 | 24 => {
+            let _ = decode_dave_json_control(envelope.op, &envelope.d);
+        }
+        _ => {}
+    }
+}
+
 struct DiscoveryCompletion {
     generation: ConnectionGeneration,
     ssrc: u32,
@@ -317,6 +355,7 @@ impl Drop for DiscoveryTask {
 
 struct UdpTransport {
     socket: Arc<tokio::net::UdpSocket>,
+    validity: Arc<TransportValidity>,
     ssrc: u32,
     selected_mode: TransportMode,
     encoder: Option<TransportEncoder>,
@@ -405,7 +444,12 @@ pub(crate) async fn run(
                 command = commands.recv() => {
                     match command {
                         Some(Command::Replace { info: replacement, reply }) => {
-                            if let Some(replacement) = accept_replacement(&mut store, replacement, reply) {
+                            if let Some(replacement) = accept_replacement(
+                                &mut store,
+                                &mut transport,
+                                replacement,
+                                reply,
+                            ).await {
                                 info = replacement;
                                 latest_sequence = None;
                                 transport = None;
@@ -636,7 +680,9 @@ pub(crate) async fn run(
             SessionOutcome::NeedsFresh(error) => {
                 store.fail(&error, ConnectionPhase::NeedsFreshVoiceInfo);
                 send_initial_error(&mut initial, error.clone());
-                match wait_for_replacement(&mut commands, &mut shutdown, &mut store).await {
+                match wait_for_replacement(&mut commands, &mut shutdown, &mut store, &mut transport)
+                    .await
+                {
                     Some(replacement) => {
                         info = replacement;
                         latest_sequence = None;
@@ -714,14 +760,19 @@ async fn run_session(
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     let _ = timed_close(&mut websocket).await;
-                    fail_pending_pings(&mut pending_pings, store.generation());
+                    fail_pending_pings_shutdown(&mut pending_pings, store.generation());
                     return SessionOutcome::Shutdown;
                 }
             }
             command = commands.recv() => {
                 match command {
                     Some(Command::Replace { info: replacement, reply }) => {
-                        if let Some(replacement) = accept_replacement(store, replacement, reply) {
+                        if let Some(replacement) = accept_replacement(
+                            store,
+                            transport,
+                            replacement,
+                            reply,
+                        ).await {
                             let _ = timed_close(&mut websocket).await;
                             fail_pending_pings(&mut pending_pings, store.generation());
                             return SessionOutcome::Replace(replacement);
@@ -730,6 +781,17 @@ async fn run_session(
                     Some(Command::Ping { reply }) => {
                         if heartbeat_interval.is_none() {
                             let _ = reply.send(Err(retrying_error(Operation::Ping, store.generation())));
+                            continue;
+                        }
+                        if pending_pings.len() >= config.limits.gateway_command_capacity() {
+                            let _ = reply.send(Err(Error::new(
+                                ErrorKind::Overloaded,
+                                Operation::Ping,
+                                Some(store.generation()),
+                                RetryDisposition::Fatal,
+                                None,
+                                "pending gateway ping waiter limit reached",
+                            )));
                             continue;
                         }
                         pending_pings.push(reply);
@@ -864,6 +926,7 @@ async fn run_session(
                 let select = select_protocol_payload(discovered.public, completion.mode);
                 *transport = Some(UdpTransport {
                     socket: discovered.socket,
+                    validity: TransportValidity::new(),
                     ssrc: completion.ssrc,
                     selected_mode: completion.mode,
                     encoder: None,
@@ -1113,6 +1176,7 @@ async fn run_session(
                                     generation: store.generation(),
                                     socket: active.socket.clone(),
                                     encoder,
+                                    validity: active.validity.clone(),
                                     dave_protocol_version: description.dave_protocol_version,
                                     dave: active.dave.clone(),
                                     dave_media: active
@@ -1468,6 +1532,7 @@ fn attach_audio(
         generation,
         socket: active.socket.clone(),
         encoder,
+        validity: active.validity.clone(),
         dave_protocol_version: active.dave_protocol_version,
         dave: active.dave.clone(),
         dave_media: active.dave.as_ref().map(dave::Handle::media_encryptor),
@@ -1643,8 +1708,9 @@ fn resumable_outcome(has_latest_sequence: bool) -> SessionOutcome {
     }
 }
 
-fn accept_replacement(
+async fn accept_replacement(
     store: &mut StateStore,
+    transport: &mut Option<UdpTransport>,
     info: ValidatedInfo,
     reply: oneshot::Sender<Result<ConnectionGeneration, Error>>,
 ) -> Option<ValidatedInfo> {
@@ -1661,15 +1727,23 @@ fn accept_replacement(
         store.fail(&error, ConnectionPhase::Failed);
         return None;
     };
+    invalidate_transport(transport).await;
     store.replace_generation(generation);
     let _ = reply.send(Ok(generation));
     Some(info)
+}
+
+async fn invalidate_transport(transport: &mut Option<UdpTransport>) {
+    if let Some(transport) = transport.as_ref() {
+        transport.validity.invalidate().await;
+    }
 }
 
 async fn wait_for_replacement(
     commands: &mut mpsc::Receiver<Command>,
     shutdown: &mut watch::Receiver<bool>,
     store: &mut StateStore,
+    transport: &mut Option<UdpTransport>,
 ) -> Option<ValidatedInfo> {
     loop {
         tokio::select! {
@@ -1678,7 +1752,12 @@ async fn wait_for_replacement(
             }
             command = commands.recv() => match command? {
                 Command::Replace { info, reply } => {
-                    if let Some(info) = accept_replacement(store, info, reply) {
+                    if let Some(info) = accept_replacement(
+                        store,
+                        transport,
+                        info,
+                        reply,
+                    ).await {
                         return Some(info);
                     }
                 }
@@ -1759,7 +1838,12 @@ async fn backoff_or_command(attempt: u8, context: BackoffContext<'_>) -> Backoff
         },
         command = commands.recv() => match command {
             Some(Command::Replace { info: replacement, reply }) => {
-                if let Some(replacement) = accept_replacement(store, replacement, reply) {
+                if let Some(replacement) = accept_replacement(
+                    store,
+                    transport,
+                    replacement,
+                    reply,
+                ).await {
                     *info = replacement;
                     *latest_sequence = None;
                     BackoffOutcome::Replaced
@@ -1955,6 +2039,23 @@ fn fail_pending_pings(
 ) {
     for waiter in pending.drain(..) {
         let _ = waiter.send(Err(retrying_error(Operation::Ping, generation)));
+    }
+}
+
+fn fail_pending_pings_shutdown(
+    pending: &mut Vec<oneshot::Sender<Result<Duration, Error>>>,
+    generation: ConnectionGeneration,
+) {
+    let error = Error::new(
+        ErrorKind::Shutdown,
+        Operation::Ping,
+        Some(generation),
+        RetryDisposition::Shutdown,
+        None,
+        "connection shut down before ping completed",
+    );
+    for waiter in pending.drain(..) {
+        let _ = waiter.send(Err(error.clone()));
     }
 }
 
@@ -2777,6 +2878,7 @@ mod tests {
         for _ in 0..20 {
             tokio::task::yield_now().await;
         }
+        eventually(|| handle.polls() > 0).await;
         assert_eq!(sender.state().phase(), AudioPhase::WaitingForSource);
         assert_eq!(
             gateway.udp.capture().len(),
@@ -2834,6 +2936,18 @@ mod tests {
         }
 
         let idle_polls = handle.polls();
+        connection
+            .ping()
+            .await
+            .expect("heartbeat state update is acknowledged");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            handle.polls(),
+            idle_polls,
+            "heartbeat state updates do not poll an idle source"
+        );
         sleep(Duration::from_millis(70)).await;
         assert_eq!(
             handle.polls(),
@@ -2995,6 +3109,7 @@ mod tests {
         let before = sender.state().stats().frames_sent();
         let captured_before = gateway.udp.capture().len();
 
+        let resume_started = std::time::Instant::now();
         gateway
             .try_close(VoiceClose {
                 code: 4015,
@@ -3002,6 +3117,9 @@ mod tests {
             })
             .expect("resumable close queues");
         eventually(|| connection.state().stats().resume_successes() >= 1).await;
+        let resume_millis = resume_started.elapsed().as_millis();
+        assert!(resume_millis < 2_000, "local buffered Resume is bounded");
+        println!("P14_LOCAL_RESUME_MILLIS={resume_millis}");
         eventually(|| sender.state().stats().frames_sent() > before).await;
         assert_eq!(connection.state().generation().get(), 1);
         assert!(gateway.udp.capture().len() > captured_before);
@@ -3125,12 +3243,12 @@ mod tests {
         handle.activate();
         let sender = connection.start_audio(source).await.expect("audio starts");
         eventually(|| sender.state().stats().frames_sent() >= 2).await;
-        let old_before = initial.udp.capture().len();
         let generation = connection
             .replace_voice_info(voice_info(&replacement, "playback-new", "token-new"))
             .await
             .expect("fresh voice information accepted");
         assert_eq!(generation.get(), 2);
+        let old_after_replacement = initial.udp.capture().len();
         eventually(|| {
             connection.state().generation() == generation
                 && connection.state().phase() == ConnectionPhase::Connected
@@ -3139,8 +3257,8 @@ mod tests {
         .await;
         let old_after = initial.udp.capture().len();
         assert_eq!(
-            old_after, old_before,
-            "old generation cannot send after replacement"
+            old_after, old_after_replacement,
+            "old generation cannot send after replacement is acknowledged"
         );
         assert!(
             sender.state().stats().frames_sent() >= 3,
@@ -3179,11 +3297,11 @@ mod tests {
         handle.activate();
         let sender = connection.start_audio(source).await.expect("audio starts");
         eventually(|| sender.state().stats().frames_sent() >= 2).await;
-        let old_before = initial.udp.capture().len();
         connection
             .replace_voice_info(voice_info(&replacement, "dave-replace-new", "token-new"))
             .await
             .expect("DAVE replacement accepted");
+        let old_after_replacement = initial.udp.capture().len();
         eventually(|| connection.state().phase() == ConnectionPhase::EstablishingDave).await;
         sleep(Duration::from_millis(30)).await;
         assert_ne!(sender.state().phase(), AudioPhase::Failed);
@@ -3194,8 +3312,8 @@ mod tests {
         );
         assert_eq!(
             initial.udp.capture().len(),
-            old_before,
-            "old transport is invalidated"
+            old_after_replacement,
+            "old transport is invalidated before replacement is acknowledged"
         );
 
         sender
@@ -4304,6 +4422,102 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "release-only simulated 24-hour connected lifecycle soak"]
+    async fn p14_simulated_24_hour_connected_lifecycle_soak() {
+        const SIMULATED_HOURS: u64 = 24;
+        const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+        const HEARTBEAT_CYCLES: u64 = SIMULATED_HOURS * 60 * 60 / 10;
+
+        let mut config = FakeVoiceGatewayConfig::local();
+        config.dave_protocol_version = 1;
+        config.heartbeat_interval = HEARTBEAT_INTERVAL;
+        config.capture_capacity = HEARTBEAT_CYCLES as usize + 128;
+        let gateway = TestGateway::start(config).await.expect("gateway starts");
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        oto.config
+            .ready_dave_fixture
+            .store(true, std::sync::atomic::Ordering::Release);
+        let connection = oto
+            .connect(voice_info(&gateway, "p14-lifecycle-soak", "token"))
+            .await
+            .expect("transport reaches DAVE setup");
+        gateway
+            .try_dave_prepare_transition(1, 0)
+            .expect("initial DAVE transition queues");
+        eventually(|| connection.state().phase() == ConnectionPhase::Connected).await;
+
+        let (source, source_handle) = QueueSource::pair();
+        let sender = connection
+            .start_audio(source)
+            .await
+            .expect("Pending source attaches");
+        eventually(|| {
+            source_handle.polls() > 0 && sender.state().phase() == AudioPhase::WaitingForSource
+        })
+        .await;
+        let polls_before = source_handle.polls();
+
+        connection
+            .ping()
+            .await
+            .expect("initial heartbeat is acknowledged before time simulation");
+        tokio::time::pause();
+        for cycle in 0..HEARTBEAT_CYCLES {
+            tokio::time::advance(HEARTBEAT_INTERVAL).await;
+            // Advancing the clock makes the heartbeat deadline ready, but the
+            // fake peer still completes real loopback TLS/WebSocket I/O. Let
+            // the reactor use wall time while waiting for that cycle's
+            // acknowledgement; otherwise Tokio's paused current-thread clock
+            // can auto-advance to another heartbeat deadline before loopback
+            // I/O becomes readable.
+            tokio::time::resume();
+            connection.ping().await.unwrap_or_else(|error| {
+                panic!(
+                    "simulated heartbeat cycle {cycle} failed: {error:?}; state={:?}",
+                    connection.state()
+                )
+            });
+            tokio::time::pause();
+            if cycle % 360 == 0 {
+                let state = connection.state();
+                assert_eq!(state.phase(), ConnectionPhase::Connected);
+                assert!(state.failure().is_none());
+            }
+        }
+        tokio::time::resume();
+
+        let state = connection.state();
+        assert_eq!(state.phase(), ConnectionPhase::Connected);
+        assert!(state.failure().is_none());
+        assert_eq!(state.stats().heartbeat_timeouts(), 0);
+        assert_eq!(source_handle.polls(), polls_before);
+        assert_eq!(sender.state().stats().frames_sent(), 0);
+        assert_eq!(sender.state().stats().silence_frames_sent(), 0);
+        let heartbeat_records = gateway
+            .records()
+            .iter()
+            .filter(|record| matches!(record, GatewayRecord::Heartbeat { .. }))
+            .count();
+        assert!(heartbeat_records >= HEARTBEAT_CYCLES as usize);
+
+        println!(
+            "P14_CONNECTED_LIFECYCLE_SOAK={}",
+            json!({
+                "classification": "simulated connected lifecycle; not wall-clock or live Discord evidence",
+                "simulatedHours": SIMULATED_HOURS,
+                "heartbeatCycles": HEARTBEAT_CYCLES,
+                "heartbeatTimeouts": state.stats().heartbeat_timeouts(),
+                "pendingSourcePollsDuringSoak": source_handle.polls() - polls_before,
+                "phase": format!("{:?}", state.phase()),
+            })
+        );
+
+        sender.stop().await.expect("Pending sender stops");
+        connection.shutdown().await.expect("connection shuts down");
+        gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
     async fn buffered_replay_sequence_wrap_and_failed_resume_fall_back_to_identify() {
         let mut config = FakeVoiceGatewayConfig::local();
         config.heartbeat_interval = Duration::from_millis(100);
@@ -4591,7 +4805,7 @@ mod tests {
         let text_gateway = TestGateway::start(FakeVoiceGatewayConfig::local())
             .await
             .expect("text gateway starts");
-        let text_limit = 256;
+        let text_limit = ResourceLimits::default().gateway_text_bytes();
         let oto = test_oto(
             &text_gateway,
             ResourceLimits::default().with_gateway_text_bytes(text_limit),
@@ -4600,18 +4814,25 @@ mod tests {
             .connect(voice_info(&text_gateway, "text-limits", "token"))
             .await
             .expect("text gateway connects");
-        let exact_padding = (0..text_limit)
-            .find(|length| {
-                serde_json::to_string(&json!({
-                    "op": 250,
-                    "d": {"pad": "x".repeat(*length)},
-                    "seq": 1,
-                }))
-                .expect("test JSON serializes")
-                .len()
-                    == text_limit
-            })
-            .expect("an exact text payload exists");
+        let empty_payload = serde_json::to_string(&json!({
+            "op": 250,
+            "d": {"pad": ""},
+            "seq": 1,
+        }))
+        .expect("test JSON serializes");
+        let exact_padding = text_limit
+            .checked_sub(empty_payload.len())
+            .expect("production text bound fits the test envelope");
+        assert_eq!(
+            serde_json::to_string(&json!({
+                "op": 250,
+                "d": {"pad": "x".repeat(exact_padding)},
+                "seq": 1,
+            }))
+            .expect("exact-bound test JSON serializes")
+            .len(),
+            text_limit,
+        );
         text_gateway
             .try_dispatch_json(250, json!({"pad": "x".repeat(exact_padding)}), true)
             .expect("edge text dispatch queues");
@@ -4702,6 +4923,58 @@ mod tests {
             ErrorKind::ResourceLimit
         );
 
+        gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn pending_ping_waiters_are_bounded_and_shutdown_is_typed() {
+        let mut gateway_config = FakeVoiceGatewayConfig::local();
+        gateway_config.heartbeat_interval = Duration::from_secs(300);
+        gateway_config.drop_heartbeat_acks = 1;
+        let gateway = TestGateway::start(gateway_config)
+            .await
+            .expect("gateway starts");
+        let limits = ResourceLimits::default().with_gateway_command_capacity(4);
+        let oto = test_oto(&gateway, limits);
+        let connection = oto
+            .connect(voice_info(&gateway, "pending-pings", "token"))
+            .await
+            .expect("gateway connects with its initial heartbeat outstanding");
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(9));
+        let mut pings = Vec::new();
+        for _ in 0..8 {
+            let connection = connection.clone();
+            let barrier = barrier.clone();
+            pings.push(tokio::spawn(async move {
+                barrier.wait().await;
+                connection.ping().await
+            }));
+        }
+        barrier.wait().await;
+        eventually(|| pings.iter().filter(|ping| ping.is_finished()).count() == 4).await;
+
+        let final_state = connection
+            .shutdown()
+            .await
+            .expect("shutdown releases admitted ping waiters");
+        assert_eq!(final_state.phase(), ConnectionPhase::Closed);
+
+        let mut overloaded = 0;
+        let mut shutdown = 0;
+        for ping in pings {
+            let error = ping
+                .await
+                .expect("ping task joins")
+                .expect_err("the dropped ACK leaves every test ping unresolved");
+            match error.kind() {
+                ErrorKind::Overloaded => overloaded += 1,
+                ErrorKind::Shutdown => shutdown += 1,
+                kind => panic!("unexpected pending-ping outcome: {kind:?}"),
+            }
+        }
+        assert_eq!(overloaded, 4, "excess ping waiters fail explicitly");
+        assert_eq!(shutdown, 4, "admitted ping waiters observe shutdown");
         gateway.shutdown().await.expect("gateway shuts down");
     }
 

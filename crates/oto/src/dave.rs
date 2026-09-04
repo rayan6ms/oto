@@ -696,6 +696,8 @@ fn prefix_u64(input: &[u8], offset: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use crate::transport::{TransportEncoder, TransportMode};
+
     use super::*;
 
     fn mutation_bytes(seed: &mut u64, maximum_len: usize) -> Vec<u8> {
@@ -1481,5 +1483,86 @@ mod tests {
             }
         });
         println!("P08_DAVE_ADAPTER_BENCHMARK={result}");
+    }
+
+    #[test]
+    #[ignore = "release-only simulated 48-hour DAVE/RTP/transport-crypto frame-count soak"]
+    fn p14_simulated_dave_transport_crypto_soak() {
+        let simulated_hours = benchmark_env("OTO_P14_SIMULATED_SOAK_HOURS", 48);
+        assert!((24..=72).contains(&simulated_hours));
+        let frames = simulated_hours * 60 * 60 * 50;
+
+        let frame = vec![0x55; 1_275];
+        let mut dave_frame = Vec::with_capacity(1_275 + OPUS_MAX_ENCRYPTION_OVERHEAD_BYTES);
+        let mut core = ready_fixture_core();
+        let mut encoder = TransportEncoder::new(
+            TransportMode::Aes256GcmRtpSize,
+            &[0x42; 32],
+            0x0102_0304,
+            1_275 + OPUS_MAX_ENCRYPTION_OVERHEAD_BYTES,
+            2_048,
+        )
+        .expect("transport encoder builds");
+        encoder.set_test_nonce_start(0);
+        let mut packet = Vec::with_capacity(2_048);
+
+        core.encrypt_into(&frame, &mut dave_frame)
+            .expect("first DAVE frame encrypts");
+        encoder
+            .encrypt_next(&dave_frame, &mut packet)
+            .expect("first transport packet encrypts");
+        let initial_sequence = u16::from_be_bytes(packet[2..4].try_into().unwrap());
+        let initial_timestamp = u32::from_be_bytes(packet[4..8].try_into().unwrap());
+
+        let started = std::time::Instant::now();
+        let allocation_region = stats_alloc::Region::new(crate::TEST_ALLOCATOR);
+        for _ in 1..frames {
+            core.encrypt_into(&frame, &mut dave_frame)
+                .expect("DAVE frame encrypts throughout simulated soak");
+            encoder
+                .encrypt_next(&dave_frame, &mut packet)
+                .expect("transport packet encrypts throughout simulated soak");
+            std::hint::black_box(packet.as_slice());
+        }
+        let allocation = allocation_region.change();
+        let wall_seconds = started.elapsed().as_secs_f64();
+
+        let final_sequence = u16::from_be_bytes(packet[2..4].try_into().unwrap());
+        let final_timestamp = u32::from_be_bytes(packet[4..8].try_into().unwrap());
+        let final_nonce = u32::from_le_bytes(packet[packet.len() - 4..].try_into().unwrap());
+        let increments = (frames - 1) as u64;
+        assert_eq!(
+            final_sequence,
+            initial_sequence.wrapping_add(increments as u16)
+        );
+        assert_eq!(
+            final_timestamp,
+            initial_timestamp.wrapping_add(increments.wrapping_mul(960) as u32)
+        );
+        assert_eq!(final_nonce, increments as u32);
+        assert!(increments / u64::from(u16::MAX) > 1);
+        assert!(increments.wrapping_mul(960) > u64::from(u32::MAX));
+        assert_eq!(allocation.allocations, 0);
+        assert_eq!(allocation.reallocations, 0);
+        assert_eq!(allocation.bytes_allocated, 0);
+
+        let result = json!({
+            "schemaVersion": 1,
+            "benchmarkId": "oto-p14-simulated-dave-transport-crypto-soak",
+            "profile": "release",
+            "classification": "simulated frame-count soak; not wall-clock or live Discord evidence",
+            "simulatedHours": simulated_hours,
+            "frames": frames,
+            "wallSeconds": wall_seconds,
+            "layers": ["DAVE v1", "RTP", "AES-256-GCM rtpsize"],
+            "sequenceWrapsMinimum": increments / (u64::from(u16::MAX) + 1),
+            "timestampWrapsMinimum": increments.wrapping_mul(960) / (u64::from(u32::MAX) + 1),
+            "transportNonceStart": 0,
+            "transportNonceEnd": final_nonce,
+            "allocations": allocation.allocations,
+            "reallocations": allocation.reallocations,
+            "bytesAllocated": allocation.bytes_allocated
+        });
+        println!("P14_SIMULATED_SOAK={result}");
     }
 }

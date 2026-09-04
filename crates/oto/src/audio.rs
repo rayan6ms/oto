@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant as StdInstant};
@@ -21,6 +21,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
 const SOURCE_POLL_LIMIT: Duration = Duration::from_millis(2);
 const SILENCE: [u8; 3] = [0xF8, 0xFF, 0xFE];
 const SILENCE_FRAMES: u8 = 5;
+const TRANSPORT_INVALIDATED: usize = 1 << (usize::BITS - 1);
 
 pub trait FrameSource: Send + 'static {
     fn poll_frame(&mut self, cx: &mut Context<'_>, output: &mut [u8]) -> Poll<FrameStatus>;
@@ -95,9 +96,72 @@ pub(crate) struct InstalledTransport {
     pub(crate) generation: ConnectionGeneration,
     pub(crate) socket: Arc<tokio::net::UdpSocket>,
     pub(crate) encoder: TransportEncoder,
+    pub(crate) validity: Arc<TransportValidity>,
     pub(crate) dave_protocol_version: u16,
     pub(crate) dave: Option<dave::Handle>,
     pub(crate) dave_media: Option<dave::MediaEncryptor>,
+}
+
+pub(crate) struct TransportValidity {
+    state: AtomicUsize,
+    drained: tokio::sync::Notify,
+}
+
+impl TransportValidity {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: AtomicUsize::new(0),
+            drained: tokio::sync::Notify::new(),
+        })
+    }
+
+    fn try_acquire(self: &Arc<Self>) -> Option<TransportPermit> {
+        let mut state = self.state.load(Ordering::Acquire);
+        loop {
+            if state & TRANSPORT_INVALIDATED != 0 {
+                return None;
+            }
+            state = match self.state.compare_exchange_weak(
+                state,
+                state.checked_add(1)?,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(TransportPermit {
+                        validity: self.clone(),
+                    });
+                }
+                Err(observed) => observed,
+            };
+        }
+    }
+
+    pub(crate) async fn invalidate(&self) {
+        self.state.fetch_or(TRANSPORT_INVALIDATED, Ordering::AcqRel);
+        loop {
+            let drained = self.drained.notified();
+            tokio::pin!(drained);
+            drained.as_mut().enable();
+            if self.state.load(Ordering::Acquire) == TRANSPORT_INVALIDATED {
+                return;
+            }
+            drained.await;
+        }
+    }
+}
+
+struct TransportPermit {
+    validity: Arc<TransportValidity>,
+}
+
+impl Drop for TransportPermit {
+    fn drop(&mut self) {
+        let previous = self.validity.state.fetch_sub(1, Ordering::AcqRel);
+        if previous == TRANSPORT_INVALIDATED | 1 {
+            self.validity.drained.notify_waiters();
+        }
+    }
 }
 
 impl std::fmt::Debug for InstalledTransport {
@@ -386,6 +450,7 @@ struct Executor {
     frame: Vec<u8>,
     dave_frame: Vec<u8>,
     packet: Vec<u8>,
+    connection_was_ready: bool,
     speaking: bool,
     active_timeline: bool,
     silence_sent: u8,
@@ -430,6 +495,7 @@ async fn run_audio(
         frame: vec![0; input.max_frame_bytes],
         dave_frame: Vec::new(),
         packet: Vec::with_capacity(input.max_datagram_bytes),
+        connection_was_ready: false,
         speaking: false,
         active_timeline: false,
         silence_sent: 0,
@@ -461,6 +527,7 @@ async fn run_audio(
 
 impl Executor {
     async fn run(&mut self) -> Result<(), Error> {
+        self.connection_was_ready = self.connection_ready();
         self.try_start().await?;
         loop {
             if self.stop_reply.is_some() && !self.active_timeline {
@@ -696,6 +763,7 @@ impl Executor {
                 .is_some_and(|dave| dave.snapshot().ready)
         {
             self.transport = Some(update);
+            self.connection_was_ready = self.connection_ready();
             // A fresh connection generation can install its transport before
             // the DAVE control plane reaches Connected. Keep the sender
             // attached but paused; connection readiness below prevents any
@@ -705,15 +773,19 @@ impl Executor {
             return Ok(());
         }
         self.transport = Some(update);
+        self.connection_was_ready = self.connection_ready();
         self.try_start().await
     }
 
     async fn handle_connection_change(&mut self) -> Result<(), Error> {
-        if !self.connection_ready() {
+        let ready = self.connection_ready();
+        let became_ready = ready && !self.connection_was_ready;
+        self.connection_was_ready = ready;
+        if !ready {
             self.pause_timeline().await?;
             self.speaking = false;
             self.store.phase(AudioPhase::Starting);
-        } else if !self.active_timeline {
+        } else if became_ready && !self.active_timeline {
             self.try_start().await?;
         }
         Ok(())
@@ -765,6 +837,14 @@ impl Executor {
     }
 
     async fn send_payload(&mut self, len: usize, silence: bool) -> Result<SendOutcome, Error> {
+        let Some(_transport_permit) = self
+            .transport
+            .as_ref()
+            .and_then(|transport| transport.validity.try_acquire())
+        else {
+            self.transport = None;
+            return Ok(SendOutcome::Renewing);
+        };
         let dave_media = self
             .transport
             .as_mut()
@@ -1079,6 +1159,7 @@ mod tests {
                 generation: ConnectionGeneration::FIRST,
                 socket: Arc::new(socket),
                 encoder,
+                validity: TransportValidity::new(),
                 dave_protocol_version: 0,
                 dave: None,
                 dave_media: None,
@@ -1167,6 +1248,7 @@ mod tests {
                 generation: ConnectionGeneration::FIRST,
                 socket: Arc::new(socket),
                 encoder,
+                validity: TransportValidity::new(),
                 dave_protocol_version: 1,
                 dave: Some(dave),
                 dave_media: Some(dave_media),
@@ -1291,6 +1373,7 @@ mod tests {
                 generation: ConnectionGeneration::FIRST,
                 socket: Arc::new(socket),
                 encoder,
+                validity: TransportValidity::new(),
                 dave_protocol_version: 1,
                 dave: Some(dave),
                 dave_media: Some(dave_media),
@@ -1401,6 +1484,7 @@ mod tests {
                 generation: ConnectionGeneration::FIRST,
                 socket: Arc::new(socket),
                 encoder,
+                validity: TransportValidity::new(),
                 dave_protocol_version: 1,
                 dave: Some(dave),
                 dave_media: Some(dave_media),
@@ -1464,5 +1548,34 @@ mod tests {
             connection_shutdown_tx,
             pacer_owner,
         ));
+    }
+
+    #[tokio::test]
+    async fn transport_invalidation_waits_for_inflight_send_and_refuses_new_sends() {
+        let validity = TransportValidity::new();
+        let permit = validity
+            .try_acquire()
+            .expect("valid transport admits an in-flight send");
+        let invalidating = validity.clone();
+        let invalidation = tokio::spawn(async move {
+            invalidating.invalidate().await;
+        });
+
+        tokio::task::yield_now().await;
+        assert!(
+            !invalidation.is_finished(),
+            "replacement waits for the admitted send to finish"
+        );
+        assert!(
+            validity.try_acquire().is_none(),
+            "no send starts once invalidation begins"
+        );
+
+        drop(permit);
+        timeout(Duration::from_secs(1), invalidation)
+            .await
+            .expect("invalidation is notified")
+            .expect("invalidation task does not panic");
+        assert!(validity.try_acquire().is_none());
     }
 }

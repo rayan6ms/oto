@@ -162,6 +162,19 @@ fn parse_discovery_response(packet: &[u8], expected_ssrc: u32) -> Option<Discove
     (port != 0).then_some(DiscoveredAddress { address, port })
 }
 
+#[cfg(fuzzing)]
+pub(crate) fn fuzz_discovery_response(input: &[u8]) {
+    let expected_ssrc = input
+        .get(..4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(u32::from_be_bytes)
+        .unwrap_or_default();
+    if let Some(discovered) = parse_discovery_response(input, expected_ssrc) {
+        assert_eq!(input.len(), DISCOVERY_BYTES);
+        assert_ne!(discovered.port, 0);
+    }
+}
+
 enum Cipher {
     Aes256Gcm(Box<Aes256Gcm>),
     XChaCha20Poly1305(XChaCha20Poly1305),

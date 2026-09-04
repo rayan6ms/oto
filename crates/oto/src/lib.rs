@@ -26,6 +26,14 @@ pub mod __fuzzing {
     pub fn dave_control_sequence(input: &[u8]) {
         crate::dave::fuzz_control_sequence(input);
     }
+
+    pub fn gateway_json_dispatch(input: &[u8]) {
+        crate::gateway::fuzz_gateway_json_dispatch(input);
+    }
+
+    pub fn ip_discovery_response(input: &[u8]) {
+        crate::transport::fuzz_discovery_response(input);
+    }
 }
 
 pub use audio::{FrameSource, FrameStatus, PacedAudioSender};
