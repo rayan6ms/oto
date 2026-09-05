@@ -4,8 +4,10 @@
   <img src="icons/oto.png" alt="Oto project icon" width="220">
 </p>
 
-[![CI](https://github.com/rayan6ms/oto/actions/workflows/ci.yml/badge.svg)](https://github.com/rayan6ms/oto/actions/workflows/ci.yml)
-[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+<p align="center">
+  <a href="https://github.com/rayan6ms/oto/actions/workflows/ci.yml"><img src="https://github.com/rayan6ms/oto/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License: MIT OR Apache-2.0"></a>
+</p>
 
 Oto is a Rust-native Discord voice transport library. It connects to Discord's
 Voice Gateway, establishes the UDP/RTP transport, applies Discord transport
