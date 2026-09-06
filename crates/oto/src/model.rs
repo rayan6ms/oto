@@ -213,6 +213,8 @@ pub struct AudioStats {
     send_failures: u64,
     source_overruns: u64,
     max_lateness: Duration,
+    last_source_overrun_wall: Duration,
+    last_source_overrun_cpu: Duration,
 }
 
 impl AudioStats {
@@ -233,7 +235,14 @@ impl AudioStats {
             send_failures,
             source_overruns,
             max_lateness,
+            ..Self::default()
         }
+    }
+
+    pub(crate) fn with_source_overrun(mut self, wall: Duration, cpu: Duration) -> Self {
+        self.last_source_overrun_wall = wall;
+        self.last_source_overrun_cpu = cpu;
+        self
     }
     /// Returns the number of caller-supplied frames sent.
     #[must_use]
@@ -265,6 +274,20 @@ impl AudioStats {
     #[must_use]
     pub fn source_overruns(self) -> u64 {
         self.source_overruns
+    }
+    /// Returns the elapsed duration of the latest source poll overrun, or zero
+    /// if none occurred. Retained after failure for diagnosis without tracing
+    /// every frame.
+    #[must_use]
+    pub fn last_source_overrun_wall(self) -> Duration {
+        self.last_source_overrun_wall
+    }
+    /// Returns the thread CPU duration measured for the latest source poll
+    /// overrun on Linux. Returns `None` elsewhere or before the first overrun.
+    #[must_use]
+    pub fn last_source_overrun_cpu(self) -> Option<Duration> {
+        (cfg!(target_os = "linux") && self.source_overruns != 0)
+            .then_some(self.last_source_overrun_cpu)
     }
     /// Returns the greatest observed sender deadline lateness.
     #[must_use]

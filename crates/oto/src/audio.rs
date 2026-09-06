@@ -438,6 +438,8 @@ struct AudioCounters {
     send_failures: AtomicU64,
     source_overruns: AtomicU64,
     max_lateness_nanos: AtomicU64,
+    last_source_overrun_wall_nanos: AtomicU64,
+    last_source_overrun_cpu_nanos: AtomicU64,
 }
 
 impl AudioCounters {
@@ -450,6 +452,10 @@ impl AudioCounters {
             self.send_failures.load(Ordering::Relaxed),
             self.source_overruns.load(Ordering::Relaxed),
             Duration::from_nanos(self.max_lateness_nanos.load(Ordering::Relaxed)),
+        )
+        .with_source_overrun(
+            Duration::from_nanos(self.last_source_overrun_wall_nanos.load(Ordering::Relaxed)),
+            Duration::from_nanos(self.last_source_overrun_cpu_nanos.load(Ordering::Relaxed)),
         )
     }
 
@@ -852,13 +858,26 @@ impl Executor {
         let cpu_started = source_cpu_time();
         let started = StdInstant::now();
         let result = self.source.source.poll_frame(&mut cx, &mut self.frame);
-        if started.elapsed() > SOURCE_POLL_LIMIT {
-            AudioCounters::increment(&self.store.counters.source_overruns);
+        let wall_elapsed = started.elapsed();
+        if wall_elapsed > SOURCE_POLL_LIMIT {
             // Wall time includes host/VM descheduling. Only attribute an
             // expensive callback to the source when the thread actually ran.
             // The second CPU-clock syscall is needed only on an overrun.
             #[cfg(target_os = "linux")]
-            let violated = source_cpu_time().saturating_sub(cpu_started) > SOURCE_POLL_LIMIT;
+            let cpu_elapsed = source_cpu_time().saturating_sub(cpu_started);
+            #[cfg(not(target_os = "linux"))]
+            let cpu_elapsed = Duration::ZERO;
+            self.store.counters.last_source_overrun_wall_nanos.store(
+                wall_elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
+                Ordering::Relaxed,
+            );
+            self.store.counters.last_source_overrun_cpu_nanos.store(
+                cpu_elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
+                Ordering::Relaxed,
+            );
+            AudioCounters::increment(&self.store.counters.source_overruns);
+            #[cfg(target_os = "linux")]
+            let violated = cpu_elapsed > SOURCE_POLL_LIMIT;
             #[cfg(not(target_os = "linux"))]
             let violated = true;
             if violated {

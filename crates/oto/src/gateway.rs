@@ -3089,6 +3089,8 @@ mod tests {
         );
         assert_eq!(snapshot.stats().frames_sent(), 3);
         assert_eq!(snapshot.stats().source_overruns(), 1);
+        assert!(snapshot.stats().last_source_overrun_wall() >= Duration::from_millis(30));
+        assert!(snapshot.stats().last_source_overrun_cpu().unwrap() < Duration::from_millis(2));
         let polls = polls.lock().unwrap();
         assert!(
             polls[2].duration_since(polls[1]) >= Duration::from_millis(15),
@@ -3150,6 +3152,11 @@ mod tests {
         eventually(|| slow.state().phase() == AudioPhase::Failed).await;
         assert_eq!(slow.state().failure(), Some(ErrorKind::FrameSourceContract));
         assert_eq!(slow.state().stats().source_overruns(), 1);
+        assert!(slow.state().stats().last_source_overrun_wall() >= Duration::from_millis(2));
+        #[cfg(target_os = "linux")]
+        assert!(
+            slow.state().stats().last_source_overrun_cpu().unwrap() >= Duration::from_millis(5)
+        );
         assert_eq!(gateway.udp.capture().len(), 7, "slow source emits no media");
 
         connection.shutdown().await.expect("connection shuts down");
