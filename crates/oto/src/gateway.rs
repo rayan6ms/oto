@@ -2421,9 +2421,19 @@ mod tests {
 
     impl FrameSource for SlowSource {
         fn poll_frame(&mut self, _cx: &mut Context<'_>, _output: &mut [u8]) -> Poll<FrameStatus> {
-            let started = std::time::Instant::now();
-            while started.elapsed() < Duration::from_millis(5) {
+            #[cfg(target_os = "linux")]
+            let started = crate::audio::source_cpu_time();
+            #[cfg(target_os = "linux")]
+            while crate::audio::source_cpu_time().saturating_sub(started) < Duration::from_millis(5)
+            {
                 std::hint::spin_loop();
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                let started = std::time::Instant::now();
+                while started.elapsed() < Duration::from_millis(5) {
+                    std::hint::spin_loop();
+                }
             }
             Poll::Pending
         }
@@ -2483,11 +2493,7 @@ mod tests {
                 }
             }
             if self.slow {
-                let started = std::time::Instant::now();
-                while started.elapsed() < Duration::from_millis(5) {
-                    std::hint::spin_loop();
-                }
-                return Poll::Pending;
+                return SlowSource.poll_frame(cx, output);
             }
             output[..4].copy_from_slice(&[0xF8, 0xFF, 0xFE, 0x01]);
             Poll::Ready(FrameStatus::Frame { len: 4 })
@@ -3030,6 +3036,52 @@ mod tests {
         sender.stop().await.expect("sender stops");
         connection.shutdown().await.expect("connection shuts down");
         gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn off_cpu_poll_delay_does_not_permanently_kill_valid_audio() {
+        // Sleep is a deterministic stand-in for a descheduled callback: wall
+        // time advances while this thread consumes essentially no CPU. It is
+        // not a recommended FrameSource implementation.
+        struct OffCpuSource(bool);
+        impl FrameSource for OffCpuSource {
+            fn poll_frame(&mut self, _: &mut Context<'_>, output: &mut [u8]) -> Poll<FrameStatus> {
+                if self.0 {
+                    return Poll::Ready(FrameStatus::Ended);
+                }
+                self.0 = true;
+                std::thread::sleep(Duration::from_millis(20));
+                output[..3].copy_from_slice(&[7, 8, 9]);
+                Poll::Ready(FrameStatus::Frame { len: 3 })
+            }
+        }
+        let gateway = TestGateway::start(FakeVoiceGatewayConfig::local())
+            .await
+            .unwrap();
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        let connection = oto
+            .connect(voice_info(&gateway, "off-cpu", "token"))
+            .await
+            .unwrap();
+        let sender = connection.start_audio(OffCpuSource(false)).await.unwrap();
+        eventually(|| {
+            matches!(
+                sender.state().phase(),
+                AudioPhase::Failed | AudioPhase::Stopped
+            )
+        })
+        .await;
+        let snapshot = sender.state();
+        connection.shutdown().await.unwrap();
+        gateway.shutdown().await.unwrap();
+        assert_eq!(
+            snapshot.phase(),
+            AudioPhase::Stopped,
+            "elapsed time alone must not reject a valid frame"
+        );
+        assert_eq!(snapshot.stats().frames_sent(), 1);
+        assert_eq!(snapshot.stats().source_overruns(), 1);
     }
 
     #[tokio::test]

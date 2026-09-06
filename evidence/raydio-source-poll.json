@@ -1,0 +1,53 @@
+{
+  "scope": "Local single-sender release benchmark; actual DAVE, RTP and loopback UDP; 10 seconds after 1 second warmup. Not an Oracle or internet quality result.",
+  "before": {
+    "allocation": {
+      "allocations": 0,
+      "allocationsPerFrame": 0.0,
+      "bytesAllocated": 0,
+      "bytesAllocatedPerFrame": 0.0,
+      "reallocations": 0,
+      "reallocationsPerFrame": 0.0
+    },
+    "benchmarkId": "oto-p08-complete-paced-dave",
+    "boundaryDifference": 1,
+    "frames": 500,
+    "maxSenderLatenessNanos": 1768510,
+    "measurementMs": 10000,
+    "profile": "release",
+    "schemaVersion": 1,
+    "udpPackets": 501,
+    "warmupMs": 1000
+  },
+  "after": {
+    "allocation": {
+      "allocations": 0,
+      "allocationsPerFrame": 0.0,
+      "bytesAllocated": 0,
+      "bytesAllocatedPerFrame": 0.0,
+      "reallocations": 0,
+      "reallocationsPerFrame": 0.0
+    },
+    "benchmarkId": "oto-p08-complete-paced-dave",
+    "boundaryDifference": 0,
+    "frames": 501,
+    "maxSenderLatenessNanos": 1185002,
+    "measurementMs": 10001,
+    "profile": "release",
+    "schemaVersion": 1,
+    "udpPackets": 501,
+    "warmupMs": 1000
+  },
+  "interpretation": "Both retained zero steady allocations and approximately 50 frames/s; latency differences in this one run are not claimed as a speedup.",
+  "regression": {
+    "test": "off_cpu_poll_delay_does_not_permanently_kill_valid_audio",
+    "before": "Failed instead of Stopped, no media frame delivered",
+    "after": "Stopped normally after sending the valid frame and silence drain; elapsed overrun still counted",
+    "simulation": "20 ms thread sleep models wall time without CPU use; not a valid production source implementation"
+  },
+  "limits": [
+    "This does not establish the cause of the earlier unclassified Oracle terminal failure.",
+    "Linux only: sleeping or blocking callbacks still violate the source contract but are not detected by the CPU-time guard.",
+    "No claim of reduced internet jitter or CPU usage from the one local benchmark pair."
+  ]
+}

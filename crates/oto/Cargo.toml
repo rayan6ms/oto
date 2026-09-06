@@ -25,6 +25,9 @@ serde_json.workspace = true
 tokio.workspace = true
 tokio-tungstenite.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", default-features = false, features = ["time", "std"] }
+
 [dev-dependencies]
 oto-testkit = { path = "../oto-testkit" }
 rustls.workspace = true

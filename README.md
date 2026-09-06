@@ -103,6 +103,13 @@ Implement `FrameSource` for a non-blocking encoded-frame source, then call
 48 kHz stereo Opus frame. Return `Poll::Pending` only after registering the
 current waker; Oto stops periodic polling while an attached source is idle.
 
+On Linux, the 2 ms source execution guard uses thread CPU time to avoid treating
+VM descheduling as a terminal source error. Elapsed overruns remain available in
+`AudioStats::source_overruns`. Invalid frame lengths still fail immediately, and
+CPU-heavy callbacks are still isolated. Callbacks must remain non-blocking:
+sleeping or blocking I/O is a caller error the CPU guard cannot detect. Other
+platforms currently retain the elapsed-time guard.
+
 The sender owns pacing and RTP timestamp advancement. A source should not run a
 competing 20 ms timer. Ending a source drains the required bounded silence and
 clears Discord's speaking state. A new source can later be attached to the same

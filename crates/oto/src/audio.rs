@@ -23,12 +23,24 @@ const SILENCE: [u8; 3] = [0xF8, 0xFF, 0xFE];
 const SILENCE_FRAMES: u8 = 5;
 const TRANSPORT_INVALIDATED: usize = 1 << (usize::BITS - 1);
 
+#[cfg(target_os = "linux")]
+pub(crate) fn source_cpu_time() -> Duration {
+    let now = rustix::time::clock_gettime(rustix::time::ClockId::ThreadCPUTime);
+    Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
+}
+
 /// A non-blocking source of encoded Discord Opus frames.
 ///
 /// Each source is polled by one logical sender at a time. A ready frame must be
 /// exactly 20 ms of 48 kHz stereo Opus. When returning [`Poll::Pending`], the
 /// source must register or replace the supplied waker and wake it after a state
 /// change that may make a frame or the end-of-stream marker available.
+///
+/// Polls must not block or do expensive work. On Linux, the sender isolates
+/// polls consuming more than 2 ms of thread CPU time. Elapsed-time overruns
+/// remain observable, but a descheduled thread does not permanently fail audio.
+/// Sleeping or waiting in the callback still violates this caller contract;
+/// the CPU guard cannot enforce it. Other platforms retain elapsed-time checks.
 pub trait FrameSource: Send + 'static {
     /// Polls one encoded frame into `output` without blocking.
     fn poll_frame(&mut self, cx: &mut Context<'_>, output: &mut [u8]) -> Poll<FrameStatus>;
@@ -821,16 +833,27 @@ impl Executor {
 
     fn poll_source(&mut self) -> Result<Polled, Error> {
         let mut cx = Context::from_waker(&self.source.waker);
+        #[cfg(target_os = "linux")]
+        let cpu_started = source_cpu_time();
         let started = StdInstant::now();
         let result = self.source.source.poll_frame(&mut cx, &mut self.frame);
         if started.elapsed() > SOURCE_POLL_LIMIT {
             AudioCounters::increment(&self.store.counters.source_overruns);
-            return Err(audio_error(
-                ErrorKind::FrameSourceContract,
-                Operation::StartAudio,
-                RetryDisposition::Fatal,
-                "FrameSource poll exceeded the non-blocking time bound",
-            ));
+            // Wall time includes host/VM descheduling. Only attribute an
+            // expensive callback to the source when the thread actually ran.
+            // The second CPU-clock syscall is needed only on an overrun.
+            #[cfg(target_os = "linux")]
+            let violated = source_cpu_time().saturating_sub(cpu_started) > SOURCE_POLL_LIMIT;
+            #[cfg(not(target_os = "linux"))]
+            let violated = true;
+            if violated {
+                return Err(audio_error(
+                    ErrorKind::FrameSourceContract,
+                    Operation::StartAudio,
+                    RetryDisposition::Fatal,
+                    "FrameSource poll exceeded its execution time bound",
+                ));
+            }
         }
         match result {
             Poll::Ready(FrameStatus::Frame { len }) if (1..=self.frame.len()).contains(&len) => {

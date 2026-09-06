@@ -260,7 +260,8 @@ impl AudioStats {
     pub fn send_failures(self) -> u64 {
         self.send_failures
     }
-    /// Returns the number of synchronous source poll-time contract overruns.
+    /// Returns source polls exceeding the elapsed-time budget, including
+    /// descheduling. On Linux an elapsed overrun alone is not a fatal failure.
     #[must_use]
     pub fn source_overruns(self) -> u64 {
         self.source_overruns
