@@ -711,6 +711,21 @@ impl Executor {
                 }
             }
         }
+        // A poll or encryption may have been descheduled after the deadline
+        // check. Preserve that valid frame, but start the next opportunity a
+        // full period from completion instead of consuming a queued old tick.
+        if self.active_timeline {
+            let completed = Instant::now();
+            let lateness = completed.saturating_duration_since(deadline);
+            if lateness >= FRAME_PERIOD {
+                self.store.counters.observe_lateness(lateness);
+                self.pacer
+                    .activate(completed + FRAME_PERIOD)
+                    .await
+                    .map_err(pacer_error)?;
+                let _ = self.deadlines.try_recv();
+            }
+        }
         Ok(())
     }
 

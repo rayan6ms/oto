@@ -49,5 +49,10 @@
     "This does not establish the cause of the earlier unclassified Oracle terminal failure.",
     "Linux only: sleeping or blocking callbacks still violate the source contract but are not detected by the CPU-time guard.",
     "No claim of reduced internet jitter or CPU usage from the one local benchmark pair."
-  ]
+  ],
+  "activeDelayRegression": {
+    "before": "A 30 ms off-CPU delay in active playback produced catch-up polling less than 15 ms after the delayed frame.",
+    "after": "After an entire missed period during poll/encrypt/send, retain the valid frame, reset the absolute pacing deadline to completion + 20 ms, and discard the capacity-one old deadline.",
+    "scope": "Tests resumed delivery and no catch-up; does not make shared-host delays disappear."
+  }
 }

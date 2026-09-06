@@ -3044,14 +3044,17 @@ mod tests {
         // Sleep is a deterministic stand-in for a descheduled callback: wall
         // time advances while this thread consumes essentially no CPU. It is
         // not a recommended FrameSource implementation.
-        struct OffCpuSource(bool);
+        struct OffCpuSource(Arc<Mutex<Vec<std::time::Instant>>>);
         impl FrameSource for OffCpuSource {
             fn poll_frame(&mut self, _: &mut Context<'_>, output: &mut [u8]) -> Poll<FrameStatus> {
-                if self.0 {
+                let count = self.0.lock().unwrap().len();
+                if count == 3 {
                     return Poll::Ready(FrameStatus::Ended);
                 }
-                self.0 = true;
-                std::thread::sleep(Duration::from_millis(20));
+                if count == 1 {
+                    std::thread::sleep(Duration::from_millis(30));
+                }
+                self.0.lock().unwrap().push(std::time::Instant::now());
                 output[..3].copy_from_slice(&[7, 8, 9]);
                 Poll::Ready(FrameStatus::Frame { len: 3 })
             }
@@ -3064,7 +3067,11 @@ mod tests {
             .connect(voice_info(&gateway, "off-cpu", "token"))
             .await
             .unwrap();
-        let sender = connection.start_audio(OffCpuSource(false)).await.unwrap();
+        let polls = Arc::new(Mutex::new(Vec::new()));
+        let sender = connection
+            .start_audio(OffCpuSource(polls.clone()))
+            .await
+            .unwrap();
         eventually(|| {
             matches!(
                 sender.state().phase(),
@@ -3080,8 +3087,13 @@ mod tests {
             AudioPhase::Stopped,
             "elapsed time alone must not reject a valid frame"
         );
-        assert_eq!(snapshot.stats().frames_sent(), 1);
+        assert_eq!(snapshot.stats().frames_sent(), 3);
         assert_eq!(snapshot.stats().source_overruns(), 1);
+        let polls = polls.lock().unwrap();
+        assert!(
+            polls[2].duration_since(polls[1]) >= Duration::from_millis(15),
+            "a delayed valid frame must not trigger catch-up polling"
+        );
     }
 
     #[tokio::test]
