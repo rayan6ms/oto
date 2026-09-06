@@ -4181,7 +4181,8 @@ mod tests {
                 "idle": idle_tasks,
                 "pending": pending_tasks,
                 "active": active_tasks,
-                "pacerCoordinators": 4
+                "pacerCoordinators": std::thread::available_parallelism()
+                    .map_or(1, |parallelism| parallelism.get().clamp(1, 4))
             },
             "threads": {
                 "baseline": baseline_threads,

@@ -7,7 +7,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until, timeout};
 
-const PACER_SHARDS: usize = 4;
+const MAX_PACER_SHARDS: usize = 4;
 const CONTROL_CAPACITY: usize = 64;
 const CONTROL_TIMEOUT: Duration = Duration::from_secs(1);
 pub(crate) const FRAME_PERIOD: Duration = Duration::from_millis(20);
@@ -19,6 +19,7 @@ pub(crate) struct Pacer {
 
 struct PacerInner {
     next_id: AtomicU64,
+    shards: usize,
     coordinators: Mutex<Option<Vec<CoordinatorHandle>>>,
 }
 
@@ -65,6 +66,9 @@ impl Pacer {
         Self {
             inner: Arc::new(PacerInner {
                 next_id: AtomicU64::new(1),
+                shards: std::thread::available_parallelism().map_or(1, |parallelism| {
+                    parallelism.get().clamp(1, MAX_PACER_SHARDS)
+                }),
                 coordinators: Mutex::new(None),
             }),
         }
@@ -122,8 +126,8 @@ impl Pacer {
             if tokio::runtime::Handle::try_current().is_err() {
                 return Err(PacerFailure::Closed);
             }
-            let mut started = Vec::with_capacity(PACER_SHARDS);
-            for _ in 0..PACER_SHARDS {
+            let mut started = Vec::with_capacity(self.inner.shards);
+            for _ in 0..self.inner.shards {
                 let (commands, receiver) = mpsc::channel(CONTROL_CAPACITY);
                 let cancellations = Arc::new(Notify::new());
                 started.push(CoordinatorHandle {
@@ -136,7 +140,7 @@ impl Pacer {
         }
         Ok(CoordinatorRef {
             guard: coordinators,
-            index: id as usize % PACER_SHARDS,
+            index: id as usize % self.inner.shards,
         })
     }
 }
