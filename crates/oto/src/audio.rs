@@ -46,6 +46,20 @@ pub trait FrameSource: Send + 'static {
     fn poll_frame(&mut self, cx: &mut Context<'_>, output: &mut [u8]) -> Poll<FrameStatus>;
 }
 
+pub(crate) enum AudioSource {
+    Callback(Box<dyn FrameSource>),
+    Channel(crate::FrameReader),
+}
+
+impl AudioSource {
+    fn poll_frame(&mut self, cx: &mut Context<'_>, output: &mut [u8]) -> Poll<FrameStatus> {
+        match self {
+            Self::Callback(source) => source.poll_frame(cx, output),
+            Self::Channel(source) => source.poll_frame(cx, output),
+        }
+    }
+}
+
 /// The result of a ready [`FrameSource`] poll.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -98,13 +112,24 @@ impl PacedAudioSender {
         &self,
         source: S,
     ) -> Result<SourceGeneration, Error> {
+        self.replace_audio_source(AudioSource::Callback(Box::new(source)))
+            .await
+    }
+
+    /// Replaces the source with an Oto-owned bounded encoded-frame channel.
+    pub async fn replace_channel(
+        &self,
+        source: crate::FrameReader,
+    ) -> Result<SourceGeneration, Error> {
+        self.replace_audio_source(AudioSource::Channel(source))
+            .await
+    }
+
+    async fn replace_audio_source(&self, source: AudioSource) -> Result<SourceGeneration, Error> {
         let (reply, response) = oneshot::channel();
         self.control
             .send(
-                AudioCommand::Replace {
-                    source: Box::new(source),
-                    reply,
-                },
+                AudioCommand::Replace { source, reply },
                 Operation::ReplaceSource,
             )
             .await?;
@@ -231,7 +256,7 @@ impl Drop for AudioControl {
 
 pub(crate) struct SpawnAudio {
     pub(crate) id: u64,
-    pub(crate) source: Box<dyn FrameSource>,
+    pub(crate) source: AudioSource,
     pub(crate) transport: InstalledTransport,
     pub(crate) transport_updates: mpsc::Receiver<InstalledTransport>,
     pub(crate) pacer: PacerRegistration,
@@ -329,7 +354,7 @@ impl AudioControl {
 
 enum AudioCommand {
     Replace {
-        source: Box<dyn FrameSource>,
+        source: AudioSource,
         reply: oneshot::Sender<Result<SourceGeneration, Error>>,
     },
     Stop {
@@ -391,17 +416,13 @@ impl Wake for WakeToken {
 }
 
 struct SourceSlot {
-    source: Box<dyn FrameSource>,
+    source: AudioSource,
     generation: SourceGeneration,
     waker: Waker,
 }
 
 impl SourceSlot {
-    fn new(
-        source: Box<dyn FrameSource>,
-        generation: SourceGeneration,
-        wake: &Arc<WakeShared>,
-    ) -> Self {
+    fn new(source: AudioSource, generation: SourceGeneration, wake: &Arc<WakeShared>) -> Self {
         Self {
             source,
             generation,
@@ -892,16 +913,20 @@ impl Executor {
         let mut cx = Context::from_waker(&self.source.waker);
         self.wake.begin_poll();
         #[cfg(target_os = "linux")]
-        let cpu_started = source_cpu_time();
+        let cpu_started =
+            matches!(self.source.source, AudioSource::Callback(_)).then(source_cpu_time);
         let started = StdInstant::now();
         let result = self.source.source.poll_frame(&mut cx, &mut self.frame);
         let wall_elapsed = started.elapsed();
-        if wall_elapsed > SOURCE_POLL_LIMIT {
+        if wall_elapsed > SOURCE_POLL_LIMIT
+            && matches!(self.source.source, AudioSource::Callback(_))
+        {
             // Wall time includes host/VM descheduling. Only attribute an
             // expensive callback to the source when the thread actually ran.
             // The second CPU-clock syscall is needed only on an overrun.
             #[cfg(target_os = "linux")]
-            let cpu_elapsed = source_cpu_time().saturating_sub(cpu_started);
+            let cpu_elapsed =
+                source_cpu_time().saturating_sub(cpu_started.expect("callback clock sampled"));
             #[cfg(not(target_os = "linux"))]
             let cpu_elapsed = Duration::ZERO;
             self.store.counters.last_source_overrun_wall_nanos.store(
@@ -1367,7 +1392,11 @@ mod tests {
         let counters = Arc::new(AudioCounters::default());
         let mut executor = Executor {
             id: 1,
-            source: SourceSlot::new(Box::new(ReadySource), SourceGeneration::FIRST, &wake),
+            source: SourceSlot::new(
+                AudioSource::Callback(Box::new(ReadySource)),
+                SourceGeneration::FIRST,
+                &wake,
+            ),
             wake,
             transport: Some(InstalledTransport {
                 generation: ConnectionGeneration::FIRST,
@@ -1469,7 +1498,7 @@ mod tests {
         let active = Arc::new(AtomicBool::new(true));
         let control = AudioControl::spawn(SpawnAudio {
             id: 1,
-            source: Box::new(ReadySource),
+            source: AudioSource::Callback(Box::new(ReadySource)),
             transport: InstalledTransport {
                 generation: ConnectionGeneration::FIRST,
                 socket: Arc::new(socket),
@@ -1511,6 +1540,15 @@ mod tests {
 
     #[tokio::test]
     async fn complete_paced_path_dave_encrypts_maximum_opus_and_all_terminal_silence() {
+        verify_complete_paced_dave_path(false).await;
+    }
+
+    #[tokio::test]
+    async fn owned_channel_preserves_dave_and_exact_terminal_silence() {
+        verify_complete_paced_dave_path(true).await;
+    }
+
+    async fn verify_complete_paced_dave_path(channel: bool) {
         const KEY: [u8; 32] = [0x42; 32];
         let normal_frame = vec![0x55; 1_275];
         let (sink, socket) = connected_udp_pair().await;
@@ -1556,9 +1594,25 @@ mod tests {
         let active = Arc::new(AtomicBool::new(true));
         let control = AudioControl::spawn(SpawnAudio {
             id: 1,
-            source: Box::new(OneFrameSource {
-                frame: Some(normal_frame.clone()),
-            }),
+            source: if channel {
+                let (mut writer, reader) = crate::frame_channel();
+                // Publish then cancel the send and close: the queued maximum
+                // frame must still precede EOF and the exact silence drain.
+                let mut send = Box::pin(writer.send(&normal_frame));
+                use std::future::Future;
+                assert!(
+                    send.as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                drop(send);
+                drop(writer);
+                AudioSource::Channel(reader)
+            } else {
+                AudioSource::Callback(Box::new(OneFrameSource {
+                    frame: Some(normal_frame.clone()),
+                }))
+            },
             transport: InstalledTransport {
                 generation: ConnectionGeneration::FIRST,
                 socket: Arc::new(socket),
@@ -1683,7 +1737,7 @@ mod tests {
         let (events, _) = broadcast::channel(8);
         let control = AudioControl::spawn(SpawnAudio {
             id: 2,
-            source: Box::new(ReadySource),
+            source: AudioSource::Callback(Box::new(ReadySource)),
             transport: InstalledTransport {
                 generation: ConnectionGeneration::FIRST,
                 socket: Arc::new(socket),
@@ -1792,9 +1846,20 @@ mod tests {
         let (connection_tx, connection_state) = connected_state();
         let (connection_shutdown_tx, connection_shutdown) = watch::channel(false);
         let (events, _) = broadcast::channel(8);
+        let channel_mode = std::env::var_os("OTO_P08_FRAME_CHANNEL").is_some();
+        let (source, producer) = if channel_mode {
+            let (mut writer, reader) = crate::frame_channel();
+            let task = tokio::spawn(async move {
+                let frame = [0x55; 1275];
+                while writer.send(&frame).await.is_ok() {}
+            });
+            (AudioSource::Channel(reader), Some(task))
+        } else {
+            (AudioSource::Callback(Box::new(MaximumFrameSource)), None)
+        };
         let control = AudioControl::spawn(SpawnAudio {
             id: 3,
-            source: Box::new(MaximumFrameSource),
+            source,
             transport: InstalledTransport {
                 generation: ConnectionGeneration::FIRST,
                 socket: Arc::new(socket),
@@ -1834,6 +1899,7 @@ mod tests {
         let result = serde_json::json!({
             "schemaVersion": 1,
             "benchmarkId": "oto-p08-complete-paced-dave",
+            "source": if channel_mode { "owned-channel" } else { "callback" },
             "profile": "release",
             "warmupMs": warmup.as_millis(),
             "measurementMs": elapsed.as_millis(),
@@ -1856,6 +1922,12 @@ mod tests {
 
         control.stop().await.expect("benchmark sender stops");
         gateway_task.await.expect("gateway responder completes");
+        if let Some(task) = producer {
+            timeout(Duration::from_secs(1), task)
+                .await
+                .expect("channel producer closes")
+                .expect("producer completes");
+        }
         sink_task.abort();
         drop((
             transport_updates_tx,

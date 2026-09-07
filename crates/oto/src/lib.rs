@@ -12,6 +12,7 @@ mod config;
 mod connection;
 mod dave;
 mod error;
+mod frame_channel;
 mod gateway;
 mod model;
 mod pacer;
@@ -41,6 +42,7 @@ pub use audio::{FrameSource, FrameStatus, PacedAudioSender};
 pub use config::{Oto, OtoBuilder, ResourceLimits};
 pub use connection::{EventSubscriber, VoiceConnection};
 pub use error::{Error, ErrorKind, Operation, RetryDisposition};
+pub use frame_channel::{FrameReader, FrameSendError, FrameWriter, frame_channel};
 pub use model::{
     AudioPhase, AudioSnapshot, AudioStats, CloseReason, ConnectionEvent, ConnectionGeneration,
     ConnectionPhase, ConnectionSnapshot, ConnectionStats, EventReceiveError, FailureSnapshot,

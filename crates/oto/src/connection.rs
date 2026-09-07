@@ -6,7 +6,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::audio::{AudioControl, FrameSource, PacedAudioSender, SpawnAudio};
+use crate::audio::{AudioControl, AudioSource, FrameSource, PacedAudioSender, SpawnAudio};
 use crate::config::Config;
 use crate::error::{Error, ErrorKind, Operation, RetryDisposition};
 use crate::gateway::{self, Command};
@@ -254,6 +254,19 @@ impl VoiceConnection {
     /// A source may initially be pending; Speaking is written and acknowledged
     /// internally before its first UDP media packet.
     pub async fn start_audio<S: FrameSource>(&self, source: S) -> Result<PacedAudioSender, Error> {
+        self.start_audio_source(AudioSource::Callback(Box::new(source)))
+            .await
+    }
+
+    /// Attaches an Oto-owned bounded channel without executing caller callbacks.
+    pub async fn start_audio_channel(
+        &self,
+        source: crate::FrameReader,
+    ) -> Result<PacedAudioSender, Error> {
+        self.start_audio_source(AudioSource::Channel(source)).await
+    }
+
+    async fn start_audio_source(&self, source: AudioSource) -> Result<PacedAudioSender, Error> {
         if self
             .inner
             .audio_active
@@ -273,15 +286,12 @@ impl VoiceConnection {
             active: self.inner.audio_active.clone(),
             committed: false,
         };
-        let sender = self.start_audio_reserved(Box::new(source)).await?;
+        let sender = self.start_audio_reserved(source).await?;
         reservation.commit();
         Ok(sender)
     }
 
-    async fn start_audio_reserved(
-        &self,
-        source: Box<dyn FrameSource>,
-    ) -> Result<PacedAudioSender, Error> {
+    async fn start_audio_reserved(&self, source: AudioSource) -> Result<PacedAudioSender, Error> {
         let audio_id = self
             .inner
             .next_audio_id

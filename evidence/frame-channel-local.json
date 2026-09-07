@@ -1,0 +1,45 @@
+{
+  "scope": "Local 10-second maximum-frame DAVE allocation/pacing smoke test, not Oracle receiver qualification or a statistically demonstrated speedup",
+  "results": [
+    {
+      "allocation": {
+        "allocations": 0,
+        "allocationsPerFrame": 0.0,
+        "bytesAllocated": 0,
+        "bytesAllocatedPerFrame": 0.0,
+        "reallocations": 0,
+        "reallocationsPerFrame": 0.0
+      },
+      "benchmarkId": "oto-p08-complete-paced-dave",
+      "boundaryDifference": 0,
+      "frames": 501,
+      "maxSenderLatenessNanos": 1148177,
+      "measurementMs": 10000,
+      "profile": "release",
+      "schemaVersion": 1,
+      "source": "callback",
+      "udpPackets": 501,
+      "warmupMs": 1000
+    },
+    {
+      "allocation": {
+        "allocations": 0,
+        "allocationsPerFrame": 0.0,
+        "bytesAllocated": 0,
+        "bytesAllocatedPerFrame": 0.0,
+        "reallocations": 0,
+        "reallocationsPerFrame": 0.0
+      },
+      "benchmarkId": "oto-p08-complete-paced-dave",
+      "boundaryDifference": 0,
+      "frames": 501,
+      "maxSenderLatenessNanos": 2001251,
+      "measurementMs": 10001,
+      "profile": "release",
+      "schemaVersion": 1,
+      "source": "owned-channel",
+      "udpPackets": 501,
+      "warmupMs": 1000
+    }
+  ]
+}
