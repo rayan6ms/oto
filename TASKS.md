@@ -9,3 +9,7 @@
 - [x] Reproduce synchronous Oto notifier work inside a reentrant source wake, bound that callback path, and preserve pending/readiness and CPU-source isolation.
 - [x] Run 81 tests, Clippy and paired DAVE benchmark with zero allocations.
 - [ ] Verify new callback isolation in Raydio on Oracle; exact cause remains diagnostic.
+
+- [x] Reproduce discarded overdue pacing opportunities and recover one frame immediately without a catch-up burst; keep the source CPU guard unchanged.
+- [x] Pass 82 ordinary tests and paired release DAVE-path allocation/frame-count measurements for overdue recovery.
+- [ ] Validate overdue recovery on Oracle with sender, independent vCPU timers and receiver measurements; this cannot remove hypervisor stalls.

@@ -1,0 +1,57 @@
+{
+  "scope": "Local complete DAVE send-path sanity and deterministic delayed-timer recovery regression, not live Oracle improvement",
+  "baselineRevision": "3d651c6ecc53a1ac4620eea231b8f9d777038dae",
+  "before": {
+    "allocation": {
+      "allocations": 0,
+      "allocationsPerFrame": 0.0,
+      "bytesAllocated": 0,
+      "bytesAllocatedPerFrame": 0.0,
+      "reallocations": 0,
+      "reallocationsPerFrame": 0.0
+    },
+    "benchmarkId": "oto-p08-complete-paced-dave",
+    "boundaryDifference": 0,
+    "frames": 500,
+    "maxSenderLatenessNanos": 1812540,
+    "measurementMs": 10000,
+    "profile": "release",
+    "schemaVersion": 1,
+    "udpPackets": 500,
+    "warmupMs": 1000
+  },
+  "after": {
+    "allocation": {
+      "allocations": 0,
+      "allocationsPerFrame": 0.0,
+      "bytesAllocated": 0,
+      "bytesAllocatedPerFrame": 0.0,
+      "reallocations": 0,
+      "reallocationsPerFrame": 0.0
+    },
+    "benchmarkId": "oto-p08-complete-paced-dave",
+    "boundaryDifference": 0,
+    "frames": 501,
+    "maxSenderLatenessNanos": 1362198,
+    "measurementMs": 10001,
+    "profile": "release",
+    "schemaVersion": 1,
+    "udpPackets": 501,
+    "warmupMs": 1000
+  },
+  "regression": {
+    "injectedDelayMs": [
+      37,
+      137
+    ],
+    "before": "fails: overdue opportunity sent zero frames",
+    "after": "passes: one immediate frame, no next opportunity before 20 ms",
+    "ordinaryOtoTestsPassed": 82,
+    "ignoredPerformanceSoaks": 5
+  },
+  "limitations": [
+    "Single benchmark pair: maximum-lateness difference is not a statistically established speedup.",
+    "No new process-memory improvement measured.",
+    "Host descheduling and earlier source CPU overrun remain unresolved."
+  ]
+}

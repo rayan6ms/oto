@@ -708,9 +708,14 @@ impl Executor {
             .skipped_deadlines
             .store(self.pacer.skipped(), Ordering::Relaxed);
         self.store.counters.observe_lateness(lateness);
-        if lateness >= FRAME_PERIOD || !self.connection_ready() {
+        if !self.connection_ready() {
             return Ok(());
         }
+
+        // A delayed opportunity still permits one current frame. Dropping the
+        // opportunity here adds another timer wait after a host scheduling
+        // stall. The completion path below rebases the next deadline and
+        // discards a queued old tick, so recovery cannot burst a backlog.
 
         let polled = if self.stop_reply.is_some() {
             Polled::Ended
@@ -748,8 +753,8 @@ impl Executor {
                 }
             }
         }
-        // A poll or encryption may have been descheduled after the deadline
-        // check. Preserve that valid frame, but start the next opportunity a
+        // The opportunity itself, polling, or encryption may be late.
+        // Preserve that valid frame, but start the next opportunity a
         // full period from completion instead of consuming a queued old tick.
         if self.active_timeline {
             let completed = Instant::now();
@@ -1338,6 +1343,108 @@ mod tests {
         let mut connection = ConnectionSnapshot::initial();
         connection.set_phase(ConnectionPhase::Connected);
         watch::channel(connection)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overdue_opportunity_recovers_one_frame_without_waiting_or_catchup() {
+        let (_sink, socket) = connected_udp_pair().await;
+        let owner = Pacer::new();
+        let mut pacer = owner.register().await.unwrap();
+        let deadlines = pacer.take_deadlines();
+        let wake = Arc::new(WakeShared {
+            poll_state: AtomicU8::new(0),
+            latest_generation: AtomicU64::new(0),
+            notify: tokio::sync::Notify::new(),
+        });
+        let (_connection_tx, connection) = connected_state();
+        let (state, _) = watch::channel(AudioSnapshot::initial());
+        let (events, _) = broadcast::channel(8);
+        let (gateway, _gateway_rx) = mpsc::channel(8);
+        let (_transport_tx, transport_updates) = mpsc::channel(1);
+        let (_command_tx, commands) = mpsc::channel(1);
+        let (_cancel_tx, cancel) = watch::channel(false);
+        let (_shutdown_tx, connection_shutdown) = watch::channel(false);
+        let counters = Arc::new(AudioCounters::default());
+        let mut executor = Executor {
+            id: 1,
+            source: SourceSlot::new(Box::new(ReadySource), SourceGeneration::FIRST, &wake),
+            wake,
+            transport: Some(InstalledTransport {
+                generation: ConnectionGeneration::FIRST,
+                socket: Arc::new(socket),
+                encoder: TransportEncoder::new(
+                    TransportMode::Aes256GcmRtpSize,
+                    &[0x42; 32],
+                    7,
+                    1_275,
+                    2_048,
+                )
+                .unwrap(),
+                validity: TransportValidity::new(),
+                dave_protocol_version: 0,
+                dave: None,
+                dave_media: None,
+            }),
+            transport_updates,
+            pacer,
+            deadlines,
+            gateway,
+            connection,
+            connection_shutdown,
+            cancel,
+            commands,
+            store: AudioStore {
+                current: AudioSnapshot::initial(),
+                state,
+                events,
+                counters: counters.clone(),
+            },
+            frame: vec![0; 1_275],
+            dave_frame: Vec::new(),
+            packet: Vec::with_capacity(2_048),
+            connection_was_ready: true,
+            speaking: true,
+            active_timeline: true,
+            silence_sent: 0,
+            source_ended: false,
+            stop_reply: None,
+            fail_udp_sends: Arc::new(AtomicBool::new(false)),
+        };
+        // A ready source has no queued pacing work yet. Simulate waking after
+        // the intended deadline, including a delay spanning multiple frames.
+        for delay in [Duration::from_millis(37), Duration::from_millis(137)] {
+            tokio::time::advance(delay + FRAME_PERIOD).await;
+            let before = counters.frames_sent.load(Ordering::Relaxed);
+            executor
+                .handle_deadline(Instant::now() - delay)
+                .await
+                .unwrap();
+            assert_eq!(
+                counters.frames_sent.load(Ordering::Relaxed),
+                before + 1,
+                "recovery should send once now instead of adding another timer wait"
+            );
+            assert!(
+                executor.deadlines.try_recv().is_err(),
+                "no catch-up tick retained"
+            );
+            tokio::time::advance(FRAME_PERIOD - Duration::from_millis(1)).await;
+            assert!(
+                executor.deadlines.try_recv().is_err(),
+                "next frame must wait a full period"
+            );
+            tokio::time::advance(Duration::from_millis(1)).await;
+            tokio::task::yield_now().await;
+            let next = executor
+                .deadlines
+                .try_recv()
+                .expect("next normally spaced opportunity");
+            executor.handle_deadline(next).await.unwrap();
+            assert_eq!(counters.frames_sent.load(Ordering::Relaxed), before + 2);
+        }
+        executor.pacer.unregister().await.unwrap();
+        drop(executor);
+        drop(owner);
     }
 
     #[tokio::test]
