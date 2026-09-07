@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Wake, Waker};
 use std::time::{Duration, Instant as StdInstant};
@@ -337,9 +337,28 @@ enum AudioCommand {
     },
 }
 
+const SOURCE_POLL_ACTIVE: u8 = 1;
+const SOURCE_WAKE_PENDING: u8 = 2;
+
 struct WakeShared {
+    poll_state: AtomicU8,
     latest_generation: AtomicU64,
     notify: tokio::sync::Notify,
+}
+
+impl WakeShared {
+    fn begin_poll(&self) {
+        self.poll_state
+            .fetch_or(SOURCE_POLL_ACTIVE, Ordering::AcqRel);
+    }
+
+    fn end_poll(&self) {
+        // A wake races either before this exchange (we deliver it) or after
+        // it (the waker delivers it). A single atomic prevents a missed wake.
+        if self.poll_state.swap(0, Ordering::AcqRel) & SOURCE_WAKE_PENDING != 0 {
+            self.notify.notify_one();
+        }
+    }
 }
 
 struct WakeToken {
@@ -356,7 +375,18 @@ impl Wake for WakeToken {
         self.shared
             .latest_generation
             .fetch_max(self.generation.get(), Ordering::AcqRel);
-        self.shared.notify.notify_one();
+        // AtomicWaker registration may synchronously invoke this waker on
+        // the source callback thread. Keep Oto's Notify/scheduler work outside
+        // that callback; its execution budget belongs to the source itself.
+        if self
+            .shared
+            .poll_state
+            .fetch_or(SOURCE_WAKE_PENDING, Ordering::AcqRel)
+            & SOURCE_POLL_ACTIVE
+            == 0
+        {
+            self.shared.notify.notify_one();
+        }
     }
 }
 
@@ -506,6 +536,7 @@ async fn run_audio(
     counters: Arc<AudioCounters>,
 ) {
     let wake = Arc::new(WakeShared {
+        poll_state: AtomicU8::new(0),
         latest_generation: AtomicU64::new(0),
         notify: tokio::sync::Notify::new(),
     });
@@ -854,6 +885,7 @@ impl Executor {
 
     fn poll_source(&mut self) -> Result<Polled, Error> {
         let mut cx = Context::from_waker(&self.source.waker);
+        self.wake.begin_poll();
         #[cfg(target_os = "linux")]
         let cpu_started = source_cpu_time();
         let started = StdInstant::now();
@@ -881,6 +913,7 @@ impl Executor {
             #[cfg(not(target_os = "linux"))]
             let violated = true;
             if violated {
+                self.wake.end_poll();
                 return Err(audio_error(
                     ErrorKind::FrameSourceContract,
                     Operation::StartAudio,
@@ -889,6 +922,7 @@ impl Executor {
                 ));
             }
         }
+        self.wake.end_poll();
         match result {
             Poll::Ready(FrameStatus::Frame { len }) if (1..=self.frame.len()).contains(&len) => {
                 Ok(Polled::Frame(len))
@@ -1184,6 +1218,103 @@ mod tests {
             output.fill(0x55);
             Poll::Ready(FrameStatus::Frame { len: output.len() })
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn source_waker_defers_notifier_work_until_callback_finishes() {
+        use std::future::Future;
+        struct SlowScheduler(AtomicUsize);
+        impl Wake for SlowScheduler {
+            fn wake(self: Arc<Self>) {
+                self.wake_by_ref();
+            }
+            fn wake_by_ref(self: &Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                let started = source_cpu_time();
+                while source_cpu_time().saturating_sub(started) < Duration::from_millis(5) {
+                    std::hint::spin_loop();
+                }
+            }
+        }
+        let shared = Arc::new(WakeShared {
+            poll_state: AtomicU8::new(0),
+            latest_generation: AtomicU64::new(0),
+            notify: tokio::sync::Notify::new(),
+        });
+        let scheduler = Arc::new(SlowScheduler(AtomicUsize::new(0)));
+        let scheduler_waker = Waker::from(scheduler.clone());
+        let mut notified = std::pin::pin!(shared.notify.notified());
+        assert!(
+            notified
+                .as_mut()
+                .poll(&mut Context::from_waker(&scheduler_waker))
+                .is_pending()
+        );
+        let source_waker = Waker::from(Arc::new(WakeToken {
+            generation: SourceGeneration::FIRST,
+            shared: shared.clone(),
+        }));
+        shared.begin_poll();
+        let started = source_cpu_time();
+        source_waker.wake_by_ref();
+        let elapsed = source_cpu_time().saturating_sub(started);
+        assert_eq!(
+            scheduler.0.load(Ordering::Relaxed),
+            0,
+            "source wake must not execute Oto's scheduler inline"
+        );
+        assert!(elapsed < SOURCE_POLL_LIMIT);
+        shared.end_poll();
+        assert_eq!(
+            scheduler.0.load(Ordering::Relaxed),
+            1,
+            "deferred wake must be delivered"
+        );
+        assert!(
+            notified
+                .as_mut()
+                .poll(&mut Context::from_waker(&scheduler_waker))
+                .is_ready()
+        );
+        println!("deferred source wake: {} us CPU", elapsed.as_micros());
+    }
+
+    #[test]
+    fn source_wake_racing_poll_exit_is_never_lost() {
+        use std::future::Future;
+        let shared = Arc::new(WakeShared {
+            poll_state: AtomicU8::new(0),
+            latest_generation: AtomicU64::new(0),
+            notify: tokio::sync::Notify::new(),
+        });
+        let token = Waker::from(Arc::new(WakeToken {
+            generation: SourceGeneration::FIRST,
+            shared: shared.clone(),
+        }));
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..1000 {
+                    barrier.wait();
+                    token.wake_by_ref();
+                    barrier.wait();
+                }
+            });
+            for _ in 0..1000 {
+                shared.begin_poll();
+                barrier.wait();
+                shared.end_poll();
+                barrier.wait();
+                let mut notified = std::pin::pin!(shared.notify.notified());
+                assert!(
+                    notified
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_ready()
+                );
+            }
+        });
     }
 
     async fn connected_udp_pair() -> (tokio::net::UdpSocket, tokio::net::UdpSocket) {
