@@ -55,7 +55,7 @@ impl AudioSource {
     fn poll_frame(&mut self, cx: &mut Context<'_>, output: &mut [u8]) -> Poll<FrameStatus> {
         match self {
             Self::Callback(source) => source.poll_frame(cx, output),
-            Self::Channel(source) => source.poll_frame(cx, output),
+            Self::Channel(source) => source.poll_owned(cx, output),
         }
     }
 }

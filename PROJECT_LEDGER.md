@@ -1,5 +1,20 @@
 # Active Raydio reliability finding
 
+2026-09-08: The capacity-one owned producer unnecessarily remained asleep until
+a 1 ms polling timer after its frame had been consumed. A paused-clock regression
+failed before the change and passes now. The concrete owned reader copies first,
+then wakes a register/recheck AtomicWaker waiter; the ordinary FrameSource poll
+still sets flags without waking producer task code, with its timer fallback and
+2 ms callback watchdog unchanged. Close, undersized buffers, cancelled waiter
+replacement, concurrent ordering, EOF and the encrypted terminal-silence path
+are covered: 92 tests pass, six benchmarks ignored; Clippy passes. Runtime task
+wake cost is now paid by the concrete owned sender path and needs live review.
+The public queue capacity and source-consumption acknowledgement are unchanged.
+Sequential release tests: 250 frames require 2633 producer polls before and 501
+after (zero unavailable in both); 10 s full DAVE paths send 501/500 frames with
+zero allocations and max lateness 1.724/2.050 ms. No memory/latency or Oracle
+quality improvement is claimed. Evidence: owned-consumption-wake-local.json.
+
 A 20 ms off-CPU delay caused a valid frame to be rejected permanently by the 2 ms wall-time guard. The Linux guard now uses thread CPU time for fatal attribution, retaining elapsed-overrun telemetry and CPU-heavy/invalid-frame failure tests. Blocking source implementations remain prohibited; CPU time cannot enforce this part of the contract. 79 tests pass, 5 manual benchmarks excluded; Clippy passes. The 10 s local DAVE benchmark pair retained zero allocations and ~50 frames/s. Full Oracle receiver qualification remains in Raydio; the earlier terminal cloud failure has not yet been classified. The unrelated coordinator-count experiment is not included.
 
 The six-hour Oracle attempt on 2026-09-06 stopped with FrameSourceContract at

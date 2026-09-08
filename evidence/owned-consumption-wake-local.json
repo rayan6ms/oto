@@ -1,0 +1,67 @@
+{
+  "scope": "Local deterministic handoff regression and sequential bounded release benchmarks; no Oracle or alternative-host quality claim",
+  "handoffBefore": {
+    "elapsedMs": 5001,
+    "frames": 250,
+    "producerPolls": 2633,
+    "unavailable": 0
+  },
+  "handoffAfter": {
+    "elapsedMs": 5001,
+    "frames": 250,
+    "producerPolls": 501,
+    "unavailable": 0
+  },
+  "daveBefore": {
+    "allocation": {
+      "allocations": 0,
+      "allocationsPerFrame": 0.0,
+      "bytesAllocated": 0,
+      "bytesAllocatedPerFrame": 0.0,
+      "reallocations": 0,
+      "reallocationsPerFrame": 0.0
+    },
+    "benchmarkId": "oto-p08-complete-paced-dave",
+    "boundaryDifference": 0,
+    "frames": 501,
+    "maxSenderLatenessNanos": 1724345,
+    "measurementMs": 10001,
+    "profile": "release",
+    "schemaVersion": 1,
+    "source": "owned-channel",
+    "udpPackets": 501,
+    "warmupMs": 1000
+  },
+  "daveAfter": {
+    "allocation": {
+      "allocations": 0,
+      "allocationsPerFrame": 0.0,
+      "bytesAllocated": 0,
+      "bytesAllocatedPerFrame": 0.0,
+      "reallocations": 0,
+      "reallocationsPerFrame": 0.0
+    },
+    "benchmarkId": "oto-p08-complete-paced-dave",
+    "boundaryDifference": 0,
+    "frames": 500,
+    "maxSenderLatenessNanos": 2049750,
+    "measurementMs": 10000,
+    "profile": "release",
+    "schemaVersion": 1,
+    "source": "owned-channel",
+    "udpPackets": 500,
+    "warmupMs": 1000
+  },
+  "tests": {
+    "ordinary": 92,
+    "ignored": 6,
+    "clippy": "passed"
+  },
+  "regression": "Owned next frame stayed Pending until a timer tick before the fix; now passes without advancing paused clock",
+  "limits": [
+    "Different host scheduling between benchmark runs; no statistically demonstrated latency or memory reduction.",
+    "One-frame capacity, byte content and consumption acknowledgement unchanged.",
+    "Arbitrary FrameSource CPU guard and generic reader timer fallback retained.",
+    "Owned path wakes producer task after bounded copy; runtime wake cost belongs to the owned sender path."
+  ]
+}

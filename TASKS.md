@@ -18,3 +18,7 @@
 - [x] Test cancellation, EOF ordering, close, byte integrity, output bounds, wake replacement, and the full DAVE/silence path: 89 tests pass; Clippy passes.
 - [x] Measure callback/channel release paths with identical maximum frames: both 501 packets, zero allocations/reallocations in 10 seconds; max lateness 1.148/2.001 ms. This is not a speedup or Oracle quality claim.
 - [ ] Qualify the committed channel through Crust/Raydio on Oracle; host descheduling can still cause gaps.
+
+- [x] Reproduce the owned producer's unnecessary timer wait after consumption; wake the producer after the concrete owned copy while retaining generic callback isolation, one-frame capacity, cancellation and EOF ordering.
+- [x] Pass 92 ordinary tests and Clippy. At 250 frames, producer polls fell 2633 to 501; complete DAVE path retains zero allocations. Local maximum lateness 1.724/2.050 ms does not prove a latency improvement.
+- [ ] Compare event-driven consumption on Oracle and a viable free alternative; host descheduling remains outside this repair.

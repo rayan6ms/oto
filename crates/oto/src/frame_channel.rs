@@ -1,4 +1,4 @@
-//! A capacity-one encoded-frame handoff with no caller code on the audio poll.
+//! A capacity-one encoded-frame handoff with bounded copying.
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -15,10 +15,9 @@ const MAX_FRAME: usize = 1275;
 /// Creates a capacity-one channel for 20 ms, 48 kHz stereo encoded Opus frames.
 ///
 /// No codec conversion or packet scheduling occurs here. Full-channel sends
-/// wait for consumption. The reader invokes no caller-supplied callback when
-/// attached through `VoiceConnection::start_audio_channel` or
-/// `PacedAudioSender::replace_channel`. Ordinary `FrameSource` attachment still
-/// applies the callback watchdog, including to this reader.
+/// wait for consumption. The concrete owned audio attachment copies the frame
+/// then wakes its producer task. Ordinary `FrameSource` attachment keeps task
+/// wake work outside its poll and still applies the callback watchdog.
 pub fn frame_channel() -> (FrameWriter, FrameReader) {
     let (writer, reader) = RingBuffer::new(1);
     let shared = Arc::new(Shared {
@@ -27,6 +26,8 @@ pub fn frame_channel() -> (FrameWriter, FrameReader) {
         closed: AtomicBool::new(false),
         undersized: AtomicBool::new(false),
         waker: AtomicWaker::new(),
+        owned: AtomicBool::new(false),
+        producer_waker: AtomicWaker::new(),
     });
     (
         FrameWriter {
@@ -88,6 +89,8 @@ struct Shared {
     closed: AtomicBool,
     undersized: AtomicBool,
     waker: AtomicWaker,
+    owned: AtomicBool,
+    producer_waker: AtomicWaker,
 }
 
 impl FrameWriter {
@@ -97,8 +100,9 @@ impl FrameWriter {
     /// before publication changes nothing. Cancellation after publication keeps
     /// that frame queued; a subsequent send waits for it before publishing the
     /// next frame. Do not retry the cancelled frame unless duplication is wanted.
-    /// The producer checks consumption using the caller's Tokio timer at 1 ms
-    /// intervals, keeping runtime scheduler wake work off the audio poll thread.
+    /// The owned audio attachment wakes the producer after copying the frame.
+    /// Ordinary `FrameSource` attachment checks consumption at 1 ms intervals,
+    /// keeping runtime wake work outside arbitrary source callbacks.
     pub async fn send(&mut self, bytes: &[u8]) -> Result<(), FrameSendError> {
         if !(1..=MAX_FRAME).contains(&bytes.len()) {
             return Err(FrameSendError::InvalidLength);
@@ -121,13 +125,7 @@ impl FrameWriter {
     }
 
     fn check_open(&self) -> Result<(), FrameSendError> {
-        if self.shared.undersized.load(Ordering::Acquire) {
-            return Err(FrameSendError::OutputTooSmall);
-        }
-        if self.shared.closed.load(Ordering::Acquire) {
-            return Err(FrameSendError::Closed);
-        }
-        Ok(())
+        self.shared.check_open()
     }
 
     async fn wait_consumed(&mut self) -> Result<(), FrameSendError> {
@@ -137,7 +135,38 @@ impl FrameWriter {
                 self.in_flight = false;
                 break;
             }
-            tokio::time::sleep(Duration::from_millis(1)).await;
+            let shared = &self.shared;
+            let owned = shared.owned.load(Ordering::Acquire);
+            let ready = futures_util::future::poll_fn(|cx| {
+                shared.producer_waker.register(cx.waker());
+                // Register/recheck also covers close and attachment races.
+                shared.check_open()?;
+                if shared.consumed.load(Ordering::Acquire) {
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Pending
+                }
+            });
+            if owned {
+                ready.await?;
+            } else {
+                tokio::select! {
+                    result = ready => result?,
+                    () = tokio::time::sleep(Duration::from_millis(1)) => {}
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Shared {
+    fn check_open(&self) -> Result<(), FrameSendError> {
+        if self.undersized.load(Ordering::Acquire) {
+            return Err(FrameSendError::OutputTooSmall);
+        }
+        if self.closed.load(Ordering::Acquire) {
+            return Err(FrameSendError::Closed);
         }
         Ok(())
     }
@@ -152,10 +181,26 @@ impl Drop for FrameWriter {
 impl Drop for FrameReader {
     fn drop(&mut self) {
         self.shared.closed.store(true, Ordering::Release);
+        self.shared.producer_waker.wake();
     }
 }
 
 impl FrameReader {
+    pub(crate) fn poll_owned(
+        &mut self,
+        cx: &mut Context<'_>,
+        output: &mut [u8],
+    ) -> Poll<FrameStatus> {
+        self.shared.owned.store(true, Ordering::Release);
+        let result = self.poll_frame(cx, output);
+        // Only the concrete owned attachment runs scheduler work here. The
+        // FrameSource implementation below still only copies and sets flags.
+        if result.is_ready() {
+            self.shared.producer_waker.wake();
+        }
+        result
+    }
+
     fn try_frame(&mut self, output: &mut [u8]) -> Option<FrameStatus> {
         let frame = self.queue.pop().ok()?;
         if frame.len > output.len() {
@@ -200,6 +245,140 @@ mod tests {
 
     fn read(reader: &mut FrameReader, output: &mut [u8]) -> Poll<FrameStatus> {
         reader.poll_frame(&mut Context::from_waker(&noop_waker()), output)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn owned_consumption_releases_producer_without_a_timer_tick() {
+        let (mut writer, mut reader) = frame_channel();
+        let task = tokio::spawn(async move {
+            writer.send(&[1]).await.unwrap();
+            writer.send(&[2]).await.unwrap();
+        });
+        tokio::task::yield_now().await;
+        let mut output = [0; MAX_FRAME];
+        assert_eq!(
+            reader.poll_owned(&mut Context::from_waker(&noop_waker()), &mut output),
+            Poll::Ready(FrameStatus::Frame { len: 1 })
+        );
+        assert_eq!(output[0], 1);
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            reader.poll_owned(&mut Context::from_waker(&noop_waker()), &mut output),
+            Poll::Ready(FrameStatus::Frame { len: 1 }),
+            "next frame must be published without waiting for a timer tick"
+        );
+        assert_eq!(output[0], 2);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "bounded real-time owned handoff benchmark"]
+    async fn benchmark_owned_consumption_wakes() {
+        let (mut writer, mut reader) = frame_channel();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let count = polls.clone();
+        let producer = tokio::spawn(async move {
+            for _ in 0..251 {
+                let mut send = std::pin::pin!(writer.send(&[0x55; MAX_FRAME]));
+                futures_util::future::poll_fn(|cx| {
+                    count.fetch_add(1, Ordering::Relaxed);
+                    send.as_mut().poll(cx)
+                })
+                .await
+                .unwrap();
+            }
+        });
+        let mut output = [0; MAX_FRAME];
+        // Prime startup, then measure identical 20 ms consumption opportunities.
+        futures_util::future::poll_fn(|cx| reader.poll_owned(cx, &mut output)).await;
+        let before = polls.load(Ordering::Relaxed);
+        let begin = tokio::time::Instant::now();
+        let mut unavailable = 0;
+        for frame in 1..=250 {
+            tokio::time::sleep_until(begin + Duration::from_millis(frame * 20)).await;
+            if reader
+                .poll_owned(&mut Context::from_waker(&noop_waker()), &mut output)
+                .is_pending()
+            {
+                unavailable += 1;
+                futures_util::future::poll_fn(|cx| reader.poll_owned(cx, &mut output)).await;
+            }
+            assert_eq!(output, [0x55; MAX_FRAME]);
+        }
+        producer.await.unwrap();
+        println!(
+            "HANDOFF_BENCHMARK={}",
+            serde_json::json!({"frames":250,"producerPolls":polls.load(Ordering::Relaxed)-before,"unavailable":unavailable,"elapsedMs":begin.elapsed().as_millis()})
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn owned_waiter_replacement_and_close_are_not_lost() {
+        for undersized in [false, true] {
+            let (mut writer, mut reader) = frame_channel();
+            let mut output = [0; MAX_FRAME];
+            assert!(
+                reader
+                    .poll_owned(&mut Context::from_waker(&noop_waker()), &mut output)
+                    .is_pending()
+            );
+            let old = Arc::new(Counter::default());
+            let new = Arc::new(Counter::default());
+            let old_waker = Waker::from(old.clone());
+            let new_waker = Waker::from(new.clone());
+            let mut send = Box::pin(writer.send(&[1, 2, 3]));
+            assert!(
+                send.as_mut()
+                    .poll(&mut Context::from_waker(&old_waker))
+                    .is_pending()
+            );
+            // Cancelling the published send retains its bytes. The replacement
+            // waiter must observe consumption/close without any timer fallback.
+            drop(send);
+            let mut next = Box::pin(writer.send(&[4]));
+            assert!(
+                next.as_mut()
+                    .poll(&mut Context::from_waker(&new_waker))
+                    .is_pending()
+            );
+            let expected = if undersized {
+                assert_eq!(
+                    reader.poll_owned(&mut Context::from_waker(&noop_waker()), &mut []),
+                    Poll::Ready(FrameStatus::Ended)
+                );
+                FrameSendError::OutputTooSmall
+            } else {
+                drop(reader);
+                FrameSendError::Closed
+            };
+            assert_eq!(old.0.load(Ordering::Relaxed), 0);
+            assert!(new.0.load(Ordering::Relaxed) > 0);
+            assert_eq!(next.await, Err(expected));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ordinary_callback_read_does_not_wake_producer_scheduler() {
+        let (mut writer, mut reader) = frame_channel();
+        let counter = Arc::new(Counter::default());
+        let waker = Waker::from(counter.clone());
+        let mut send = Box::pin(writer.send(&[7]));
+        assert!(
+            send.as_mut()
+                .poll(&mut Context::from_waker(&waker))
+                .is_pending()
+        );
+        let mut output = [0; MAX_FRAME];
+        assert_eq!(
+            read(&mut reader, &mut output),
+            Poll::Ready(FrameStatus::Frame { len: 1 })
+        );
+        assert_eq!(counter.0.load(Ordering::Relaxed), 0);
+        // A manual poll can observe the permit, and the timer remains the
+        // automatic fallback for ordinary FrameSource callers.
+        assert_eq!(send.await, Ok(()));
     }
 
     #[tokio::test]
@@ -353,6 +532,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn concurrent_publication_preserves_bytes_order_and_eof() {
+        concurrent_publication(false).await;
+        concurrent_publication(true).await;
+    }
+
+    async fn concurrent_publication(owned: bool) {
         let (mut writer, mut reader) = frame_channel();
         let task = tokio::spawn(async move {
             for sequence in 0..256u32 {
@@ -365,14 +549,27 @@ mod tests {
         });
         let mut output = [0; MAX_FRAME];
         for sequence in 0..256u32 {
-            let status =
-                futures_util::future::poll_fn(|cx| reader.poll_frame(cx, &mut output)).await;
+            let status = futures_util::future::poll_fn(|cx| {
+                if owned {
+                    reader.poll_owned(cx, &mut output)
+                } else {
+                    reader.poll_frame(cx, &mut output)
+                }
+            })
+            .await;
             assert_eq!(status, FrameStatus::Frame { len: MAX_FRAME });
             for (i, byte) in output.iter().enumerate() {
                 assert_eq!(*byte, (sequence as usize + i) as u8);
             }
         }
-        let status = futures_util::future::poll_fn(|cx| reader.poll_frame(cx, &mut output)).await;
+        let status = futures_util::future::poll_fn(|cx| {
+            if owned {
+                reader.poll_owned(cx, &mut output)
+            } else {
+                reader.poll_frame(cx, &mut output)
+            }
+        })
+        .await;
         assert_eq!(status, FrameStatus::Ended);
         task.await.unwrap();
     }
