@@ -564,7 +564,8 @@ impl StateStore {
             self.current.generation(),
             error.retry_disposition(),
             error.safe_code(),
-        );
+        )
+        .with_dave_failure(error.dave_failure());
         self.current.set_failure(failure.clone());
         self.current.set_phase(terminal_phase);
         if terminal_phase == ConnectionPhase::Failed {

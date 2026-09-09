@@ -2,7 +2,7 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
-use crate::{ErrorKind, Operation, RetryDisposition};
+use crate::{DaveFailure, ErrorKind, Operation, RetryDisposition};
 
 /// A Discord voice token whose debug representation is always redacted.
 #[derive(Clone)]
@@ -302,6 +302,7 @@ pub struct AudioSnapshot {
     generation: SourceGeneration,
     phase: AudioPhase,
     failure: Option<ErrorKind>,
+    dave_failure: Option<DaveFailure>,
     stats: AudioStats,
 }
 
@@ -311,6 +312,7 @@ impl AudioSnapshot {
             generation: SourceGeneration::FIRST,
             phase: AudioPhase::WaitingForSource,
             failure: None,
+            dave_failure: None,
             stats: AudioStats::default(),
         }
     }
@@ -330,6 +332,11 @@ impl AudioSnapshot {
     pub fn failure(&self) -> Option<ErrorKind> {
         self.failure
     }
+    /// Returns the terminal DAVE cause, if applicable.
+    #[must_use]
+    pub fn dave_failure(&self) -> Option<DaveFailure> {
+        self.dave_failure
+    }
     /// Returns cumulative sender counters.
     #[must_use]
     pub fn stats(&self) -> AudioStats {
@@ -339,12 +346,14 @@ impl AudioSnapshot {
     pub(crate) fn set_generation(&mut self, generation: SourceGeneration) {
         self.generation = generation;
         self.failure = None;
+        self.dave_failure = None;
     }
     pub(crate) fn set_phase(&mut self, phase: AudioPhase) {
         self.phase = phase;
     }
-    pub(crate) fn set_failure(&mut self, failure: ErrorKind) {
-        self.failure = Some(failure);
+    pub(crate) fn set_failure(&mut self, failure: &crate::Error) {
+        self.failure = Some(failure.kind());
+        self.dave_failure = failure.dave_failure();
         self.phase = AudioPhase::Failed;
     }
     pub(crate) fn set_stats(&mut self, stats: AudioStats) {
@@ -448,6 +457,7 @@ pub struct FailureSnapshot {
     generation: ConnectionGeneration,
     retry: RetryDisposition,
     safe_code: Option<u32>,
+    dave_failure: Option<DaveFailure>,
 }
 
 impl FailureSnapshot {
@@ -464,7 +474,19 @@ impl FailureSnapshot {
             generation,
             retry,
             safe_code,
+            dave_failure: None,
         }
+    }
+
+    pub(crate) fn with_dave_failure(mut self, failure: Option<DaveFailure>) -> Self {
+        self.dave_failure = failure;
+        self
+    }
+
+    /// Returns the DAVE cause, if applicable, without backend error text.
+    #[must_use]
+    pub fn dave_failure(&self) -> Option<DaveFailure> {
+        self.dave_failure
     }
 
     /// Returns the stable failure classification.

@@ -464,8 +464,8 @@ impl AudioStore {
         self.commit();
     }
 
-    fn fail(&mut self, kind: ErrorKind) {
-        self.current.set_failure(kind);
+    fn fail(&mut self, error: &Error) {
+        self.current.set_failure(error);
         self.commit();
         let _ = self.events.send(ConnectionEvent::AudioChanged {
             generation: self.current.generation(),
@@ -596,7 +596,7 @@ async fn run_audio(
     };
     let failure = executor.run().await.err();
     if let Some(error) = &failure {
-        executor.store.fail(error.kind());
+        executor.store.fail(error);
     } else if executor.store.current.phase() != AudioPhase::Failed {
         executor.store.phase(AudioPhase::Stopped);
     }
@@ -1770,6 +1770,10 @@ mod tests {
         assert_eq!(
             control.snapshot().failure(),
             Some(ErrorKind::DaveTransition)
+        );
+        assert_eq!(
+            control.snapshot().dave_failure(),
+            Some(crate::DaveFailure::InvalidState)
         );
         let mut packet = [0_u8; 2_048];
         assert!(

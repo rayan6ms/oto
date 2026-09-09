@@ -21,34 +21,7 @@ pub(crate) struct Snapshot {
     pub(crate) ready: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum Failure {
-    UnsupportedVersion,
-    RequiredDowngrade,
-    Malformed,
-    InvalidState,
-    Backend,
-    BackendPanic,
-    Overloaded,
-    Closed,
-}
-
-impl std::fmt::Display for Failure {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(match self {
-            Self::UnsupportedVersion => "unsupported DAVE protocol version",
-            Self::RequiredDowngrade => "DAVE-required call attempted a plaintext downgrade",
-            Self::Malformed => "malformed DAVE control payload",
-            Self::InvalidState => "invalid DAVE lifecycle transition",
-            Self::Backend => "DAVE backend rejected the operation",
-            Self::BackendPanic => "DAVE backend panicked while rejecting untrusted input",
-            Self::Overloaded => "DAVE command queue remained full",
-            Self::Closed => "DAVE owner task stopped",
-        })
-    }
-}
-
-impl std::error::Error for Failure {}
+use crate::DaveFailure as Failure;
 
 #[derive(Debug)]
 pub(crate) enum Outbound {
@@ -200,11 +173,11 @@ impl Handle {
                 .send(Command::Control { control, reply }),
         )
         .await
-        .map_err(|_| Failure::Overloaded)?
+        .map_err(|_| Failure::QueueTimeout)?
         .map_err(|_| Failure::Closed)?;
         timeout(COMMAND_TIMEOUT, response)
             .await
-            .map_err(|_| Failure::Overloaded)?
+            .map_err(|_| Failure::ResponseTimeout)?
             .map_err(|_| Failure::Closed)?
     }
 }
@@ -229,11 +202,11 @@ impl MediaEncryptor {
             }),
         )
         .await
-        .map_err(|_| Failure::Overloaded)?
+        .map_err(|_| Failure::QueueTimeout)?
         .map_err(|_| Failure::Closed)?;
         timeout(COMMAND_TIMEOUT, self.responses.recv())
             .await
-            .map_err(|_| Failure::Overloaded)?
+            .map_err(|_| Failure::ResponseTimeout)?
             .ok_or(Failure::Closed)
     }
 }
@@ -1323,6 +1296,41 @@ mod tests {
                 ready: true,
             }
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn media_diagnostics_distinguish_queue_and_response_deadlines() {
+        let (commands, mut receiver) = mpsc::channel(1);
+        let (reply, responses) = mpsc::channel(1);
+        let mut media = MediaEncryptor {
+            commands,
+            reply,
+            responses,
+        };
+        media
+            .commands
+            .send(Command::Encrypt {
+                frame: vec![1],
+                len: 1,
+                output: Vec::new(),
+                reply: media.reply.clone(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            media.encrypt_buffered(vec![1], 1, Vec::new()).await,
+            Err(Failure::QueueTimeout)
+        ));
+        drop(receiver.recv().await);
+        assert!(matches!(
+            media.encrypt_buffered(vec![1], 1, Vec::new()).await,
+            Err(Failure::ResponseTimeout)
+        ));
+        drop(receiver);
+        assert!(matches!(
+            media.encrypt_buffered(vec![1], 1, Vec::new()).await,
+            Err(Failure::Closed)
+        ));
     }
 
     #[tokio::test]

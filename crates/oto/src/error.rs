@@ -52,6 +52,48 @@ pub enum ErrorKind {
     Shutdown,
 }
 
+/// Credential-free DAVE failure classifications, retained by durable snapshots.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DaveFailure {
+    /// The selected protocol version is unsupported.
+    UnsupportedVersion,
+    /// A required encrypted call attempted a plaintext downgrade.
+    RequiredDowngrade,
+    /// A control payload or frame length was malformed.
+    Malformed,
+    /// The lifecycle state does not permit the operation.
+    InvalidState,
+    /// The encryption or MLS backend rejected the operation.
+    Backend,
+    /// The backend panicked.
+    BackendPanic,
+    /// The owner command could not be queued before its deadline.
+    QueueTimeout,
+    /// The owner did not respond before its deadline.
+    ResponseTimeout,
+    /// The owner command or response lane closed.
+    Closed,
+}
+
+impl std::fmt::Display for DaveFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::UnsupportedVersion => "unsupported DAVE protocol version",
+            Self::RequiredDowngrade => "DAVE-required call attempted a plaintext downgrade",
+            Self::Malformed => "malformed DAVE control payload",
+            Self::InvalidState => "invalid DAVE lifecycle transition",
+            Self::Backend => "DAVE backend rejected the operation",
+            Self::BackendPanic => "DAVE backend panicked while rejecting untrusted input",
+            Self::QueueTimeout => "DAVE command queue remained full",
+            Self::ResponseTimeout => "DAVE owner response deadline expired",
+            Self::Closed => "DAVE owner task stopped",
+        })
+    }
+}
+
+impl std::error::Error for DaveFailure {}
+
 /// What the caller should assume about retry ownership after a failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -146,6 +188,15 @@ impl Error {
         self.kind
     }
 
+    /// Returns only the allowlisted DAVE cause, never arbitrary source text.
+    #[must_use]
+    pub fn dave_failure(&self) -> Option<DaveFailure> {
+        self.source
+            .as_deref()?
+            .downcast_ref::<DaveFailure>()
+            .copied()
+    }
+
     /// Returns the operation that observed the failure.
     #[must_use]
     pub fn operation(&self) -> Operation {
@@ -186,6 +237,7 @@ impl fmt::Debug for Error {
             .field("generation", &self.generation)
             .field("retry", &self.retry)
             .field("safe_code", &self.safe_code)
+            .field("dave_failure", &self.dave_failure())
             .field("message", &self.message)
             .field("has_source", &self.source.is_some())
             .finish()
@@ -197,5 +249,57 @@ impl StdError for Error {
         self.source
             .as_deref()
             .map(|source| source as &(dyn StdError + 'static))
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn durable_dave_cause_survives_failure_and_resets_with_source_generation() {
+        let error = Error::new(
+            ErrorKind::DaveTransition,
+            Operation::StartAudio,
+            None,
+            RetryDisposition::Fatal,
+            None,
+            "DAVE media encryption failed",
+        )
+        .with_source(DaveFailure::ResponseTimeout);
+        let mut audio = crate::AudioSnapshot::initial();
+        audio.set_failure(&error);
+        assert_eq!(
+            audio.clone().dave_failure(),
+            Some(DaveFailure::ResponseTimeout)
+        );
+        assert_eq!(audio.failure(), Some(ErrorKind::DaveTransition));
+        let connection = crate::FailureSnapshot::new(
+            error.kind(),
+            error.operation(),
+            ConnectionGeneration::FIRST,
+            error.retry_disposition(),
+            None,
+        )
+        .with_dave_failure(error.dave_failure());
+        assert_eq!(connection.clone().dave_failure(), audio.dave_failure());
+        audio.set_generation(crate::SourceGeneration::FIRST);
+        assert_eq!(audio.dave_failure(), None);
+        assert_eq!(audio.failure(), None);
+    }
+
+    #[test]
+    fn arbitrary_backend_source_is_not_exposed_by_diagnostics() {
+        let error = Error::new(
+            ErrorKind::DaveTransition,
+            Operation::Connect,
+            None,
+            RetryDisposition::Fatal,
+            None,
+            "DAVE failed",
+        )
+        .with_source(std::io::Error::other("SECRET_TOKEN_AND_PAYLOAD"));
+        assert_eq!(error.dave_failure(), None);
+        assert!(!format!("{error:?} {error}").contains("SECRET_TOKEN_AND_PAYLOAD"));
     }
 }
