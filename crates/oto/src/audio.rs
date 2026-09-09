@@ -594,7 +594,15 @@ async fn run_audio(
         #[cfg(test)]
         fail_udp_sends: input.fail_udp_sends,
     };
-    let failure = executor.run().await.err();
+    let failure = executor.run().await.err().map(|error| {
+        if error.dave_failure().is_some()
+            && let Some(dave) = executor.transport.as_ref().and_then(|t| t.dave.as_ref())
+        {
+            error.with_dave_context(dave.snapshot().into())
+        } else {
+            error
+        }
+    });
     if let Some(error) = &failure {
         executor.store.fail(error);
     } else if executor.store.current.phase() != AudioPhase::Failed {
@@ -1774,6 +1782,14 @@ mod tests {
         assert_eq!(
             control.snapshot().dave_failure(),
             Some(crate::DaveFailure::InvalidState)
+        );
+        assert_eq!(
+            control.snapshot().dave_context(),
+            Some(crate::DaveContext {
+                active_version: 0,
+                transition_pending: false,
+                ready: false,
+            })
         );
         let mut packet = [0_u8; 2_048];
         assert!(

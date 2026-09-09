@@ -2,7 +2,7 @@ use std::fmt;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
-use crate::{DaveFailure, ErrorKind, Operation, RetryDisposition};
+use crate::{DaveContext, DaveFailure, ErrorKind, Operation, RetryDisposition};
 
 /// A Discord voice token whose debug representation is always redacted.
 #[derive(Clone)]
@@ -303,6 +303,7 @@ pub struct AudioSnapshot {
     phase: AudioPhase,
     failure: Option<ErrorKind>,
     dave_failure: Option<DaveFailure>,
+    dave_context: Option<DaveContext>,
     stats: AudioStats,
 }
 
@@ -313,6 +314,7 @@ impl AudioSnapshot {
             phase: AudioPhase::WaitingForSource,
             failure: None,
             dave_failure: None,
+            dave_context: None,
             stats: AudioStats::default(),
         }
     }
@@ -337,6 +339,12 @@ impl AudioSnapshot {
     pub fn dave_failure(&self) -> Option<DaveFailure> {
         self.dave_failure
     }
+    /// Returns the DAVE lifecycle state observed after the failure.
+    #[must_use]
+    pub fn dave_context(&self) -> Option<DaveContext> {
+        self.dave_context
+    }
+
     /// Returns cumulative sender counters.
     #[must_use]
     pub fn stats(&self) -> AudioStats {
@@ -347,6 +355,7 @@ impl AudioSnapshot {
         self.generation = generation;
         self.failure = None;
         self.dave_failure = None;
+        self.dave_context = None;
     }
     pub(crate) fn set_phase(&mut self, phase: AudioPhase) {
         self.phase = phase;
@@ -354,6 +363,7 @@ impl AudioSnapshot {
     pub(crate) fn set_failure(&mut self, failure: &crate::Error) {
         self.failure = Some(failure.kind());
         self.dave_failure = failure.dave_failure();
+        self.dave_context = failure.dave_context();
         self.phase = AudioPhase::Failed;
     }
     pub(crate) fn set_stats(&mut self, stats: AudioStats) {
@@ -458,6 +468,7 @@ pub struct FailureSnapshot {
     retry: RetryDisposition,
     safe_code: Option<u32>,
     dave_failure: Option<DaveFailure>,
+    dave_context: Option<DaveContext>,
 }
 
 impl FailureSnapshot {
@@ -475,7 +486,13 @@ impl FailureSnapshot {
             retry,
             safe_code,
             dave_failure: None,
+            dave_context: None,
         }
+    }
+
+    pub(crate) fn with_dave_context(mut self, context: Option<DaveContext>) -> Self {
+        self.dave_context = context;
+        self
     }
 
     pub(crate) fn with_dave_failure(mut self, failure: Option<DaveFailure>) -> Self {
@@ -487,6 +504,11 @@ impl FailureSnapshot {
     #[must_use]
     pub fn dave_failure(&self) -> Option<DaveFailure> {
         self.dave_failure
+    }
+    /// Returns the DAVE lifecycle state observed after the failure.
+    #[must_use]
+    pub fn dave_context(&self) -> Option<DaveContext> {
+        self.dave_context
     }
 
     /// Returns the stable failure classification.

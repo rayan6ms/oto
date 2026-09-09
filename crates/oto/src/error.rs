@@ -94,6 +94,28 @@ impl std::fmt::Display for DaveFailure {
 
 impl std::error::Error for DaveFailure {}
 
+/// Redaction-safe DAVE state observed when an operation failed.
+/// This is a lifecycle observation, not a copy of keys or control payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DaveContext {
+    /// Active protocol version observed by the DAVE owner.
+    pub active_version: u16,
+    /// Whether a transition was pending at the observation.
+    pub transition_pending: bool,
+    /// Whether the owner reported a ready encrypted sender.
+    pub ready: bool,
+}
+
+impl From<crate::dave::Snapshot> for DaveContext {
+    fn from(state: crate::dave::Snapshot) -> Self {
+        Self {
+            active_version: state.active_version,
+            transition_pending: state.transition_id.is_some(),
+            ready: state.ready,
+        }
+    }
+}
+
 /// What the caller should assume about retry ownership after a failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
@@ -145,6 +167,7 @@ pub struct Error {
     safe_code: Option<u32>,
     message: &'static str,
     source: Option<Arc<dyn StdError + Send + Sync>>,
+    dave_context: Option<DaveContext>,
 }
 
 impl Error {
@@ -164,7 +187,19 @@ impl Error {
             safe_code,
             message,
             source: None,
+            dave_context: None,
         }
+    }
+
+    pub(crate) fn with_dave_context(mut self, context: DaveContext) -> Self {
+        self.dave_context = Some(context);
+        self
+    }
+
+    /// Returns the lifecycle state observed after a DAVE failure, if available.
+    #[must_use]
+    pub fn dave_context(&self) -> Option<DaveContext> {
+        self.dave_context
     }
 
     pub(crate) fn with_source(mut self, source: impl StdError + Send + Sync + 'static) -> Self {
@@ -238,6 +273,7 @@ impl fmt::Debug for Error {
             .field("retry", &self.retry)
             .field("safe_code", &self.safe_code)
             .field("dave_failure", &self.dave_failure())
+            .field("dave_context", &self.dave_context)
             .field("message", &self.message)
             .field("has_source", &self.source.is_some())
             .finish()
@@ -266,7 +302,12 @@ mod diagnostic_tests {
             None,
             "DAVE media encryption failed",
         )
-        .with_source(DaveFailure::ResponseTimeout);
+        .with_source(DaveFailure::ResponseTimeout)
+        .with_dave_context(DaveContext {
+            active_version: 1,
+            transition_pending: true,
+            ready: false,
+        });
         let mut audio = crate::AudioSnapshot::initial();
         audio.set_failure(&error);
         assert_eq!(
@@ -274,6 +315,7 @@ mod diagnostic_tests {
             Some(DaveFailure::ResponseTimeout)
         );
         assert_eq!(audio.failure(), Some(ErrorKind::DaveTransition));
+        assert_eq!(audio.clone().dave_context(), error.dave_context());
         let connection = crate::FailureSnapshot::new(
             error.kind(),
             error.operation(),
@@ -281,10 +323,13 @@ mod diagnostic_tests {
             error.retry_disposition(),
             None,
         )
-        .with_dave_failure(error.dave_failure());
+        .with_dave_failure(error.dave_failure())
+        .with_dave_context(error.dave_context());
         assert_eq!(connection.clone().dave_failure(), audio.dave_failure());
+        assert_eq!(connection.clone().dave_context(), audio.dave_context());
         audio.set_generation(crate::SourceGeneration::FIRST);
         assert_eq!(audio.dave_failure(), None);
+        assert_eq!(audio.dave_context(), None);
         assert_eq!(audio.failure(), None);
     }
 

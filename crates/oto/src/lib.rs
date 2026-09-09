@@ -41,7 +41,7 @@ pub mod __fuzzing {
 pub use audio::{FrameSource, FrameStatus, PacedAudioSender};
 pub use config::{Oto, OtoBuilder, ResourceLimits};
 pub use connection::{EventSubscriber, VoiceConnection};
-pub use error::{DaveFailure, Error, ErrorKind, Operation, RetryDisposition};
+pub use error::{DaveContext, DaveFailure, Error, ErrorKind, Operation, RetryDisposition};
 pub use frame_channel::{FrameReader, FrameSendError, FrameWriter, frame_channel};
 pub use model::{
     AudioPhase, AudioSnapshot, AudioStats, CloseReason, ConnectionEvent, ConnectionGeneration,

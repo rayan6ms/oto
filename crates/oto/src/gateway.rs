@@ -1430,10 +1430,11 @@ async fn run_dave_control(
     websocket: &mut ClientWebSocket,
     generation: ConnectionGeneration,
 ) -> Result<(), Error> {
-    let actions = dave
-        .control(control)
-        .await
-        .map_err(|source| dave_error(generation).with_source(source))?;
+    let actions = dave.control(control).await.map_err(|source| {
+        dave_error(generation)
+            .with_source(source)
+            .with_dave_context(dave.snapshot().into())
+    })?;
     let messages =
         dave_outbound_messages(actions, config.limits.gateway_binary_bytes(), generation)?;
     for message in messages {
