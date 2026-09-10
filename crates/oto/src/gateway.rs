@@ -26,6 +26,7 @@ use crate::transport::{
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DAVE_READY_TIMEOUT: Duration = Duration::from_secs(10);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const MIN_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
@@ -759,6 +760,7 @@ async fn run_session(
     store: &mut StateStore,
     initial: &mut Option<oneshot::Sender<Result<(), Error>>>,
 ) -> SessionOutcome {
+    let mut dave_deadline = None;
     let mut heartbeat_interval = None;
     let mut heartbeat_deadline = None;
     let mut outstanding = None::<(u64, Instant)>;
@@ -769,6 +771,13 @@ async fn run_session(
     let mut udp_receive_buffer = vec![0_u8; config.limits.udp_datagram_bytes() + 1];
 
     loop {
+        // Bound total not-ready time, not each individual successful control
+        // operation. Heartbeats/duplicate epoch messages cannot extend this wait.
+        if dave.as_ref().is_some_and(|owner| !owner.snapshot().ready) {
+            dave_deadline.get_or_insert_with(|| Instant::now() + DAVE_READY_TIMEOUT);
+        } else {
+            dave_deadline = None;
+        }
         let udp_socket = transport.as_ref().map(|transport| transport.socket.clone());
         let has_udp_socket = udp_socket.is_some();
         tokio::select! {
@@ -779,6 +788,14 @@ async fn run_session(
                     fail_pending_pings_shutdown(&mut pending_pings, store.generation());
                     return SessionOutcome::Shutdown;
                 }
+            }
+            _ = async {
+                if let Some(deadline) = dave_deadline { sleep_until(deadline).await; }
+                else { pending::<()>().await; }
+            } => {
+                return SessionOutcome::Fatal(dave_error(store.generation())
+                    .with_source(crate::DaveFailure::ResponseTimeout)
+                    .with_dave_context(dave.as_ref().expect("deadline requires DAVE owner").snapshot().into()));
             }
             command = commands.recv() => {
                 match command {
@@ -3321,7 +3338,7 @@ mod tests {
         eventually(|| sender.state().phase() == AudioPhase::Failed).await;
         let state = sender.state();
         assert_eq!(state.failure(), Some(ErrorKind::SendIo));
-        assert_eq!(state.stats().send_failures(), 1);
+        assert_eq!(state.stats().send_failures(), 3);
         assert_eq!(gateway.udp.capture().len(), 1, "discovery only");
         assert!(
             !gateway.speaking().is_empty(),
@@ -3336,6 +3353,100 @@ mod tests {
 
         connection.shutdown().await.expect("connection shuts down");
         gateway.shutdown().await.expect("gateway shuts down");
+    }
+
+    #[tokio::test]
+    async fn transient_udp_failure_resumes_exact_frame_with_contiguous_rtp_and_nonce() {
+        let gateway = TestGateway::start(FakeVoiceGatewayConfig::local())
+            .await
+            .unwrap();
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        oto.config
+            .fail_udp_sends
+            .store(true, std::sync::atomic::Ordering::Release);
+        let connection = oto
+            .connect(voice_info(&gateway, "udp-retry", "token"))
+            .await
+            .unwrap();
+        let (source, handle) = QueueSource::pair();
+        let sender = connection.start_audio(source).await.unwrap();
+        handle.push(vec![1, 2, 3]);
+        handle.push(vec![4, 5, 6]);
+        eventually(|| sender.state().stats().send_failures() == 1).await;
+        oto.config
+            .fail_udp_sends
+            .store(false, std::sync::atomic::Ordering::Release);
+        eventually(|| sender.state().stats().frames_sent() == 2).await;
+        eventually(|| gateway.udp.capture().len() >= 3).await;
+        let first = gateway
+            .udp
+            .decrypt_captured_transport(1, OracleMode::Aes256GcmRtpSize, &[0x42; 32], 1275)
+            .unwrap();
+        let second = gateway
+            .udp
+            .decrypt_captured_transport(2, OracleMode::Aes256GcmRtpSize, &[0x42; 32], 1275)
+            .unwrap();
+        assert_eq!(first.payload, [1, 2, 3]);
+        assert_eq!(second.payload, [4, 5, 6]);
+        assert_eq!(second.sequence, first.sequence.wrapping_add(1));
+        assert_eq!(second.timestamp, first.timestamp.wrapping_add(960));
+        assert_eq!(second.nonce, first.nonce + 1);
+        assert_eq!(sender.state().stats().send_failures(), 1);
+        assert_ne!(sender.state().phase(), AudioPhase::Failed);
+        sender.stop().await.unwrap();
+        connection.shutdown().await.unwrap();
+        gateway.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn missing_dave_successor_has_bounded_deadline_despite_duplicate_controls() {
+        for initially_ready in [false, true] {
+            let mut config = FakeVoiceGatewayConfig::local();
+            config.dave_protocol_version = 1;
+            config.heartbeat_interval = Duration::from_secs(300);
+            let gateway = TestGateway::start(config).await.unwrap();
+            let oto = test_oto(&gateway, ResourceLimits::default());
+            oto.config
+                .ready_dave_fixture
+                .store(initially_ready, std::sync::atomic::Ordering::Release);
+            let connection = oto
+                .connect(voice_info(&gateway, "dave-deadline", "token"))
+                .await
+                .unwrap();
+            if initially_ready {
+                gateway.try_dave_prepare_transition(1, 0).unwrap();
+                eventually(|| connection.state().phase() == ConnectionPhase::Connected).await;
+                gateway.try_dave_prepare_epoch(1, 1).unwrap();
+                eventually(|| connection.state().phase() == ConnectionPhase::EstablishingDave)
+                    .await;
+            }
+            // Pause only after real socket setup, then hold the runtime alive
+            // across manual advances to avoid idle auto-advance of TLS timers.
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(6)).await;
+            gateway.try_dave_prepare_epoch(1, 1).unwrap();
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            assert_ne!(connection.state().phase(), ConnectionPhase::Failed);
+            tokio::time::advance(Duration::from_secs(5)).await;
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(connection.state().phase(), ConnectionPhase::Failed);
+            assert_eq!(
+                connection.state().failure().map(|failure| failure.kind()),
+                Some(ErrorKind::DaveTransition)
+            );
+            assert_eq!(
+                gateway.udp.capture().len(),
+                1,
+                "no media during missing key setup"
+            );
+            tokio::time::resume();
+            connection.shutdown().await.unwrap();
+            gateway.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]
