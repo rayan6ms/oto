@@ -88,6 +88,17 @@ impl Pacer {
         let (deadlines, receiver) = mpsc::channel(1);
         let skipped = Arc::new(AtomicU64::new(0));
         let live = Arc::new(AtomicBool::new(true));
+        // Arm rollback before the first yield, including the successful-reply/
+        // not-yet-resumed window. The coordinator sees the same liveness flag.
+        let registration = PacerRegistration {
+            id,
+            commands: commands.clone(),
+            deadlines: Some(receiver),
+            skipped: skipped.clone(),
+            live: live.clone(),
+            cancellations,
+            registered: true,
+        };
         let (reply, response) = oneshot::channel();
         timed_control(
             &commands,
@@ -101,15 +112,7 @@ impl Pacer {
         )
         .await?;
         response.await.map_err(|_| PacerFailure::Closed)?;
-        Ok(PacerRegistration {
-            id,
-            commands,
-            deadlines: Some(receiver),
-            skipped,
-            live,
-            cancellations,
-            registered: true,
-        })
+        Ok(registration)
     }
 
     fn coordinator(&self, id: u64) -> Result<CoordinatorRef<'_>, PacerFailure> {
@@ -368,6 +371,37 @@ fn advance_deadline(deadline: Instant, now: Instant, skipped: &AtomicU64) -> Ins
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cancelled_registration_after_successful_reply_marks_slot_dead() {
+        let pacer = Pacer::new();
+        let (commands, mut receiver) = mpsc::channel(CONTROL_CAPACITY);
+        let cancellations = Arc::new(Notify::new());
+        *pacer.inner.coordinators.lock().unwrap() = Some(
+            (0..PACER_SHARDS)
+                .map(|_| CoordinatorHandle {
+                    commands: commands.clone(),
+                    cancellations: cancellations.clone(),
+                    task: tokio::spawn(std::future::pending()),
+                })
+                .collect(),
+        );
+        let mut registration = Box::pin(pacer.register());
+        std::future::poll_fn(|cx| {
+            assert!(registration.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut slots = HashMap::new();
+        apply_command(receiver.recv().await.unwrap(), &mut slots);
+        assert_eq!(slots.len(), 1);
+        drop(registration);
+        slots.retain(|_, slot| slot.live.load(Ordering::Acquire));
+        assert!(
+            slots.is_empty(),
+            "cancel must reap even after coordinator acknowledged"
+        );
+    }
 
     async fn settle() {
         for _ in 0..16 {

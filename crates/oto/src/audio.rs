@@ -491,6 +491,10 @@ struct AudioCounters {
     max_lateness_nanos: AtomicU64,
     last_source_overrun_wall_nanos: AtomicU64,
     last_source_overrun_cpu_nanos: AtomicU64,
+    active_send_gap_counts: [AtomicU64; 3],
+    max_active_send_gap_nanos: AtomicU64,
+    last_active_send_gap_nanos: AtomicU64,
+    last_active_send_gap_unix_ms: AtomicU64,
 }
 
 impl AudioCounters {
@@ -508,6 +512,37 @@ impl AudioCounters {
             Duration::from_nanos(self.last_source_overrun_wall_nanos.load(Ordering::Relaxed)),
             Duration::from_nanos(self.last_source_overrun_cpu_nanos.load(Ordering::Relaxed)),
         )
+        .with_send_gaps(
+            self.active_send_gap_counts
+                .each_ref()
+                .map(|value| value.load(Ordering::Relaxed)),
+            Duration::from_nanos(self.max_active_send_gap_nanos.load(Ordering::Relaxed)),
+            Duration::from_nanos(self.last_active_send_gap_nanos.load(Ordering::Relaxed)),
+            self.last_active_send_gap_unix_ms.load(Ordering::Relaxed),
+        )
+    }
+
+    fn observe_send_gap(&self, gap: Duration) {
+        if gap < Duration::from_millis(40) {
+            return;
+        }
+        for (counter, threshold) in self.active_send_gap_counts.iter().zip([40, 100, 1000]) {
+            if gap >= Duration::from_millis(threshold) {
+                Self::increment(counter);
+            }
+        }
+        let nanos = gap.as_nanos().min(u128::from(u64::MAX)) as u64;
+        self.max_active_send_gap_nanos
+            .fetch_max(nanos, Ordering::Relaxed);
+        self.last_active_send_gap_nanos
+            .store(nanos, Ordering::Relaxed);
+        let unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        self.last_active_send_gap_unix_ms
+            .store(unix_ms, Ordering::Relaxed);
     }
 
     fn observe_lateness(&self, lateness: Duration) {
@@ -542,6 +577,7 @@ struct Executor {
     connection_was_ready: bool,
     speaking: bool,
     active_timeline: bool,
+    last_packet_sent: Option<Instant>,
     silence_sent: u8,
     source_ended: bool,
     stop_reply: Option<oneshot::Sender<Result<AudioSnapshot, Error>>>,
@@ -588,6 +624,7 @@ async fn run_audio(
         connection_was_ready: false,
         speaking: false,
         active_timeline: false,
+        last_packet_sent: None,
         silence_sent: 0,
         source_ended: false,
         stop_reply: None,
@@ -1060,6 +1097,12 @@ impl Executor {
         }
         match timeout(FRAME_PERIOD, transport.socket.send(&self.packet)).await {
             Ok(Ok(written)) if written == self.packet.len() => {
+                let now = Instant::now();
+                if let Some(previous) = self.last_packet_sent.replace(now) {
+                    self.store
+                        .counters
+                        .observe_send_gap(now.saturating_duration_since(previous));
+                }
                 if !silence {
                     AudioCounters::increment(&self.store.counters.frames_sent);
                 }
@@ -1130,6 +1173,7 @@ impl Executor {
     }
 
     async fn pause_timeline(&mut self) -> Result<(), Error> {
+        self.last_packet_sent = None;
         if self.active_timeline {
             self.pacer.deactivate().await.map_err(pacer_error)?;
             self.active_timeline = false;
@@ -1221,6 +1265,18 @@ fn audio_error(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn send_gap_thresholds_retain_cumulative_counts_and_latest_time() {
+        let counters = AudioCounters::default();
+        for ms in [20, 39, 40, 99, 100, 999, 1000] {
+            counters.observe_send_gap(Duration::from_millis(ms));
+        }
+        let stats = counters.snapshot();
+        assert_eq!(stats.active_send_gap_counts(), [5, 3, 1]);
+        assert_eq!(stats.last_active_send_gap().0, Duration::from_secs(1));
+        assert!(stats.last_active_send_gap().1 > 0);
+    }
+
     use super::*;
     use crate::pacer::Pacer;
     use crate::transport::TransportMode;
@@ -1442,6 +1498,7 @@ mod tests {
             connection_was_ready: true,
             speaking: true,
             active_timeline: true,
+            last_packet_sent: None,
             silence_sent: 0,
             source_ended: false,
             stop_reply: None,

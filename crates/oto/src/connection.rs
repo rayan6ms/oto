@@ -339,16 +339,19 @@ impl VoiceConnection {
             Operation::StartAudio,
         )
         .await?;
-        let transport = response.await.unwrap_or_else(|_| {
-            Err(Error::new(
-                ErrorKind::Shutdown,
-                Operation::StartAudio,
-                Some(self.state().generation()),
-                RetryDisposition::Shutdown,
-                None,
-                "gateway owner stopped before audio attachment completed",
-            ))
-        })?;
+        let transport = response
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::new(
+                    ErrorKind::Shutdown,
+                    Operation::StartAudio,
+                    Some(self.state().generation()),
+                    RetryDisposition::Shutdown,
+                    None,
+                    "gateway owner stopped before audio attachment completed",
+                ))
+            })?
+            .claim();
         let control = AudioControl::spawn(SpawnAudio {
             id: audio_id,
             source,

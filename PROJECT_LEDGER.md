@@ -1,3 +1,23 @@
+# Attachment ownership and diagnostic audit (2026-09-10)
+
+The gateway retains a recoverable transport until the caller synchronously
+claims it. Dropping 32 successfully acknowledged attachments then retrying keeps
+the original encoder; the transport nonce advances 123 -> 124. Pacer registration
+now owns its rollback guard before the first await, so cancellation after an
+acknowledgement removes the otherwise orphaned coordinator slot. No per-frame
+mutex was introduced; the shared attachment allocation is bounded per connection.
+
+Audio snapshots now retain active-send gaps at 40/100/1000 ms and latest/max gap
+with wall time. One monotonic clock read per successful UDP send; no new worker,
+timer, per-frame allocation or log. Pausing the pacing timeline clears the gap
+anchor, so these counters deliberately exclude inactive source/connection time.
+98 tests pass, six manual benchmarks excluded; Clippy passes. A separately run
+10-second release owned-channel+DAVE/UDP benchmark sent 500 packets before and
+501 after, with zero allocations/reallocations in both. Maximum observed sender
+lateness was 2.139/1.837 ms; this single pair demonstrates no gross regression,
+not a statistically established latency improvement. Raw evidence is in Raydio
+`evidence/dependency-fixes-20260910/`. Fresh Oracle qualification remains required.
+
 # Active Raydio reliability finding
 
 2026-09-08: The capacity-one owned producer unnecessarily remained asleep until

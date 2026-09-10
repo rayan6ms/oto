@@ -215,6 +215,12 @@ pub struct AudioStats {
     max_lateness: Duration,
     last_source_overrun_wall: Duration,
     last_source_overrun_cpu: Duration,
+    active_send_gaps_40ms: u64,
+    active_send_gaps_100ms: u64,
+    active_send_gaps_1s: u64,
+    max_active_send_gap: Duration,
+    last_active_send_gap: Duration,
+    last_active_send_gap_unix_ms: u64,
 }
 
 impl AudioStats {
@@ -244,6 +250,42 @@ impl AudioStats {
         self.last_source_overrun_cpu = cpu;
         self
     }
+    pub(crate) fn with_send_gaps(
+        mut self,
+        counts: [u64; 3],
+        maximum: Duration,
+        last: Duration,
+        unix_ms: u64,
+    ) -> Self {
+        self.active_send_gaps_40ms = counts[0];
+        self.active_send_gaps_100ms = counts[1];
+        self.active_send_gaps_1s = counts[2];
+        self.max_active_send_gap = maximum;
+        self.last_active_send_gap = last;
+        self.last_active_send_gap_unix_ms = unix_ms;
+        self
+    }
+
+    /// Cumulative gaps between successful UDP sends while the pacing timeline
+    /// stayed active, at thresholds 40 ms, 100 ms, and one second. These include
+    /// terminal silence packets; inactive source/connection time is excluded.
+    #[must_use]
+    pub fn active_send_gap_counts(self) -> [u64; 3] {
+        [
+            self.active_send_gaps_40ms,
+            self.active_send_gaps_100ms,
+            self.active_send_gaps_1s,
+        ]
+    }
+
+    /// Latest qualifying gap and its completion time since the Unix epoch.
+    /// A zero time means no gap reached 40 ms. Snapshot fields are best-effort
+    /// observations and may straddle a concurrent sender update.
+    #[must_use]
+    pub fn last_active_send_gap(self) -> (Duration, u64) {
+        (self.last_active_send_gap, self.last_active_send_gap_unix_ms)
+    }
+
     /// Returns the number of caller-supplied frames sent.
     #[must_use]
     pub fn frames_sent(self) -> u64 {

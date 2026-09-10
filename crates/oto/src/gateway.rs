@@ -1,6 +1,6 @@
 use std::future::pending;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -46,7 +46,7 @@ pub(crate) enum Command {
     AttachAudio {
         audio_id: u64,
         updates: mpsc::Sender<InstalledTransport>,
-        reply: oneshot::Sender<Result<InstalledTransport, Error>>,
+        reply: oneshot::Sender<Result<AudioAttachment, Error>>,
     },
     Speaking {
         audio_id: u64,
@@ -353,7 +353,23 @@ impl Drop for DiscoveryTask {
     }
 }
 
+/// The gateway retains transport ownership until the caller synchronously claims it.
+/// Dropping a successful oneshot reply cannot drop the only encryption state.
+#[derive(Clone)]
+pub(crate) struct AudioAttachment(Arc<Mutex<Option<InstalledTransport>>>);
+
+impl AudioAttachment {
+    pub(crate) fn claim(self) -> InstalledTransport {
+        self.0
+            .lock()
+            .expect("attachment mutex poisoned")
+            .take()
+            .expect("attachment claimed once")
+    }
+}
+
 struct UdpTransport {
+    pending_attachment: Option<AudioAttachment>,
     socket: Arc<tokio::net::UdpSocket>,
     validity: Arc<TransportValidity>,
     ssrc: u32,
@@ -925,6 +941,7 @@ async fn run_session(
                 };
                 let select = select_protocol_payload(discovered.public, completion.mode);
                 *transport = Some(UdpTransport {
+                    pending_attachment: None,
                     socket: discovered.socket,
                     validity: TransportValidity::new(),
                     ssrc: completion.ssrc,
@@ -1480,7 +1497,7 @@ fn attach_audio(
     attachment: &mut Option<(u64, mpsc::Sender<InstalledTransport>)>,
     audio_id: u64,
     updates: mpsc::Sender<InstalledTransport>,
-    reply: oneshot::Sender<Result<InstalledTransport, Error>>,
+    reply: oneshot::Sender<Result<AudioAttachment, Error>>,
     generation: ConnectionGeneration,
 ) {
     if attachment
@@ -1502,6 +1519,11 @@ fn attach_audio(
         let _ = reply.send(Err(retrying_error(Operation::StartAudio, generation)));
         return;
     };
+    if let Some(pending) = active.pending_attachment.take()
+        && let Some(returned) = pending.0.lock().expect("attachment mutex poisoned").take()
+    {
+        active.encoder = Some(returned.encoder);
+    }
     if active.dave_protocol_version != 0
         && !active
             .dave
@@ -1538,9 +1560,14 @@ fn attach_audio(
         dave: active.dave.clone(),
         dave_media: active.dave.as_ref().map(dave::Handle::media_encryptor),
     };
-    match reply.send(Ok(installed)) {
+    let pending = AudioAttachment(Arc::new(Mutex::new(Some(installed))));
+    active.pending_attachment = Some(pending.clone());
+    match reply.send(Ok(pending)) {
         Ok(()) => *attachment = Some((audio_id, updates)),
-        Err(Ok(returned)) => active.encoder = Some(returned.encoder),
+        Err(Ok(returned)) => {
+            active.encoder = Some(returned.claim().encoder);
+            active.pending_attachment = None;
+        }
         Err(Err(_)) => unreachable!("attach reply sends an installed transport"),
     }
 }
@@ -2101,6 +2128,71 @@ fn finish_shutdown(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn cancelled_successful_attachment_preserves_encoder_and_allows_retry() {
+        let mode = TransportMode::Aes256GcmRtpSize;
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let mut encoder = TransportEncoder::new(mode, &[0; 32], 42, 1275, 1500).unwrap();
+        encoder.set_test_nonce_start(123);
+        let mut before = Vec::new();
+        encoder
+            .encrypt_next(&[0xf8, 0xff, 0xfe], &mut before)
+            .unwrap();
+        let mut transport = Some(UdpTransport {
+            pending_attachment: None,
+            socket: Arc::new(socket),
+            validity: TransportValidity::new(),
+            ssrc: 42,
+            selected_mode: mode,
+            encoder: Some(encoder),
+            dave_protocol_version: 0,
+            dave: None,
+            session_ready: true,
+        });
+        let mut attachment = None;
+        for id in 1..=32 {
+            let (updates, receiver) = mpsc::channel(1);
+            let (reply, response) = oneshot::channel();
+            attach_audio(
+                &mut transport,
+                &mut attachment,
+                id,
+                updates,
+                reply,
+                ConnectionGeneration::FIRST,
+            );
+            assert!(!response.is_terminated());
+            drop(response);
+            drop(receiver);
+        }
+        let (updates, _receiver) = mpsc::channel(1);
+        let (reply, response) = oneshot::channel();
+        attach_audio(
+            &mut transport,
+            &mut attachment,
+            33,
+            updates,
+            reply,
+            ConnectionGeneration::FIRST,
+        );
+        let mut installed = response
+            .await
+            .unwrap()
+            .unwrap_or_else(|e| panic!("retry: {e}"))
+            .claim();
+        let mut after = Vec::new();
+        installed
+            .encoder
+            .encrypt_next(&[0xf8, 0xff, 0xfe], &mut after)
+            .unwrap();
+        assert_eq!(&before[before.len() - 4..], &123_u32.to_le_bytes());
+        assert_eq!(
+            &after[after.len() - 4..],
+            &124_u32.to_le_bytes(),
+            "nonce state must not restart"
+        );
+    }
+
     use std::collections::HashMap;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
