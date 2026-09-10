@@ -474,6 +474,22 @@ pub(crate) struct StateStore {
 }
 
 impl StateStore {
+    pub(crate) fn dave_changed(
+        &self,
+        opcode: u8,
+        before: crate::DaveContext,
+        after: crate::DaveContext,
+    ) {
+        if before != after {
+            let _ = self.events.send(ConnectionEvent::DaveStateChanged {
+                generation: self.generation(),
+                opcode,
+                before,
+                after,
+            });
+        }
+    }
+
     pub(crate) fn generation(&self) -> ConnectionGeneration {
         self.current.generation()
     }

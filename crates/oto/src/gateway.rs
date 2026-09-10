@@ -1172,7 +1172,7 @@ async fn run_session(
                                             config,
                                             DaveControl::Roster(dave_roster.clone()),
                                             &mut websocket,
-                                            store.generation(),
+                                            store,
                                         )
                                         .await
                                     {
@@ -1277,7 +1277,7 @@ async fn run_session(
                                 if let Some(dave) = dave.as_ref()
                                     && let Err(error) = run_dave_control(
                                         dave, config, DaveControl::Roster(users),
-                                        &mut websocket, store.generation(),
+                                        &mut websocket, store,
                                     ).await
                                 {
                                     return SessionOutcome::Fatal(error);
@@ -1292,7 +1292,7 @@ async fn run_session(
                                 if let Some(dave) = dave.as_ref()
                                     && let Err(error) = run_dave_control(
                                         dave, config, DaveControl::MemberDisconnected(user),
-                                        &mut websocket, store.generation(),
+                                        &mut websocket, store,
                                     ).await
                                 {
                                     return SessionOutcome::Fatal(error);
@@ -1306,7 +1306,7 @@ async fn run_session(
                                     return SessionOutcome::Fatal(protocol_error(store.generation()));
                                 };
                                 if let Err(error) = run_dave_control(
-                                    dave, config, control, &mut websocket, store.generation(),
+                                    dave, config, control, &mut websocket, store,
                                 ).await {
                                     return SessionOutcome::Fatal(error);
                                 }
@@ -1348,7 +1348,7 @@ async fn run_session(
                                 return SessionOutcome::Fatal(protocol_error(store.generation()));
                             };
                             if let Err(error) = run_dave_control(
-                                dave, config, control, &mut websocket, store.generation(),
+                                dave, config, control, &mut websocket, store,
                             ).await {
                                 return SessionOutcome::Fatal(error);
                             }
@@ -1445,9 +1445,14 @@ async fn run_dave_control(
     config: &Config,
     control: DaveControl,
     websocket: &mut ClientWebSocket,
-    generation: ConnectionGeneration,
+    store: &StateStore,
 ) -> Result<(), Error> {
-    let actions = dave.control(control).await.map_err(|source| {
+    let generation = store.generation();
+    let opcode = control.opcode();
+    let before = dave.snapshot().into();
+    let result = dave.control(control).await;
+    store.dave_changed(opcode, before, dave.snapshot().into());
+    let actions = result.map_err(|source| {
         dave_error(generation)
             .with_source(source)
             .with_dave_context(dave.snapshot().into())
@@ -3568,10 +3573,29 @@ mod tests {
         eventually(|| sender.state().stats().frames_sent() > before_execute).await;
         assert_eq!(connection.state().phase(), ConnectionPhase::Connected);
 
+        let mut lifecycle_events = connection.subscribe_events().unwrap();
         gateway
             .try_dave_prepare_epoch(1, 1)
             .expect("epoch reset queues");
         eventually(|| connection.state().phase() == ConnectionPhase::EstablishingDave).await;
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if let crate::ConnectionEvent::DaveStateChanged {
+                    opcode: 24,
+                    before,
+                    after,
+                    ..
+                } = lifecycle_events.recv().await.unwrap()
+                {
+                    assert!(before.ready);
+                    assert!(!after.ready);
+                    assert_eq!(after.active_version, 0);
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("reset opcode and readiness change retained without keys or payloads");
         // A frame whose encryption command was ordered before PrepareEpoch may
         // finish its transport send after the connection snapshot changes. It
         // belongs wholly to the old epoch. Once that in-flight frame settles,

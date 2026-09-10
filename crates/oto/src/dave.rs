@@ -42,6 +42,22 @@ pub(crate) enum Control {
     MemberDisconnected(u64),
 }
 
+impl Control {
+    pub(crate) fn opcode(&self) -> u8 {
+        match self {
+            Self::Roster(_) => 11,
+            Self::MemberDisconnected(_) => 13,
+            Self::PrepareTransition { .. } => 21,
+            Self::ExecuteTransition { .. } => 22,
+            Self::PrepareEpoch { .. } => 24,
+            Self::ExternalSender(_) => 25,
+            Self::Proposals(_) => 27,
+            Self::Commit(_) => 29,
+            Self::Welcome(_) => 30,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Handle {
     inner: Arc<Owner>,
@@ -76,6 +92,8 @@ impl std::fmt::Debug for Handle {
 }
 
 enum Command {
+    #[cfg(test)]
+    PrepareFixtureEpoch { reply: oneshot::Sender<()> },
     Control {
         control: Control,
         reply: oneshot::Sender<Result<Vec<Outbound>, Failure>>,
@@ -91,7 +109,15 @@ enum Command {
 pub(crate) struct EncryptedBuffers {
     pub(crate) frame: Vec<u8>,
     pub(crate) output: Vec<u8>,
-    pub(crate) result: Result<(), Failure>,
+    pub(crate) result: Result<MediaOutcome, Failure>,
+}
+
+/// Readiness is decided in the same owner turn as encryption. A snapshot read
+/// by the sender cannot exclude an epoch reset queued ahead of its frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MediaOutcome {
+    Encrypted,
+    NotReady,
 }
 
 pub(crate) struct MediaEncryptor {
@@ -119,6 +145,14 @@ impl Handle {
             let mut core = core;
             while let Some(command) = receiver.recv().await {
                 match command {
+                    #[cfg(test)]
+                    Command::PrepareFixtureEpoch { reply } => {
+                        // Models the fresh, authenticated MLS exchange after an
+                        // epoch reset using the existing real crypto fixtures.
+                        core = prepared_fixture_core();
+                        state_tx.send_replace(core.snapshot());
+                        let _ = reply.send(());
+                    }
                     Command::Control { control, reply } => {
                         let result = core.control(control);
                         state_tx.send_replace(core.snapshot());
@@ -130,7 +164,13 @@ impl Handle {
                         mut output,
                         reply,
                     } => {
-                        let result = core.encrypt_into(&frame[..len], &mut output);
+                        let result = if core.snapshot().ready {
+                            core.encrypt_into(&frame[..len], &mut output)
+                                .map(|()| MediaOutcome::Encrypted)
+                        } else {
+                            output.clear();
+                            Ok(MediaOutcome::NotReady)
+                        };
                         let _ = reply
                             .send(EncryptedBuffers {
                                 frame,
@@ -153,6 +193,10 @@ impl Handle {
 
     pub(crate) fn snapshot(&self) -> Snapshot {
         *self.inner.state.borrow()
+    }
+
+    pub(crate) fn subscribe(&self) -> watch::Receiver<Snapshot> {
+        self.inner.state.clone()
     }
 
     pub(crate) fn media_encryptor(&self) -> MediaEncryptor {
@@ -215,6 +259,30 @@ impl MediaEncryptor {
 impl Handle {
     pub(crate) fn spawn_ready_fixture(capacity: usize) -> Self {
         Self::spawn_core(ready_fixture_core(), capacity)
+    }
+
+    pub(crate) async fn prepare_fixture_epoch(&self) {
+        let (reply, response) = oneshot::channel();
+        self.inner
+            .commands
+            .send(Command::PrepareFixtureEpoch { reply })
+            .await
+            .unwrap();
+        response.await.unwrap();
+    }
+
+    pub(crate) fn queue_fixture_epoch_reset(&self) {
+        let (reply, _) = oneshot::channel();
+        self.inner
+            .commands
+            .try_send(Command::Control {
+                control: Control::PrepareEpoch {
+                    protocol_version: 1,
+                    epoch: 1,
+                },
+                reply,
+            })
+            .unwrap();
     }
 }
 
@@ -1406,7 +1474,7 @@ mod tests {
             .unwrap();
 
         let before = before_responses.recv().await.unwrap();
-        assert!(matches!(before.result, Err(Failure::InvalidState)));
+        assert_eq!(before.result, Ok(MediaOutcome::NotReady));
         assert!(before.output.is_empty());
 
         assert!(execute_response.await.unwrap().unwrap().is_empty());

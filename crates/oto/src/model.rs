@@ -661,6 +661,17 @@ impl ConnectionSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConnectionEvent {
+    /// Redaction-safe DAVE control transition, emitted only when state changes.
+    DaveStateChanged {
+        /// Connection generation receiving the control.
+        generation: ConnectionGeneration,
+        /// Discord voice opcode (e.g. 24 Prepare Epoch, 29 Commit, 30 Welcome).
+        opcode: u8,
+        /// DAVE lifecycle state before the control.
+        before: DaveContext,
+        /// DAVE lifecycle state after the control.
+        after: DaveContext,
+    },
     /// The durable connection lifecycle phase changed.
     StateChanged {
         /// Connection generation that changed.

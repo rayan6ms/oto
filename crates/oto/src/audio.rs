@@ -567,11 +567,15 @@ struct Executor {
     deadlines: mpsc::Receiver<Instant>,
     gateway: mpsc::Sender<GatewayCommand>,
     connection: watch::Receiver<ConnectionSnapshot>,
+    dave_state: Option<watch::Receiver<dave::Snapshot>>,
     connection_shutdown: watch::Receiver<bool>,
     cancel: watch::Receiver<bool>,
     commands: mpsc::Receiver<AudioCommand>,
     store: AudioStore,
     frame: Vec<u8>,
+    // The already-polled Opus frame survives a DAVE reset or transport renewal.
+    // Its bytes stay in `frame`; no second allocation or unbounded queue.
+    staged_frame_len: Option<usize>,
     dave_frame: Vec<u8>,
     packet: Vec<u8>,
     connection_was_ready: bool,
@@ -603,6 +607,7 @@ async fn run_audio(
         id: input.id,
         source: SourceSlot::new(input.source, SourceGeneration::FIRST, &wake),
         wake,
+        dave_state: input.transport.dave.as_ref().map(dave::Handle::subscribe),
         transport: Some(input.transport),
         transport_updates: input.transport_updates,
         pacer,
@@ -619,6 +624,7 @@ async fn run_audio(
             counters,
         },
         frame: vec![0; input.max_frame_bytes],
+        staged_frame_len: None,
         dave_frame: Vec::new(),
         packet: Vec::with_capacity(input.max_datagram_bytes),
         connection_was_ready: false,
@@ -687,6 +693,10 @@ impl Executor {
                         if changed.is_err() { return Ok(()); }
                         self.handle_connection_change().await?;
                     }
+                    changed = dave_changed(&mut self.dave_state) => {
+                        changed?;
+                        self.handle_connection_change().await?;
+                    }
                     deadline = self.deadlines.recv() => {
                         let Some(deadline) = deadline else { return Err(pacer_error(PacerFailure::Closed)); };
                         self.handle_deadline(deadline).await?;
@@ -712,6 +722,10 @@ impl Executor {
                         if changed.is_err() { return Ok(()); }
                         self.handle_connection_change().await?;
                     }
+                    changed = dave_changed(&mut self.dave_state) => {
+                        changed?;
+                        self.handle_connection_change().await?;
+                    }
                     _ = self.wake.notify.notified() => {
                         if self.wake.latest_generation.load(Ordering::Acquire) == self.source.generation.get() {
                             self.try_start().await?;
@@ -732,7 +746,7 @@ impl Executor {
                 self.store.phase(AudioPhase::Starting);
                 self.set_speaking(true).await?;
                 if !self.connection_ready() {
-                    self.speaking = false;
+                    self.connection_was_ready = false;
                     return Ok(());
                 }
                 if let Ok(command) = self.commands.try_recv() {
@@ -755,16 +769,33 @@ impl Executor {
                             .await
                             .map_err(pacer_error)?;
                     }
-                    SendOutcome::Renewing => self.store.phase(AudioPhase::Starting),
+                    SendOutcome::Renewing | SendOutcome::AwaitingDave => {
+                        self.connection_was_ready = false;
+                        self.store.phase(AudioPhase::Starting);
+                    }
                 }
             }
+            Polled::Pending if self.speaking => self.resume_silence_drain().await?,
             Polled::Pending => self.store.phase(AudioPhase::WaitingForSource),
             Polled::Ended => {
                 self.source_ended = true;
-                self.store.phase(AudioPhase::Stopped);
+                if self.speaking {
+                    self.resume_silence_drain().await?;
+                } else {
+                    self.store.phase(AudioPhase::Stopped);
+                }
             }
         }
         Ok(())
+    }
+
+    async fn resume_silence_drain(&mut self) -> Result<(), Error> {
+        self.active_timeline = true;
+        self.store.phase(AudioPhase::DrainingSilence);
+        self.pacer
+            .activate(Instant::now() + FRAME_PERIOD)
+            .await
+            .map_err(pacer_error)
     }
 
     async fn handle_deadline(&mut self, deadline: Instant) -> Result<(), Error> {
@@ -793,7 +824,8 @@ impl Executor {
                 self.silence_sent = 0;
                 self.source_ended = false;
                 self.store.phase(AudioPhase::Sending);
-                if self.send_payload(len, false).await? == SendOutcome::Renewing {
+                if self.send_payload(len, false).await? != SendOutcome::Sent {
+                    self.connection_was_ready = false;
                     self.pause_timeline().await?;
                     self.store.phase(AudioPhase::Starting);
                 }
@@ -802,7 +834,8 @@ impl Executor {
                 AudioCounters::increment(&self.store.counters.frames_unavailable);
                 self.source_ended |= matches!(polled, Polled::Ended);
                 self.store.phase(AudioPhase::DrainingSilence);
-                if self.send_silence().await? == SendOutcome::Renewing {
+                if self.send_silence().await? != SendOutcome::Sent {
+                    self.connection_was_ready = false;
                     self.pause_timeline().await?;
                     self.store.phase(AudioPhase::Starting);
                     return Ok(());
@@ -851,6 +884,7 @@ impl Executor {
                     return Err(error);
                 };
                 self.source = SourceSlot::new(source, generation, &self.wake);
+                self.staged_frame_len = None;
                 self.source_ended = false;
                 self.silence_sent = 0;
                 self.store.replace_generation(generation);
@@ -884,6 +918,7 @@ impl Executor {
                     return Err(error);
                 };
                 self.source.generation = generation;
+                self.staged_frame_len = None;
                 self.store.invalidate_generation(generation);
                 self.stop_reply = Some(reply);
                 self.source_ended = true;
@@ -911,6 +946,7 @@ impl Executor {
         };
         self.pause_timeline().await?;
         self.speaking = false;
+        self.dave_state = update.dave.as_ref().map(dave::Handle::subscribe);
         if update.dave_protocol_version != 0
             && !update
                 .dave
@@ -938,7 +974,20 @@ impl Executor {
         self.connection_was_ready = ready;
         if !ready {
             self.pause_timeline().await?;
-            self.speaking = false;
+            // A same-transport DAVE rekey does not clear the gateway's Speaking
+            // bit. Preserve our knowledge of it so Stop still clears it and
+            // resumption needs no redundant Speaking round trip.
+            let state = self.connection.borrow();
+            if !matches!(
+                state.phase(),
+                ConnectionPhase::Connected | ConnectionPhase::EstablishingDave
+            ) || !self
+                .transport
+                .as_ref()
+                .is_some_and(|t| t.generation == state.generation())
+            {
+                self.speaking = false;
+            }
             self.store.phase(AudioPhase::Starting);
         } else if became_ready && !self.active_timeline {
             self.try_start().await?;
@@ -951,10 +1000,19 @@ impl Executor {
         let Some(transport) = &self.transport else {
             return false;
         };
-        state.phase() == ConnectionPhase::Connected && state.generation() == transport.generation
+        state.phase() == ConnectionPhase::Connected
+            && state.generation() == transport.generation
+            && (transport.dave_protocol_version == 0
+                || self
+                    .dave_state
+                    .as_ref()
+                    .is_some_and(|state| state.borrow().ready))
     }
 
     fn poll_source(&mut self) -> Result<Polled, Error> {
+        if let Some(len) = self.staged_frame_len {
+            return Ok(Polled::Frame(len));
+        }
         let mut cx = Context::from_waker(&self.source.waker);
         self.wake.begin_poll();
         #[cfg(target_os = "linux")]
@@ -1000,6 +1058,7 @@ impl Executor {
         self.wake.end_poll();
         match result {
             Poll::Ready(FrameStatus::Frame { len }) if (1..=self.frame.len()).contains(&len) => {
+                self.staged_frame_len = Some(len);
                 Ok(Polled::Frame(len))
             }
             Poll::Ready(FrameStatus::Frame { .. }) => Err(audio_error(
@@ -1052,7 +1111,7 @@ impl Executor {
                 })?;
             self.frame = buffers.frame;
             self.dave_frame = buffers.output;
-            buffers.result.map_err(|source| {
+            let outcome = buffers.result.map_err(|source| {
                 audio_error(
                     ErrorKind::DaveTransition,
                     Operation::StartAudio,
@@ -1061,6 +1120,9 @@ impl Executor {
                 )
                 .with_source(source)
             })?;
+            if outcome == dave::MediaOutcome::NotReady {
+                return Ok(SendOutcome::AwaitingDave);
+            }
             Some(self.dave_frame.as_slice())
         } else {
             None
@@ -1097,6 +1159,7 @@ impl Executor {
         }
         match timeout(FRAME_PERIOD, transport.socket.send(&self.packet)).await {
             Ok(Ok(written)) if written == self.packet.len() => {
+                self.staged_frame_len = None;
                 let now = Instant::now();
                 if let Some(previous) = self.last_packet_sent.replace(now) {
                     self.store
@@ -1213,6 +1276,22 @@ enum Polled {
 enum SendOutcome {
     Sent,
     Renewing,
+    AwaitingDave,
+}
+
+async fn dave_changed(state: &mut Option<watch::Receiver<dave::Snapshot>>) -> Result<(), Error> {
+    let Some(state) = state else {
+        return std::future::pending().await;
+    };
+    state.changed().await.map_err(|_| {
+        audio_error(
+            ErrorKind::DaveTransition,
+            Operation::StartAudio,
+            RetryDisposition::Fatal,
+            "DAVE readiness owner stopped",
+        )
+        .with_source(crate::DaveFailure::Closed)
+    })
 }
 
 async fn timed_gateway_send(
@@ -1483,6 +1562,7 @@ mod tests {
             deadlines,
             gateway,
             connection,
+            dave_state: None,
             connection_shutdown,
             cancel,
             commands,
@@ -1493,6 +1573,7 @@ mod tests {
                 counters: counters.clone(),
             },
             frame: vec![0; 1_275],
+            staged_frame_len: None,
             dave_frame: Vec::new(),
             packet: Vec::with_capacity(2_048),
             connection_was_ready: true,
@@ -1759,7 +1840,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dave_encryption_failure_emits_no_plaintext_udp_and_clears_speaking() {
+    async fn unready_dave_waits_without_plaintext_and_stop_remains_responsive() {
         let (sink, socket) = connected_udp_pair().await;
         let encoder = TransportEncoder::new(
             TransportMode::Aes256GcmRtpSize,
@@ -1825,29 +1906,13 @@ mod tests {
             fail_udp_sends: Arc::new(AtomicBool::new(false)),
         });
 
-        timeout(Duration::from_secs(1), async {
-            while control.snapshot().phase() != AudioPhase::Failed {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("DAVE encryption failure is terminal");
-        assert_eq!(
-            control.snapshot().failure(),
-            Some(ErrorKind::DaveTransition)
-        );
-        assert_eq!(
-            control.snapshot().dave_failure(),
-            Some(crate::DaveFailure::InvalidState)
-        );
-        assert_eq!(
-            control.snapshot().dave_context(),
-            Some(crate::DaveContext {
-                active_version: 0,
-                transition_pending: false,
-                ready: false,
-            })
-        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_ne!(control.snapshot().phase(), AudioPhase::Failed);
+        assert_eq!(control.snapshot().stats().frames_sent(), 0);
+        timeout(Duration::from_millis(100), control.stop())
+            .await
+            .expect("Stop does not wait for an unready DAVE owner")
+            .expect("Stop succeeds");
         let mut packet = [0_u8; 2_048];
         assert!(
             timeout(Duration::from_millis(40), sink.recv(&mut packet))
@@ -1855,6 +1920,265 @@ mod tests {
                 .is_err(),
             "failed DAVE encryption cannot fall back to plaintext UDP"
         );
+        gateway_task.await.expect("gateway responder completes");
+        drop((
+            transport_updates_tx,
+            connection_tx,
+            connection_shutdown_tx,
+            pacer_owner,
+        ));
+        assert_eq!(
+            *speaking.lock().expect("speaking record mutex"),
+            Vec::<bool>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn dave_epoch_reset_during_speaking_preserves_sender_and_accepts_stop() {
+        verify_epoch_reset(0, false).await;
+    }
+
+    #[tokio::test]
+    async fn dave_epoch_reset_resumes_retained_frame_without_gateway_phase_update() {
+        for owned in [false, true] {
+            verify_epoch_reset(1, owned).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn dave_epoch_reset_source_replacement_discards_old_staged_frame() {
+        for owned in [false, true] {
+            verify_epoch_reset(2, owned).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn dave_epoch_reset_queued_ahead_of_inflight_media_retains_frame() {
+        verify_epoch_reset(3, false).await;
+    }
+
+    #[tokio::test]
+    async fn dave_epoch_reset_during_terminal_drain_finishes_exact_silence_tail() {
+        verify_epoch_reset(4, false).await;
+    }
+
+    struct ResetSecondFrame {
+        owner: dave::Handle,
+        polls: usize,
+    }
+
+    impl FrameSource for ResetSecondFrame {
+        fn poll_frame(&mut self, _cx: &mut Context<'_>, output: &mut [u8]) -> Poll<FrameStatus> {
+            self.polls += 1;
+            let len = match self.polls {
+                1 => 64,
+                2 => {
+                    // FIFO owner commands put this reset ahead of the media
+                    // request, after the sender's readiness check has passed.
+                    self.owner.queue_fixture_epoch_reset();
+                    128
+                }
+                _ => return Poll::Ready(FrameStatus::Ended),
+            };
+            output[..len].fill(0x55);
+            Poll::Ready(FrameStatus::Frame { len })
+        }
+    }
+
+    async fn verify_epoch_reset(action: u8, owned: bool) {
+        let (sink, socket) = connected_udp_pair().await;
+        let encoder = TransportEncoder::new(
+            TransportMode::Aes256GcmRtpSize,
+            &[0x42; 32],
+            7,
+            1_275 + dave::OPUS_MAX_ENCRYPTION_OVERHEAD_BYTES,
+            2_048,
+        )
+        .expect("transport encoder initializes");
+        let dave = dave::Handle::spawn_ready_fixture(8);
+        let reset_owner = dave.clone();
+        let recovery_owner = dave.clone();
+        let dave_media = dave.media_encryptor();
+        let pacer_owner = Pacer::new();
+        let pacer = pacer_owner.register().await.expect("pacer registers");
+        let (gateway, mut gateway_rx) = mpsc::channel(8);
+        let speaking = Arc::new(Mutex::new(Vec::new()));
+        let speaking_observer = speaking.clone();
+        let gateway_task = tokio::spawn(async move {
+            let mut reset = false;
+            while let Some(command) = gateway_rx.recv().await {
+                match command {
+                    GatewayCommand::Speaking {
+                        speaking, reply, ..
+                    } => {
+                        speaking_observer
+                            .lock()
+                            .expect("speaking record mutex")
+                            .push(speaking);
+                        if speaking && !reset && action < 3 {
+                            reset_owner
+                                .control(dave::Control::PrepareEpoch {
+                                    protocol_version: 1,
+                                    epoch: 1,
+                                })
+                                .await
+                                .unwrap();
+                            reset = true;
+                        }
+                        let _ = reply.send(Ok(()));
+                    }
+                    GatewayCommand::DetachAudio { reply, .. } => {
+                        let _ = reply.send(());
+                        break;
+                    }
+                    _ => panic!("unexpected gateway command in DAVE failure test"),
+                }
+            }
+        });
+        let (transport_updates_tx, transport_updates) = mpsc::channel(1);
+        let (connection_tx, connection_state) = connected_state();
+        let (connection_shutdown_tx, connection_shutdown) = watch::channel(false);
+        let (events, _) = broadcast::channel(8);
+        let control = AudioControl::spawn(SpawnAudio {
+            id: 2,
+            source: if action == 3 {
+                AudioSource::Callback(Box::new(ResetSecondFrame {
+                    owner: recovery_owner.clone(),
+                    polls: 0,
+                }))
+            } else if owned {
+                let (mut writer, reader) = crate::frame_channel();
+                let mut send = Box::pin(writer.send(&[0x55; 128]));
+                use std::future::Future;
+                assert!(
+                    send.as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop()))
+                        .is_pending()
+                );
+                drop(send);
+                drop(writer);
+                AudioSource::Channel(reader)
+            } else {
+                AudioSource::Callback(Box::new(OneFrameSource {
+                    frame: Some(vec![0x55; 128]),
+                }))
+            },
+            transport: InstalledTransport {
+                generation: ConnectionGeneration::FIRST,
+                socket: Arc::new(socket),
+                encoder,
+                validity: TransportValidity::new(),
+                dave_protocol_version: 1,
+                dave: Some(dave),
+                dave_media: Some(dave_media),
+            },
+            transport_updates,
+            pacer,
+            gateway_commands: gateway,
+            connection_state,
+            connection_shutdown,
+            events,
+            command_capacity: 8,
+            max_frame_bytes: 1_275,
+            max_datagram_bytes: 2_048,
+            active: Arc::new(AtomicBool::new(true)),
+            fail_udp_sends: Arc::new(AtomicBool::new(false)),
+        });
+
+        if action == 4 {
+            timeout(Duration::from_secs(1), async {
+                while control.snapshot().stats().silence_frames_sent() < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            recovery_owner
+                .control(dave::Control::PrepareEpoch {
+                    protocol_version: 1,
+                    epoch: 1,
+                })
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        assert_ne!(
+            control.snapshot().phase(),
+            AudioPhase::Failed,
+            "an epoch reset is temporary, not a terminal encryption failure: {:?}",
+            control.snapshot()
+        );
+        assert_eq!(
+            control.snapshot().stats().frames_sent(),
+            if action >= 3 { 1 } else { 0 }
+        );
+        let mut packet = [0_u8; 2_048];
+        while sink.try_recv(&mut packet).is_ok() {}
+        assert!(
+            timeout(Duration::from_millis(40), sink.recv(&mut packet))
+                .await
+                .is_err(),
+            "not-ready DAVE sends no plaintext or transport-only packet"
+        );
+        if action != 0 {
+            if action == 2 {
+                timeout(
+                    Duration::from_millis(100),
+                    control.sender().replace_source(OneFrameSource {
+                        frame: Some(vec![0x77; 64]),
+                    }),
+                )
+                .await
+                .expect("replacement remains responsive during rekey")
+                .unwrap();
+            }
+            recovery_owner.prepare_fixture_epoch().await;
+            recovery_owner
+                .control(dave::Control::ExecuteTransition { id: 7 })
+                .await
+                .unwrap();
+            // The gateway phase deliberately stays Connected throughout. The
+            // DAVE watch alone must wake and resume the retained source.
+            let len = timeout(Duration::from_secs(1), sink.recv(&mut packet))
+                .await
+                .expect("pending frame resumes after key establishment")
+                .unwrap();
+            let decoded = decrypt_transport_packet(
+                OracleMode::Aes256GcmRtpSize,
+                &[0x42; 32],
+                &packet[..len],
+                2_048,
+            )
+            .unwrap();
+            let expected_len = match action {
+                2 => 64,
+                4 => SILENCE.len(),
+                _ => 128,
+            };
+            assert!(
+                decoded.payload.len() > expected_len && decoded.payload.len() <= expected_len + 16,
+                "exact pending source frame, not an EOF silence frame: {}",
+                decoded.payload.len()
+            );
+            assert!(decoded.payload.ends_with(&[0xFA, 0xFA]));
+            timeout(Duration::from_secs(1), async {
+                while control.snapshot().stats().silence_frames_sent() != u64::from(SILENCE_FRAMES)
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("source finishes with its normal bounded silence drain");
+            assert_eq!(
+                control.snapshot().stats().frames_sent(),
+                if action == 3 { 2 } else { 1 },
+                "no dropped or duplicated source frame"
+            );
+        }
+        timeout(Duration::from_millis(100), control.stop())
+            .await
+            .expect("Stop remains responsive during DAVE establishment")
+            .expect("sender stops cleanly");
         gateway_task.await.expect("gateway responder completes");
         drop((
             transport_updates_tx,
