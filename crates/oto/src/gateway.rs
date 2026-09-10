@@ -403,9 +403,13 @@ pub(crate) async fn run(
     let mut transport = None;
     let mut audio_attachment = None;
     let mut dave = None;
+    let mut dave_deadline = None;
     let mut dave_roster = Vec::new();
 
     'control: loop {
+        if dave.is_none() {
+            dave_deadline = None;
+        }
         if *shutdown.borrow() {
             finish_shutdown(&mut store, &mut initial);
             return;
@@ -457,6 +461,12 @@ pub(crate) async fn run(
                         finish_shutdown(&mut store, &mut initial);
                         return;
                     }
+                }
+                () = wait_dave_deadline(dave_deadline) => {
+                    let error = dave_error(store.generation())
+                        .with_source(crate::DaveFailure::ResponseTimeout);
+                    terminal(&mut store, &mut initial, error);
+                    return;
                 }
                 command = commands.recv() => {
                     match command {
@@ -579,6 +589,7 @@ pub(crate) async fn run(
             &mut transport,
             &mut audio_attachment,
             &mut dave,
+            &mut dave_deadline,
             &mut dave_roster,
             &mut commands,
             &mut shutdown,
@@ -742,6 +753,14 @@ pub(crate) async fn run(
     }
 }
 
+async fn wait_dave_deadline(deadline: Option<Instant>) {
+    if let Some(deadline) = deadline {
+        sleep_until(deadline).await;
+    } else {
+        pending::<()>().await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_session(
     mut websocket: ClientWebSocket,
@@ -754,13 +773,13 @@ async fn run_session(
     transport: &mut Option<UdpTransport>,
     audio_attachment: &mut Option<(u64, mpsc::Sender<InstalledTransport>)>,
     dave: &mut Option<dave::Handle>,
+    dave_deadline: &mut Option<Instant>,
     dave_roster: &mut Vec<u64>,
     commands: &mut mpsc::Receiver<Command>,
     shutdown: &mut watch::Receiver<bool>,
     store: &mut StateStore,
     initial: &mut Option<oneshot::Sender<Result<(), Error>>>,
 ) -> SessionOutcome {
-    let mut dave_deadline = None;
     let mut heartbeat_interval = None;
     let mut heartbeat_deadline = None;
     let mut outstanding = None::<(u64, Instant)>;
@@ -776,7 +795,7 @@ async fn run_session(
         if dave.as_ref().is_some_and(|owner| !owner.snapshot().ready) {
             dave_deadline.get_or_insert_with(|| Instant::now() + DAVE_READY_TIMEOUT);
         } else {
-            dave_deadline = None;
+            *dave_deadline = None;
         }
         let udp_socket = transport.as_ref().map(|transport| transport.socket.clone());
         let has_udp_socket = udp_socket.is_some();
@@ -789,10 +808,7 @@ async fn run_session(
                     return SessionOutcome::Shutdown;
                 }
             }
-            _ = async {
-                if let Some(deadline) = dave_deadline { sleep_until(deadline).await; }
-                else { pending::<()>().await; }
-            } => {
+            () = wait_dave_deadline(*dave_deadline) => {
                 return SessionOutcome::Fatal(dave_error(store.generation())
                     .with_source(crate::DaveFailure::ResponseTimeout)
                     .with_dave_context(dave.as_ref().expect("deadline requires DAVE owner").snapshot().into()));
@@ -3400,7 +3416,7 @@ mod tests {
 
     #[tokio::test]
     async fn missing_dave_successor_has_bounded_deadline_despite_duplicate_controls() {
-        for initially_ready in [false, true] {
+        for (initially_ready, resume) in [(false, false), (true, false), (true, true)] {
             let mut config = FakeVoiceGatewayConfig::local();
             config.dave_protocol_version = 1;
             config.heartbeat_interval = Duration::from_secs(300);
@@ -3429,6 +3445,18 @@ mod tests {
                 tokio::task::yield_now().await;
             }
             assert_ne!(connection.state().phase(), ConnectionPhase::Failed);
+            if resume {
+                // TLS/real sockets must make wall-clock progress during resume.
+                tokio::time::resume();
+                gateway
+                    .try_close(VoiceClose {
+                        code: 4015,
+                        reason: "resume must not replenish DAVE readiness budget".to_owned(),
+                    })
+                    .unwrap();
+                eventually(|| connection.state().stats().resume_successes() >= 1).await;
+                tokio::time::pause();
+            }
             tokio::time::advance(Duration::from_secs(5)).await;
             for _ in 0..100 {
                 tokio::task::yield_now().await;
