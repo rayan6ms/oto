@@ -39,6 +39,7 @@ pub mod __fuzzing {
 }
 
 pub use audio::{FrameSource, FrameStatus, PacedAudioSender};
+mod send_trace;
 pub use config::{Oto, OtoBuilder, ResourceLimits};
 pub use connection::{EventSubscriber, VoiceConnection};
 pub use error::{DaveContext, DaveFailure, Error, ErrorKind, Operation, RetryDisposition};
@@ -48,3 +49,4 @@ pub use model::{
     ConnectionPhase, ConnectionSnapshot, ConnectionStats, EventReceiveError, FailureSnapshot,
     SourceGeneration, VoiceConnectInfo, VoiceToken,
 };
+pub use send_trace::{SendRecord, SendTrace};

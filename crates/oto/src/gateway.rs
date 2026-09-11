@@ -2658,6 +2658,7 @@ mod tests {
         timelines: HashMap<std::net::SocketAddr, BenchmarkPeerTimeline>,
         lateness_nanos: Vec<u64>,
         interval_error_nanos: Vec<u64>,
+        interval_nanos: Vec<u64>,
     }
 
     struct BenchmarkUdpPeer {
@@ -2679,6 +2680,7 @@ mod tests {
                 timelines: HashMap::with_capacity(senders + 1),
                 lateness_nanos: Vec::with_capacity(sample_capacity),
                 interval_error_nanos: Vec::with_capacity(sample_capacity),
+                interval_nanos: Vec::with_capacity(sample_capacity),
             }));
             let (shutdown, mut shutdown_rx) = watch::channel(false);
             let task_state = state.clone();
@@ -2716,6 +2718,7 @@ mod tests {
                                 let interval = now.saturating_duration_since(last);
                                 let error = interval.abs_diff(FRAME_PERIOD);
                                 state.interval_error_nanos.push(duration_nanos(error));
+                                state.interval_nanos.push(duration_nanos(interval));
                             }
                             if let Some(expected) = expected {
                                 state.lateness_nanos.push(duration_nanos(
@@ -2739,6 +2742,7 @@ mod tests {
             state.media_packets = 0;
             state.lateness_nanos.clear();
             state.interval_error_nanos.clear();
+            state.interval_nanos.clear();
             for timeline in state.timelines.values_mut() {
                 timeline.last = None;
                 timeline.next = None;
@@ -4301,7 +4305,7 @@ mod tests {
         gateway.shutdown().await.expect("gateway shuts down");
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 28)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "release-only P07 production-path performance gate"]
     async fn p07_complete_non_dave_path_benchmark() {
         let sender_count = benchmark_env("OTO_P07_SENDERS", 250);
@@ -4396,7 +4400,7 @@ mod tests {
                 if ready && slow_sender.state().phase() == AudioPhase::Failed {
                     break;
                 }
-                tokio::task::yield_now().await;
+                sleep(Duration::from_millis(1)).await;
             }
         })
         .await
@@ -4432,24 +4436,23 @@ mod tests {
             .zip(&frames_before)
             .map(|(after, before)| after.saturating_sub(*before))
             .sum();
-        let (udp_packets, mut lateness, mut interval_error) = {
+        let (udp_packets, mut lateness, mut interval_error, mut intervals) = {
             let state = peer.state.lock().expect("benchmark peer mutex poisoned");
             (
                 state.media_packets,
                 state.lateness_nanos.clone(),
                 state.interval_error_nanos.clone(),
+                state.interval_nanos.clone(),
             )
         };
         let allocation_frames_before: u64 = senders
             .iter()
             .map(|sender| sender.state().stats().frames_sent())
             .sum();
-        let allocation_deadline =
-            std::time::Instant::now() + measurement.min(Duration::from_secs(1));
         let allocation_region = stats_alloc::Region::new(crate::TEST_ALLOCATOR);
-        while std::time::Instant::now() < allocation_deadline {
-            tokio::task::yield_now().await;
-        }
+        // Do not spin/yield for a second on a fractional-core host: that load
+        // perturbs scheduling and measures rebase/control allocations as audio.
+        sleep(measurement.min(Duration::from_secs(1))).await;
         let allocation = allocation_region.change();
         let allocation_frames = senders
             .iter()
@@ -4486,6 +4489,7 @@ mod tests {
             "schemaVersion": 1,
             "benchmarkId": "oto-p07-complete-non-dave",
             "profile": "release",
+            "runtimeWorkers": 2,
             "senders": sender_count,
             "oneSlowSource": true,
             "warmupMs": warmup.as_millis(),
@@ -4508,7 +4512,7 @@ mod tests {
                 "idle": idle_tasks,
                 "pending": pending_tasks,
                 "active": active_tasks,
-                "pacerCoordinators": 4
+                "pacerCoordinators": 0
             },
             "threads": {
                 "baseline": baseline_threads,
@@ -4541,6 +4545,11 @@ mod tests {
                 "allocationsPerFrame": allocation.allocations as f64 / allocation_frames.max(1) as f64
             },
             "timingNanos": {
+                "p99Interval": percentile(&mut intervals, 990),
+                "p999Interval": percentile(&mut intervals, 999),
+                "maxInterval": intervals.iter().copied().max().unwrap_or(0),
+                "gapsAtLeast40Ms": intervals.iter().filter(|&&n| n >= 40_000_000).count(),
+                "gapsAtLeast100Ms": intervals.iter().filter(|&&n| n >= 100_000_000).count(),
                 "p50Lateness": p50_lateness,
                 "p95Lateness": p95_lateness,
                 "p99Lateness": p99_lateness,

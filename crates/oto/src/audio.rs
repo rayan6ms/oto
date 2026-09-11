@@ -99,6 +99,26 @@ impl std::fmt::Debug for PacedAudioSender {
 }
 
 impl PacedAudioSender {
+    /// Starts optional RTP header/timing recording. No per-packet allocation or I/O.
+    /// Capacity must be 1..=4096; a full trace drops records, never audio.
+    /// Replaces an earlier trace. Dropping the consumer disables it on the next send.
+    pub async fn start_send_trace(&self, capacity: usize) -> Result<crate::SendTrace, Error> {
+        if !(1..=4096).contains(&capacity) {
+            return Err(audio_error(
+                ErrorKind::ResourceLimit,
+                Operation::StartAudio,
+                RetryDisposition::Fatal,
+                "trace capacity must be 1..=4096",
+            ));
+        }
+        let (writer, reader) = crate::send_trace::pair(capacity);
+        let (reply, response) = oneshot::channel();
+        self.control
+            .send(AudioCommand::Trace { writer, reply }, Operation::StartAudio)
+            .await?;
+        response.await.map_err(|_| gateway_stopped())?;
+        Ok(reader)
+    }
     /// Returns the latest durable audio state and low-cost counters.
     #[must_use]
     pub fn state(&self) -> AudioSnapshot {
@@ -353,6 +373,10 @@ impl AudioControl {
 }
 
 enum AudioCommand {
+    Trace {
+        writer: crate::send_trace::TraceWriter,
+        reply: oneshot::Sender<()>,
+    },
     Replace {
         source: AudioSource,
         reply: oneshot::Sender<Result<SourceGeneration, Error>>,
@@ -558,13 +582,13 @@ impl AudioCounters {
 }
 
 struct Executor {
+    trace: Option<crate::send_trace::TraceWriter>,
     id: u64,
     source: SourceSlot,
     wake: Arc<WakeShared>,
     transport: Option<InstalledTransport>,
     transport_updates: mpsc::Receiver<InstalledTransport>,
     pacer: PacerRegistration,
-    deadlines: mpsc::Receiver<Instant>,
     gateway: mpsc::Sender<GatewayCommand>,
     connection: watch::Receiver<ConnectionSnapshot>,
     dave_state: Option<watch::Receiver<dave::Snapshot>>,
@@ -601,9 +625,9 @@ async fn run_audio(
         latest_generation: AtomicU64::new(0),
         notify: tokio::sync::Notify::new(),
     });
-    let mut pacer = input.pacer;
-    let deadlines = pacer.take_deadlines();
+    let pacer = input.pacer;
     let mut executor = Executor {
+        trace: None,
         id: input.id,
         source: SourceSlot::new(input.source, SourceGeneration::FIRST, &wake),
         wake,
@@ -611,7 +635,6 @@ async fn run_audio(
         transport: Some(input.transport),
         transport_updates: input.transport_updates,
         pacer,
-        deadlines,
         gateway: input.gateway_commands,
         connection: input.connection_state,
         connection_shutdown: input.connection_shutdown,
@@ -697,7 +720,7 @@ impl Executor {
                         changed?;
                         self.handle_connection_change().await?;
                     }
-                    deadline = self.deadlines.recv() => {
+                    deadline = self.pacer.next_deadline() => {
                         let Some(deadline) = deadline else { return Err(pacer_error(PacerFailure::Closed)); };
                         self.handle_deadline(deadline).await?;
                         if self.stop_reply.is_some() && !self.active_timeline { return Ok(()); }
@@ -750,9 +773,16 @@ impl Executor {
                     return Ok(());
                 }
                 if let Ok(command) = self.commands.try_recv() {
-                    self.set_speaking(false).await?;
-                    let _ = self.handle_command(Some(command)).await?;
-                    return Ok(());
+                    if let AudioCommand::Trace { writer, reply } = command {
+                        // Diagnostics do not invalidate a staged first frame or
+                        // consume its readiness notification during startup.
+                        self.trace = Some(writer);
+                        let _ = reply.send(());
+                    } else {
+                        self.set_speaking(false).await?;
+                        let _ = self.handle_command(Some(command)).await?;
+                        return Ok(());
+                    }
                 }
                 if staged_generation != self.source.generation {
                     self.set_speaking(false).await?;
@@ -812,7 +842,7 @@ impl Executor {
         // A delayed opportunity still permits one current frame. Dropping the
         // opportunity here adds another timer wait after a host scheduling
         // stall. The completion path below rebases the next deadline and
-        // discards a queued old tick, so recovery cannot burst a backlog.
+        // replaces the old deadline, so recovery cannot burst a backlog.
 
         let polled = if self.stop_reply.is_some() {
             Polled::Ended
@@ -854,17 +884,17 @@ impl Executor {
         }
         // The opportunity itself, polling, or encryption may be late.
         // Preserve that valid frame, but start the next opportunity a
-        // full period from completion instead of consuming a queued old tick.
+        // full period from completion instead of consuming an old deadline.
         if self.active_timeline {
             let completed = Instant::now();
             let lateness = completed.saturating_duration_since(deadline);
+            self.pacer.complete(deadline, completed);
+            self.store
+                .counters
+                .skipped_deadlines
+                .store(self.pacer.skipped(), Ordering::Relaxed);
             if lateness >= FRAME_PERIOD {
                 self.store.counters.observe_lateness(lateness);
-                self.pacer
-                    .activate(completed + FRAME_PERIOD)
-                    .await
-                    .map_err(pacer_error)?;
-                let _ = self.deadlines.try_recv();
             }
         }
         Ok(())
@@ -872,6 +902,11 @@ impl Executor {
 
     async fn handle_command(&mut self, command: Option<AudioCommand>) -> Result<bool, Error> {
         match command {
+            Some(AudioCommand::Trace { writer, reply }) => {
+                self.trace = Some(writer);
+                let _ = reply.send(());
+                Ok(true)
+            }
             Some(AudioCommand::Replace { source, reply }) => {
                 let Some(generation) = self.source.generation.next() else {
                     let error = audio_error(
@@ -1160,6 +1195,17 @@ impl Executor {
             if matches!(result, Ok(Ok(written)) if written == self.packet.len()) {
                 self.staged_frame_len = None;
                 let now = Instant::now();
+                if let Some(trace) = self.trace.as_mut()
+                    && !trace.record(
+                        now,
+                        &self.packet[..12],
+                        transport.generation.get(),
+                        self.source.generation.get(),
+                        silence,
+                    )
+                {
+                    self.trace = None;
+                }
                 if let Some(previous) = self.last_packet_sent.replace(now) {
                     self.store
                         .counters
@@ -1334,8 +1380,8 @@ async fn timed_gateway_send(
 }
 
 fn pacer_error(failure: PacerFailure) -> Error {
-    let kind = if failure == PacerFailure::Overloaded {
-        ErrorKind::Overloaded
+    let kind = if failure == PacerFailure::Exhausted {
+        ErrorKind::ResourceLimit
     } else {
         ErrorKind::Shutdown
     };
@@ -1343,7 +1389,7 @@ fn pacer_error(failure: PacerFailure) -> Error {
         kind,
         Operation::StartAudio,
         RetryDisposition::Fatal,
-        "shared pacing coordinator is unavailable",
+        "audio pacing registration is unavailable",
     )
 }
 
@@ -1540,8 +1586,7 @@ mod tests {
     async fn overdue_opportunity_recovers_one_frame_without_waiting_or_catchup() {
         let (_sink, socket) = connected_udp_pair().await;
         let owner = Pacer::new();
-        let mut pacer = owner.register().await.unwrap();
-        let deadlines = pacer.take_deadlines();
+        let pacer = owner.register().await.unwrap();
         let wake = Arc::new(WakeShared {
             poll_state: AtomicU8::new(0),
             latest_generation: AtomicU64::new(0),
@@ -1557,6 +1602,7 @@ mod tests {
         let (_shutdown_tx, connection_shutdown) = watch::channel(false);
         let counters = Arc::new(AudioCounters::default());
         let mut executor = Executor {
+            trace: None,
             id: 1,
             source: SourceSlot::new(
                 AudioSource::Callback(Box::new(ReadySource)),
@@ -1582,7 +1628,6 @@ mod tests {
             }),
             transport_updates,
             pacer,
-            deadlines,
             gateway,
             connection,
             dave_state: None,
@@ -1623,19 +1668,20 @@ mod tests {
                 "recovery should send once now instead of adding another timer wait"
             );
             assert!(
-                executor.deadlines.try_recv().is_err(),
+                futures_util::FutureExt::now_or_never(executor.pacer.next_deadline()).is_none(),
                 "no catch-up tick retained"
             );
             tokio::time::advance(FRAME_PERIOD - Duration::from_millis(1)).await;
             assert!(
-                executor.deadlines.try_recv().is_err(),
+                futures_util::FutureExt::now_or_never(executor.pacer.next_deadline()).is_none(),
                 "next frame must wait a full period"
             );
             tokio::time::advance(Duration::from_millis(1)).await;
             tokio::task::yield_now().await;
             let next = executor
-                .deadlines
-                .try_recv()
+                .pacer
+                .next_deadline()
+                .await
                 .expect("next normally spaced opportunity");
             executor.handle_deadline(next).await.unwrap();
             assert_eq!(counters.frames_sent.load(Ordering::Relaxed), before + 2);
@@ -1709,15 +1755,20 @@ mod tests {
 
     #[tokio::test]
     async fn complete_paced_path_dave_encrypts_maximum_opus_and_all_terminal_silence() {
-        verify_complete_paced_dave_path(false).await;
+        verify_complete_paced_dave_path(false, false).await;
     }
 
     #[tokio::test]
     async fn owned_channel_preserves_dave_and_exact_terminal_silence() {
-        verify_complete_paced_dave_path(true).await;
+        verify_complete_paced_dave_path(true, false).await;
     }
 
-    async fn verify_complete_paced_dave_path(channel: bool) {
+    #[tokio::test]
+    async fn tracing_queued_before_first_speaking_ack_preserves_staged_audio() {
+        verify_complete_paced_dave_path(true, true).await;
+    }
+
+    async fn verify_complete_paced_dave_path(channel: bool, tracing: bool) {
         const KEY: [u8; 32] = [0x42; 32];
         let normal_frame = vec![0x55; 1_275];
         let (sink, socket) = connected_udp_pair().await;
@@ -1804,6 +1855,13 @@ mod tests {
             fail_udp_sends: Arc::new(AtomicBool::new(false)),
         });
 
+        // On this current-thread runtime the command is queued before run_audio
+        // can resume. It must not consume the only source wakeup at the barrier.
+        let mut trace = if tracing {
+            Some(control.sender().start_send_trace(16).await.unwrap())
+        } else {
+            None
+        };
         let mut observed = Vec::new();
         let mut packet = [0_u8; 2_048];
         for index in 0..1 + usize::from(SILENCE_FRAMES) {
@@ -1849,6 +1907,13 @@ mod tests {
         .await
         .expect("silence drain completes");
         control.stop().await.expect("sender stops cleanly");
+        if let Some(trace) = trace.as_mut() {
+            let records: Vec<_> = std::iter::from_fn(|| trace.pop()).collect();
+            assert_eq!(records.len(), 6);
+            assert!(!records[0].silence);
+            assert!(records[1..].iter().all(|r| r.silence));
+            assert_eq!(trace.dropped(), 0);
+        }
         gateway_task.await.expect("gateway responder completes");
         drop((
             transport_updates_tx,
@@ -2306,6 +2371,11 @@ mod tests {
             fail_udp_sends: Arc::new(AtomicBool::new(false)),
         });
 
+        let mut trace = if std::env::var_os("OTO_P08_TRACE").is_some() {
+            Some(control.sender().start_send_trace(4096).await.unwrap())
+        } else {
+            None
+        };
         tokio::time::sleep(warmup).await;
         let frames_before = control.snapshot().stats().frames_sent();
         let udp_before = received.load(Ordering::Relaxed);
@@ -2339,10 +2409,28 @@ mod tests {
                 "bytesAllocatedPerFrame": allocation.bytes_allocated as f64 / frames.max(1) as f64,
             },
             "maxSenderLatenessNanos": control.snapshot().stats().max_lateness().as_nanos(),
+            "traceEnabled": trace.is_some(),
         });
         println!("P08_COMPLETE_PATH_BENCHMARK={result}");
         assert!(frames > 0);
         assert!(frames.abs_diff(udp_packets) <= 1);
+        if let Some(trace) = trace.as_mut() {
+            assert_eq!(
+                trace.dropped(),
+                0,
+                "trace benchmark must fit its bounded storage"
+            );
+            let mut prior: Option<crate::SendRecord> = None;
+            while let Some(record) = trace.pop() {
+                if let Some(p) = prior {
+                    assert_eq!(record.sequence, p.sequence.wrapping_add(1));
+                    assert_eq!(record.timestamp, p.timestamp.wrapping_add(960));
+                    assert!(record.elapsed_micros >= p.elapsed_micros);
+                }
+                prior = Some(record);
+            }
+            assert!(prior.is_some());
+        }
 
         control.stop().await.expect("benchmark sender stops");
         gateway_task.await.expect("gateway responder completes");

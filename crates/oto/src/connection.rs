@@ -316,8 +316,8 @@ impl VoiceConnection {
             .await
             .map_err(|failure| {
                 Error::new(
-                    if failure == crate::pacer::PacerFailure::Overloaded {
-                        ErrorKind::Overloaded
+                    if failure == crate::pacer::PacerFailure::Exhausted {
+                        ErrorKind::ResourceLimit
                     } else {
                         ErrorKind::Shutdown
                     },
@@ -325,7 +325,7 @@ impl VoiceConnection {
                     Some(self.state().generation()),
                     RetryDisposition::Fatal,
                     None,
-                    "shared pacing coordinator is unavailable",
+                    "audio pacing registration is unavailable",
                 )
             })?;
         let (updates, transport_updates) = mpsc::channel(1);
