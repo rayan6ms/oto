@@ -49,4 +49,4 @@ pub use model::{
     ConnectionPhase, ConnectionSnapshot, ConnectionStats, EventReceiveError, FailureSnapshot,
     SourceGeneration, VoiceConnectInfo, VoiceToken,
 };
-pub use send_trace::{SendRecord, SendTrace};
+pub use send_trace::{SendRecord, SendTiming, SendTrace};

@@ -583,6 +583,7 @@ impl AudioCounters {
 
 struct Executor {
     trace: Option<crate::send_trace::TraceWriter>,
+    send_timing: crate::send_trace::SendTiming,
     id: u64,
     source: SourceSlot,
     wake: Arc<WakeShared>,
@@ -628,6 +629,7 @@ async fn run_audio(
     let pacer = input.pacer;
     let mut executor = Executor {
         trace: None,
+        send_timing: Default::default(),
         id: input.id,
         source: SourceSlot::new(input.source, SourceGeneration::FIRST, &wake),
         wake,
@@ -763,6 +765,7 @@ impl Executor {
         if self.stop_reply.is_some() || !self.connection_ready() || self.transport.is_none() {
             return Ok(());
         }
+        self.send_timing = Default::default();
         match self.poll_source()? {
             Polled::Frame(len) => {
                 let staged_generation = self.source.generation;
@@ -830,6 +833,13 @@ impl Executor {
 
     async fn handle_deadline(&mut self, deadline: Instant) -> Result<(), Error> {
         let lateness = Instant::now().saturating_duration_since(deadline);
+        if self.trace.is_some() {
+            self.send_timing = crate::send_trace::SendTiming {
+                scheduled: true,
+                wake_lateness: crate::send_trace::micros(lateness),
+                ..Default::default()
+            };
+        }
         self.store
             .counters
             .skipped_deadlines
@@ -841,8 +851,8 @@ impl Executor {
 
         // A delayed opportunity still permits one current frame. Dropping the
         // opportunity here adds another timer wait after a host scheduling
-        // stall. The completion path below rebases the next deadline and
-        // replaces the old deadline, so recovery cannot burst a backlog.
+        // stall. The completion path rebases the next deadline and prevents
+        // a catch-up burst after that stall.
 
         let polled = if self.stop_reply.is_some() {
             Polled::Ended
@@ -1056,6 +1066,9 @@ impl Executor {
         let started = StdInstant::now();
         let result = self.source.source.poll_frame(&mut cx, &mut self.frame);
         let wall_elapsed = started.elapsed();
+        if self.trace.is_some() {
+            self.send_timing.source_poll = crate::send_trace::micros(wall_elapsed);
+        }
         if wall_elapsed > SOURCE_POLL_LIMIT
             && matches!(self.source.source, AudioSource::Callback(_))
         {
@@ -1130,6 +1143,8 @@ impl Executor {
             .as_mut()
             .and_then(|transport| transport.dave_media.as_mut());
         let dave_payload = if let Some(dave_media) = dave_media {
+            dave_media.measure = self.trace.is_some();
+            let started = self.trace.as_ref().map(|_| StdInstant::now());
             let frame = std::mem::take(&mut self.frame);
             let output = std::mem::take(&mut self.dave_frame);
             let buffers = dave_media
@@ -1144,6 +1159,11 @@ impl Executor {
                     )
                     .with_source(source)
                 })?;
+            if let Some(started) = started {
+                self.send_timing.dave_wait = crate::send_trace::micros(started.elapsed());
+                self.send_timing.dave_work_wall = buffers.work_wall_micros;
+                self.send_timing.dave_work_cpu = buffers.work_cpu_micros;
+            }
             self.frame = buffers.frame;
             self.dave_frame = buffers.output;
             let outcome = buffers.result.map_err(|source| {
@@ -1166,6 +1186,7 @@ impl Executor {
         let Some(transport) = self.transport.as_mut() else {
             return Ok(SendOutcome::Renewing);
         };
+        let crypto_started = self.trace.as_ref().map(|_| StdInstant::now());
         match transport.encoder.encrypt_next(payload, &mut self.packet) {
             Ok(()) => {}
             Err(TransportCryptoFailure::NonceExhausted) => {
@@ -1182,6 +1203,10 @@ impl Executor {
                 ));
             }
         }
+        if let Some(started) = crypto_started {
+            self.send_timing.transport_crypto = crate::send_trace::micros(started.elapsed());
+        }
+        let udp_started = self.trace.as_ref().map(|_| StdInstant::now());
         for attempt in 0..3 {
             #[cfg(test)]
             let injected = self.fail_udp_sends.load(Ordering::Acquire);
@@ -1195,6 +1220,9 @@ impl Executor {
             if matches!(result, Ok(Ok(written)) if written == self.packet.len()) {
                 self.staged_frame_len = None;
                 let now = Instant::now();
+                if let Some(started) = udp_started {
+                    self.send_timing.udp_wait = crate::send_trace::micros(started.elapsed());
+                }
                 if let Some(trace) = self.trace.as_mut()
                     && !trace.record(
                         now,
@@ -1202,6 +1230,7 @@ impl Executor {
                         transport.generation.get(),
                         self.source.generation.get(),
                         silence,
+                        self.send_timing,
                     )
                 {
                     self.trace = None;
@@ -1603,6 +1632,7 @@ mod tests {
         let counters = Arc::new(AudioCounters::default());
         let mut executor = Executor {
             trace: None,
+            send_timing: Default::default(),
             id: 1,
             source: SourceSlot::new(
                 AudioSource::Callback(Box::new(ReadySource)),

@@ -4,6 +4,50 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use tokio::time::Instant;
 
+/// Optional send-stage measurements, enabled only while a send trace is active.
+/// All values are microseconds. Wall durations include descheduling; DAVE CPU
+/// measures only the owner thread's encryption work on Linux.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SendTiming {
+    /// False for an initial or readiness-driven send without a timer deadline.
+    pub scheduled: bool,
+    /// Delay between the scheduled deadline and its handler starting.
+    pub wake_lateness: u64,
+    /// Wall time spent polling for the encoded source frame.
+    pub source_poll: u64,
+    /// Full DAVE command/response round trip, including queue waits.
+    pub dave_wait: u64,
+    /// Wall time inside the DAVE owner, excluding command/response queue waits.
+    pub dave_work_wall: u64,
+    /// `u64::MAX` when the platform cannot measure thread CPU time.
+    pub dave_work_cpu: u64,
+    /// Wall time encrypting the RTP transport payload.
+    pub transport_crypto: u64,
+    /// Wall time submitting UDP, including any retry delays.
+    pub udp_wait: u64,
+}
+
+impl SendTiming {
+    /// Stable trace schema: scheduled (0/1), wake lateness, source poll,
+    /// DAVE round trip, DAVE work wall/CPU, transport crypto, UDP wait.
+    pub fn as_micros(self) -> [u64; 8] {
+        [
+            u64::from(self.scheduled),
+            self.wake_lateness,
+            self.source_poll,
+            self.dave_wait,
+            self.dave_work_wall,
+            self.dave_work_cpu,
+            self.transport_crypto,
+            self.udp_wait,
+        ]
+    }
+}
+
+pub(crate) fn micros(duration: std::time::Duration) -> u64 {
+    duration.as_micros().min(u128::from(u64::MAX)) as u64
+}
+
 /// One successfully submitted UDP packet. Success is local submission, not delivery.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SendRecord {
@@ -23,6 +67,8 @@ pub struct SendRecord {
     pub sequence: u16,
     /// Whether this was one of Oto's terminal/underflow silence packets.
     pub silence: bool,
+    /// Stage timings for this packet, excluding work before tracing was enabled.
+    pub timing: SendTiming,
 }
 
 /// Single-consumer trace. Drain outside the audio task; dropping it disables tracing.
@@ -82,6 +128,7 @@ impl TraceWriter {
         connection: u64,
         source: u64,
         silence: bool,
+        timing: SendTiming,
     ) -> bool {
         if self.producer.is_abandoned() {
             return false;
@@ -99,6 +146,7 @@ impl TraceWriter {
             timestamp: u32::from_be_bytes(header[4..8].try_into().expect("RTP timestamp")),
             sequence: u16::from_be_bytes(header[2..4].try_into().expect("RTP sequence")),
             silence,
+            timing,
         };
         if self.producer.push(record).is_err() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -115,8 +163,18 @@ mod tests {
         let (mut writer, mut reader) = pair(1);
         let header = [0x80, 0x78, 0xff, 0xff, 0, 0, 3, 0xc0, 0, 0, 0, 7];
         let now = Instant::now();
-        assert!(writer.record(now, &header, 4, 8, false));
-        assert!(writer.record(now, &header, 4, 8, false));
+        let timing = SendTiming {
+            scheduled: true,
+            wake_lateness: 33000,
+            source_poll: 2,
+            dave_wait: 120,
+            dave_work_wall: 90,
+            dave_work_cpu: 80,
+            transport_crypto: 3,
+            udp_wait: 12,
+        };
+        assert!(writer.record(now, &header, 4, 8, false, timing));
+        assert!(writer.record(now, &header, 4, 8, false, SendTiming::default()));
         assert_eq!(reader.dropped(), 1);
         let first = reader.pop().unwrap();
         assert_eq!(
@@ -128,13 +186,14 @@ mod tests {
             (4, 8)
         );
         assert!(!first.silence);
+        assert_eq!(first.timing.as_micros(), [1, 33000, 2, 120, 90, 80, 3, 12]);
         tokio::time::advance(std::time::Duration::from_millis(20)).await;
-        writer.record(Instant::now(), &header, 5, 9, true);
+        writer.record(Instant::now(), &header, 5, 9, true, SendTiming::default());
         let third = reader.pop().unwrap();
         assert_eq!(third.index, 3);
         assert_eq!(third.elapsed_micros, 20000);
         assert!(third.silence);
         drop(reader);
-        assert!(!writer.record(Instant::now(), &header, 5, 9, false));
+        assert!(!writer.record(Instant::now(), &header, 5, 9, false, SendTiming::default()));
     }
 }

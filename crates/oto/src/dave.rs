@@ -103,6 +103,7 @@ enum Command {
         len: usize,
         output: Vec<u8>,
         reply: mpsc::Sender<EncryptedBuffers>,
+        measure: bool,
     },
 }
 
@@ -110,6 +111,8 @@ pub(crate) struct EncryptedBuffers {
     pub(crate) frame: Vec<u8>,
     pub(crate) output: Vec<u8>,
     pub(crate) result: Result<MediaOutcome, Failure>,
+    pub(crate) work_wall_micros: u64,
+    pub(crate) work_cpu_micros: u64,
 }
 
 /// Readiness is decided in the same owner turn as encryption. A snapshot read
@@ -124,6 +127,7 @@ pub(crate) struct MediaEncryptor {
     commands: mpsc::Sender<Command>,
     reply: mpsc::Sender<EncryptedBuffers>,
     responses: mpsc::Receiver<EncryptedBuffers>,
+    pub(crate) measure: bool,
 }
 
 impl std::fmt::Debug for MediaEncryptor {
@@ -163,7 +167,11 @@ impl Handle {
                         len,
                         mut output,
                         reply,
+                        measure,
                     } => {
+                        let wall = measure.then(std::time::Instant::now);
+                        #[cfg(target_os = "linux")]
+                        let cpu = measure.then(crate::audio::source_cpu_time);
                         let result = if core.snapshot().ready {
                             core.encrypt_into(&frame[..len], &mut output)
                                 .map(|()| MediaOutcome::Encrypted)
@@ -171,11 +179,23 @@ impl Handle {
                             output.clear();
                             Ok(MediaOutcome::NotReady)
                         };
+                        #[cfg(target_os = "linux")]
+                        let work_cpu_micros = cpu.map_or(0, |start| {
+                            crate::send_trace::micros(
+                                crate::audio::source_cpu_time().saturating_sub(start),
+                            )
+                        });
+                        #[cfg(not(target_os = "linux"))]
+                        let work_cpu_micros = u64::MAX;
+                        let work_wall_micros =
+                            wall.map_or(0, |start| crate::send_trace::micros(start.elapsed()));
                         let _ = reply
                             .send(EncryptedBuffers {
                                 frame,
                                 output,
                                 result,
+                                work_wall_micros,
+                                work_cpu_micros,
                             })
                             .await;
                     }
@@ -205,6 +225,7 @@ impl Handle {
             commands: self.inner.commands.clone(),
             reply,
             responses,
+            measure: false,
         }
     }
 
@@ -243,6 +264,7 @@ impl MediaEncryptor {
                 len,
                 output,
                 reply: self.reply.clone(),
+                measure: self.measure,
             }),
         )
         .await
@@ -1374,6 +1396,7 @@ mod tests {
             commands,
             reply,
             responses,
+            measure: false,
         };
         media
             .commands
@@ -1381,6 +1404,7 @@ mod tests {
                 frame: vec![1],
                 len: 1,
                 output: Vec::new(),
+                measure: false,
                 reply: media.reply.clone(),
             })
             .await
@@ -1413,6 +1437,7 @@ mod tests {
                 frame: vec![1, 2, 3],
                 len: 3,
                 output: Vec::new(),
+                measure: false,
                 reply,
             })
             .await
@@ -1448,6 +1473,7 @@ mod tests {
                 frame: frame.clone(),
                 len: frame.len(),
                 output: Vec::new(),
+                measure: false,
                 reply: before_reply,
             })
             .await
@@ -1468,6 +1494,7 @@ mod tests {
                 frame: frame.clone(),
                 len: frame.len(),
                 output: Vec::new(),
+                measure: false,
                 reply: after_reply,
             })
             .await
