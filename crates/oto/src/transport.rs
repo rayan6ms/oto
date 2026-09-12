@@ -107,6 +107,7 @@ pub(crate) async fn discover(
         .await
         .map_err(|_| DiscoveryFailure::TimedOut)?
         .map_err(DiscoveryFailure::Io)?;
+    apply_audio_qos(&socket);
 
     let request = build_discovery_request(ssrc);
     let mut response = vec![0_u8; max_datagram_bytes.saturating_add(1)];
@@ -135,6 +136,25 @@ pub(crate) async fn discover(
     }
     Err(DiscoveryFailure::TimedOut)
 }
+
+/// Optionally mark voice datagrams with an audio DSCP value. This is deliberately
+/// opt-in: many networks ignore or rewrite DSCP, and changing the default would
+/// make a transport experiment impossible to compare with existing runs. A
+/// failed best-effort mark never prevents a voice connection.
+#[cfg(target_os = "linux")]
+fn apply_audio_qos(socket: &UdpSocket) {
+    let Ok(raw) = std::env::var("RAYDIO_AUDIO_DSCP") else {
+        return;
+    };
+    let Ok(dscp) = raw.parse::<u8>() else { return };
+    if dscp > 63 {
+        return;
+    }
+    let _ = rustix::net::sockopt::set_ip_tos(socket, dscp << 2);
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_audio_qos(_socket: &UdpSocket) {}
 
 fn build_discovery_request(ssrc: u32) -> [u8; DISCOVERY_BYTES] {
     let mut request = [0_u8; DISCOVERY_BYTES];

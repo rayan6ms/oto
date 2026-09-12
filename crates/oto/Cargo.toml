@@ -27,7 +27,7 @@ tokio-tungstenite.workspace = true
 rtrb.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1.1.4", default-features = false, features = ["time", "std"] }
+rustix = { version = "1.1.4", default-features = false, features = ["net", "time", "std"] }
 
 [dev-dependencies]
 oto-testkit = { path = "../oto-testkit" }
