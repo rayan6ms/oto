@@ -150,7 +150,17 @@ fn apply_audio_qos(socket: &UdpSocket) {
     if dscp > 63 {
         return;
     }
-    let _ = rustix::net::sockopt::set_ip_tos(socket, dscp << 2);
+    // Discord currently commonly selects IPv4, but the voice gateway can
+    // return an IPv6 endpoint. Mark the address family actually in use.
+    match socket.peer_addr() {
+        Ok(std::net::SocketAddr::V4(_)) => {
+            let _ = rustix::net::sockopt::set_ip_tos(socket, dscp << 2);
+        }
+        Ok(std::net::SocketAddr::V6(_)) => {
+            let _ = rustix::net::sockopt::set_ipv6_tclass(socket, u32::from(dscp) << 2);
+        }
+        Err(_) => {}
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
