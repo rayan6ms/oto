@@ -381,6 +381,70 @@ mod tests {
 
     const KEY: [u8; 32] = [0x42; 32];
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn optional_qos_marks_both_families_without_altering_datagrams() {
+        // Environment configuration is isolated per child process; never
+        // mutate process-wide environment alongside Tokio's test threads.
+        if let Ok(expected) = std::env::var("OTO_QOS_TEST_TCLASS") {
+            let expected: u32 = expected.parse().unwrap();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                for address in ["127.0.0.1:0", "[::1]:0"] {
+                    let sink = UdpSocket::bind(address).await.unwrap();
+                    let socket = UdpSocket::bind(address).await.unwrap();
+                    socket.connect(sink.local_addr().unwrap()).await.unwrap();
+                    apply_audio_qos(&socket);
+                    let actual = if sink.local_addr().unwrap().is_ipv4() {
+                        u32::from(rustix::net::sockopt::ip_tos(&socket).unwrap())
+                    } else {
+                        rustix::net::sockopt::ipv6_tclass(&socket).unwrap()
+                    };
+                    assert_eq!(actual, expected);
+                    let packet = b"unchanged media packet";
+                    socket.send(packet).await.unwrap();
+                    let mut buffer = [0; 64];
+                    let length = timeout(Duration::from_secs(1), sink.recv(&mut buffer))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(&buffer[..length], packet);
+                }
+            });
+            return;
+        }
+        for (setting, expected) in [
+            (None, "0"),
+            (Some("0"), "0"),
+            (Some("46"), "184"),
+            (Some("63"), "252"),
+            (Some("64"), "0"),
+            (Some("46#"), "0"),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "transport::tests::optional_qos_marks_both_families_without_altering_datagrams",
+                ])
+                .env("OTO_QOS_TEST_TCLASS", expected)
+                .env_remove("RAYDIO_AUDIO_DSCP");
+            if let Some(value) = setting {
+                child.env("RAYDIO_AUDIO_DSCP", value);
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "setting {setting:?}: {} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
     fn oracle_mode(mode: TransportMode) -> OracleMode {
         match mode {
             TransportMode::Aes256GcmRtpSize => OracleMode::Aes256GcmRtpSize,
