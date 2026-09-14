@@ -18,6 +18,11 @@ use crate::pacer::{FRAME_PERIOD, PacerFailure, PacerRegistration};
 use crate::transport::{TransportCryptoFailure, TransportEncoder};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
+
+// Decision experiment only; not included in release libraries or the bot.
+#[cfg(test)]
+#[path = "sender_queue_experiment.rs"]
+mod sender_queue_experiment;
 const SOURCE_POLL_LIMIT: Duration = Duration::from_millis(2);
 const SILENCE: [u8; 3] = [0xF8, 0xFF, 0xFE];
 const SILENCE_FRAMES: u8 = 5;
