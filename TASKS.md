@@ -1,5 +1,16 @@
 # Current task: Raydio Oracle audio reliability
 
+## Sender queue decision experiment — 2026-09-15
+
+- [x] Correct the full-stream/native-feeder benchmark shortcut and record the withdrawn claims.
+- [x] Use incremental owned-channel production and actual DAVE encryption on the same two-worker runtime as the baseline; bound all prepared frames.
+- [x] Test 8/16 slots, both/one worker stalls, >buffer stalls, native sender stalls, explicit pause/fence/rekey/replacement, and warmed channel+DAVE allocations.
+- [x] Retain successful-send and independent-receiver interval arrays; run matched Oracle loopback trials without deploying or restarting services.
+- [x] Record conditional promotion decision: synthetic stall protection passes, Oracle continuity benefit is unestablished and production lifecycle integration is absent. Do not enable this test-only prototype or claim six-hour/Discord validation.
+
+Historical reliability items below predate this experiment; see Raydio's
+`docs/SENDER-QUEUE-VALIDATION-2026-09-15.md` for the current evidence and scope.
+
 - [ ] Diagnose wall-time source poll rejection under shared VM scheduling.
 - [ ] Add regression coverage and retain isolation of CPU-bound sources.
 - [ ] Measure transport pacing and source guard overhead; do not include the unrelated coordinator-count experiment.

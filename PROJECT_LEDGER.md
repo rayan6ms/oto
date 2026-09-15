@@ -58,3 +58,27 @@ unoptimized test). Caller CPU-heavy failure still passes unchanged. Two new
 regressions cover delivery and the poll-exit race; 81 tests and Clippy pass.
 Before/after 10-second DAVE benchmark: 501 packets/frames, zero allocations,
 max lateness 1.538/1.326 ms. No Oracle cause or audio-reliability claim yet.
+# Sender queue validation — 2026-09-15
+
+The earlier independent-sender experiment prepared the full DAVE stream and
+fed its ring from a native producer unaffected by runtime faults. Its 250 ms
+stall result did not prove 160 ms bounded protection. The replacement Linux
+test uses incremental owned-channel production and actual DAVE on Tokio,
+8/16 fixed slots, one native sender, independent UDP receipt, and successful
+submission traces. Full-runtime fault counters verify zero production and
+preparation progress; an external bounded coordinator fixes a two-worker fault
+injector deadlock. At 250 ms stalls, final local max send intervals are
+251.391–251.567 ms baseline, 91.358 ms (8 slots), 20.175 ms (16 slots).
+At 400 ms even the larger queue underflows (~81 ms gap). After 64 warm-up
+frames, owned-channel/source/DAVE/native transport has zero allocations over
+100 frames. Source/gateway/reconnect integration is still absent.
+
+Six one-minute Oracle loopback runs, 3005 packets each, preserve every packet.
+Three baseline runs and two 8-slot runs have zero >=40 ms send gaps; the 16-slot
+run has three, max 65.755 ms. Sequential host variability prevents attributing
+that regression to capacity; send traces do rule out receiver-only delay.
+No demonstrated Oracle continuity gain or live packet-loss/audio-quality
+claim. The prototype cannot be promoted without Crust consumption-aware
+pause/EOF handling, real DAVE transition fencing, and transport/diagnostic
+ownership. Report/raw evidence are in Raydio docs/SENDER-QUEUE-VALIDATION-2026-09-15.md
+and evidence/sender-queue-20260915/. Production pins/deployment unchanged.

@@ -1,24 +1,23 @@
 //! Decision spike only, compiled exclusively into the Oto test executable.
 //! Compares the real AudioControl path with a native paced payload queue.
 //! It does not change VoiceConnection, gateway or production DAVE lifecycle.
+#![cfg(target_os = "linux")]
 use super::*;
 use crate::pacer::Pacer;
 use crate::transport::TransportMode;
+use std::hash::{Hash, Hasher};
 use std::net::UdpSocket as StdSocket;
 use std::sync::atomic::AtomicBool;
 use std::thread;
-use std::hash::{Hash, Hasher};
 
-// 16 x 20 ms gives 320 ms of bounded prepared audio. This is still only
-// ~41 KiB of fixed frame storage; the benchmark reports the exact footprint.
-const DEPTH: usize = 16;
+const DEPTH: usize = 8;
 const MAX_OPUS: usize = 1275;
 const MAX_PREPARED: usize = MAX_OPUS + dave::OPUS_MAX_ENCRYPTION_OVERHEAD_BYTES;
 const MAX_PACKET: usize = 2048;
 const KEY: [u8; 32] = [0x42; 32]; // Synthetic test key, never a Discord credential.
 const PERIOD: Duration = Duration::from_millis(20);
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct Prepared {
     source: u64,
     epoch: u64,
@@ -56,6 +55,7 @@ struct Shared {
     credits: futures_util::task::AtomicWaker,
 }
 
+#[derive(Debug)]
 enum Control {
     Pause(bool, oneshot::Sender<()>),
     // Return unsent original frames for re-encryption; never throw away music
@@ -80,6 +80,15 @@ impl Native {
         encoder: TransportEncoder,
         capacity: usize,
         sender_stall_ms: u64,
+    ) -> Self {
+        Self::start_traced(socket, encoder, capacity, sender_stall_ms, None)
+    }
+    fn start_traced(
+        socket: StdSocket,
+        encoder: TransportEncoder,
+        capacity: usize,
+        sender_stall_ms: u64,
+        mut trace: Option<crate::send_trace::TraceWriter>,
     ) -> Self {
         assert!((1..=32).contains(&capacity));
         socket.set_nonblocking(true).unwrap();
@@ -173,6 +182,16 @@ impl Native {
                         // Same absolute-clock policy as Pacer: rebase after >=20ms
                         // lateness, never burst or discard frames to catch up.
                         let now = StdInstant::now();
+                        if let Some(trace) = trace.as_mut() {
+                            trace.record(
+                                Instant::from_std(now),
+                                &packet[..12],
+                                1,
+                                frame.source,
+                                frame.silence,
+                                Default::default(),
+                            );
+                        }
                         deadline = Some(match deadline {
                             Some(due) if now.saturating_duration_since(due) < PERIOD => {
                                 due + PERIOD
@@ -199,7 +218,7 @@ impl Native {
             self.shared.credits.register(cx.waker());
             let producer = self
                 .producer
-                .as_ref()
+                .as_mut()
                 .expect("source producer is available");
             if producer.is_abandoned() || self.shared.cancel.load(Ordering::Acquire) {
                 return Poll::Ready(false);
@@ -226,7 +245,6 @@ impl Native {
         let (reply, response) = oneshot::channel();
         self.controls
             .try_send(Control::Pause(paused, reply))
-            .ok()
             .expect("control capacity");
         self.thread.as_ref().unwrap().thread().unpark();
         timeout(Duration::from_secs(1), response)
@@ -242,7 +260,6 @@ impl Native {
                 epoch,
                 reply,
             })
-            .ok()
             .expect("control capacity");
         self.thread.as_ref().unwrap().thread().unpark();
         timeout(Duration::from_secs(1), response)
@@ -370,7 +387,7 @@ async fn prepare(
     *buffers = (result.frame, result.output);
 }
 async fn wait_count(count: &AtomicUsize, expected: usize) {
-    timeout(Duration::from_secs(15), async {
+    timeout(Duration::from_secs(5) + PERIOD * expected as u32, async {
         while count.load(Ordering::Acquire) < expected {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -379,30 +396,16 @@ async fn wait_count(count: &AtomicUsize, expected: usize) {
     .expect("receiver/sender progress deadline");
 }
 
-struct FixtureSource {
-    next: usize,
-    count: usize,
-}
-impl FrameSource for FixtureSource {
-    fn poll_frame(&mut self, _: &mut Context<'_>, output: &mut [u8]) -> Poll<FrameStatus> {
-        if self.next == self.count {
-            return Poll::Ready(FrameStatus::Ended);
-        }
-        let frame = Prepared::plain(self.next);
-        output[..frame.raw_len].copy_from_slice(&frame.raw);
-        self.next += 1;
-        Poll::Ready(FrameStatus::Frame { len: frame.raw_len })
-    }
-}
-
 // Both arms run source preparation and the real DAVE actor on this caller's
-// current-thread Tokio runtime. sleep() in the fault task blocks that runtime,
+// Tokio runtime. Native fault coordination blocks the requested runtime workers,
 // while the independent UDP receiver remains runnable in both arms.
 async fn trial(
     native: bool,
     count: usize,
     runtime_stall_ms: u64,
     sender_stall_ms: u64,
+    depth: usize,
+    stalled_workers: usize,
 ) -> serde_json::Value {
     let (mut receiver, socket) = Receiver::start(count + 5);
     let owner = dave::Handle::spawn_ready_fixture(8);
@@ -411,10 +414,32 @@ async fn trial(
     let mut keepalive = None;
     let mut worker = None;
     let mut expected_hashes: Option<Vec<u64>> = None;
-    // Candidate preparation is deliberately incremental. At most DEPTH frames
-    // plus the one being prepared can exist; no whole-stream Vec is permitted.
+    let mut trace;
+    let (source_start, source_ready) = oneshot::channel();
+    // Same capacity-one owned handoff as Crust's production bridge in both
+    // arms. Producer runs on Tokio; generated frames cannot evade the fault.
+    let (mut source_writer, source_reader) = crate::frame_channel();
+    let mut source_reader = Some(source_reader);
+    let produced = Arc::new(AtomicUsize::new(0));
+    let producer_count = produced.clone();
+    let source_task = tokio::spawn(async move {
+        source_ready.await.unwrap();
+        for index in 0..count {
+            let frame = Prepared::plain(index);
+            source_writer
+                .send(&frame.raw[..frame.raw_len])
+                .await
+                .unwrap();
+            producer_count.fetch_add(1, Ordering::Release);
+        }
+    });
+    // At most depth prepared frames, one in preparation/admission, one native
+    // in-flight frame and the capacity-one source bridge; no audio Vec grows
+    // with duration. Digest/capture/trace storage is bounded test metadata.
     if native {
-        let sender = Native::start(socket, encoder(), DEPTH, sender_stall_ms);
+        let (writer, reader) = crate::send_trace::pair(count + 5);
+        trace = reader;
+        let sender = Native::start_traced(socket, encoder(), depth, sender_stall_ms, Some(writer));
         // The caller feeds after the fault task is installed below. This keeps
         // the runtime stall concurrent with source preparation, as it is in
         // production, instead of precomputing while the runtime is idle.
@@ -447,7 +472,7 @@ async fn trial(
         let pacer = Pacer::new().register().await.unwrap();
         baseline = Some(AudioControl::spawn(SpawnAudio {
             id: 1,
-            source: AudioSource::Callback(Box::new(FixtureSource { next: 0, count })),
+            source: AudioSource::Channel(source_reader.take().unwrap()),
             transport: InstalledTransport {
                 generation: ConnectionGeneration::FIRST,
                 socket: Arc::new(socket),
@@ -469,28 +494,91 @@ async fn trial(
             active: Arc::new(AtomicBool::new(true)),
             fail_udp_sends: Arc::new(AtomicBool::new(false)),
         }));
+        trace = baseline
+            .as_ref()
+            .unwrap()
+            .sender()
+            .start_send_trace(count + 5)
+            .await
+            .unwrap();
         keepalive = Some((updates, connection, shutdown));
     }
+    source_start.send(()).unwrap();
     let received = receiver.count.clone();
-    let fault = tokio::spawn(async move {
-        wait_count(&received, 50).await;
+    let prepared_count = Arc::new(AtomicUsize::new(0));
+    let prepared_fault = prepared_count.clone();
+    let runtime = tokio::runtime::Handle::current();
+    let fault = thread::spawn(move || {
+        let limit = StdInstant::now() + Duration::from_secs(5);
+        while received.load(Ordering::Acquire) < 50 {
+            assert!(StdInstant::now() < limit, "fault trigger deadline");
+            thread::sleep(Duration::from_millis(1));
+        }
+        let memory = process_memory();
+        // External coordinator submits blockers through the global runtime
+        // queue. No blocker awaits another task on the worker's LIFO slot.
+        // Every Condvar wait is bounded so a broken injector cannot hang CI.
+        let gate = Arc::new((Mutex::new((0usize, false)), std::sync::Condvar::new()));
+        let mut blockers = Vec::new();
+        if runtime_stall_ms != 0 {
+            for _ in 0..stalled_workers {
+                let gate = gate.clone();
+                blockers.push(runtime.spawn(async move {
+                    let mut state = gate.0.lock().unwrap();
+                    state.0 += 1;
+                    gate.1.notify_all();
+                    let (state, _) = gate
+                        .1
+                        .wait_timeout_while(state, Duration::from_secs(2), |s| !s.1)
+                        .unwrap();
+                    assert!(state.1, "fault release deadline");
+                }));
+            }
+            let state = gate.0.lock().unwrap();
+            let (state, _) = gate
+                .1
+                .wait_timeout_while(state, Duration::from_secs(2), |s| s.0 != stalled_workers)
+                .unwrap();
+            assert_eq!(state.0, stalled_workers, "worker rendezvous deadline");
+        }
+        let before_produced = produced.load(Ordering::Acquire);
+        let before_prepared = prepared_fault.load(Ordering::Acquire);
         if runtime_stall_ms != 0 {
             thread::sleep(Duration::from_millis(runtime_stall_ms));
         }
+        let source_progress = produced.load(Ordering::Acquire) - before_produced;
+        let preparation_progress = prepared_fault.load(Ordering::Acquire) - before_prepared;
+        gate.0.lock().unwrap().1 = true;
+        gate.1.notify_all();
+        runtime.block_on(async {
+            for blocker in blockers {
+                blocker.await.unwrap();
+            }
+        });
+        (source_progress, preparation_progress, memory)
     });
+    let cpu_started = process_cpu();
+    let wall_started = StdInstant::now();
     if native {
         let mut sender = worker.take().unwrap();
         let mut media = owner.media_encryptor();
         let mut buffers = (vec![0; MAX_OPUS], Vec::with_capacity(MAX_PREPARED));
         let mut hashes = Vec::with_capacity(count + 5);
+        let mut reader = source_reader.take().unwrap();
         for index in 0..count + 5 {
             let mut frame = Prepared::plain(index);
-            if index >= count {
+            if index < count {
+                let status =
+                    futures_util::future::poll_fn(|cx| reader.poll_owned(cx, &mut frame.raw)).await;
+                assert_eq!(status, FrameStatus::Frame { len: MAX_OPUS });
+                assert_eq!(&frame.raw[..8], &(index as u64).to_be_bytes());
+            } else {
                 frame.silence = true;
                 frame.raw_len = 3;
                 frame.raw[..3].copy_from_slice(&SILENCE);
             }
             prepare(&mut media, &mut frame, &mut buffers).await;
+            prepared_count.fetch_add(1, Ordering::Release);
             hashes.push(digest(&frame.bytes[..frame.len]));
             sender.send(frame).await;
         }
@@ -498,7 +586,10 @@ async fn trial(
         worker = Some(sender);
     }
     wait_count(&receiver.count, count + 5).await;
-    fault.await.unwrap();
+    let cpu = process_cpu().saturating_sub(cpu_started);
+    let elapsed = wall_started.elapsed();
+    let fault_result = fault.join().unwrap();
+    source_task.await.unwrap();
     if let Some(sender) = baseline {
         sender.stop().await.unwrap();
         assert_eq!(sender.snapshot().stats().frames_sent(), count as u64);
@@ -534,45 +625,152 @@ async fn trial(
             "DAVE trailer missing"
         );
         if let Some(expected) = expected_hashes.as_ref() {
-            assert_eq!(digest(&decoded.payload), expected[index], "prepared payload altered");
+            assert_eq!(
+                digest(&decoded.payload),
+                expected[index],
+                "prepared payload altered"
+            );
         }
     }
     let mut intervals: Vec<u64> = capture[..count]
         .windows(2)
         .map(|p| p[1].at.duration_since(p[0].at).as_micros() as u64)
         .collect();
+    assert_eq!(trace.dropped(), 0);
+    let mut sends = Vec::with_capacity(count + 5);
+    while let Some(r) = trace.pop() {
+        sends.push(r);
+    }
+    assert_eq!(
+        sends.len(),
+        count + 5,
+        "all successful sends must be traced"
+    );
+    for (record, packet) in sends.iter().zip(&capture) {
+        assert_eq!(
+            record.sequence,
+            u16::from_be_bytes(packet.bytes[2..4].try_into().unwrap())
+        );
+    }
+    assert!(sends[..count].iter().all(|r| !r.silence));
+    assert!(sends[count..].iter().all(|r| r.silence));
+    let send_intervals_us: Vec<u64> = sends[..count]
+        .windows(2)
+        .map(|p| p[1].elapsed_micros - p[0].elapsed_micros)
+        .collect();
+    let arrival_intervals_us = intervals.clone();
     intervals.sort_unstable();
-    serde_json::json!({ "native": native, "runtime_stall_ms": runtime_stall_ms,
+    serde_json::json!({ "send_interval_max_us": send_intervals_us.iter().max(),
+        "send_gaps_ge_40ms": send_intervals_us.iter().filter(|&&n| n>=40000).count(),
+        "send_intervals_us": send_intervals_us, "arrival_intervals_us": arrival_intervals_us, "native": native, "runtime_stall_ms": runtime_stall_ms,
         "sender_stall_ms": sender_stall_ms, "frames": count, "received": capture.len(),
         "gaps_ge_40ms": intervals.iter().filter(|&&v| v >= 40000).count(),
         "interval_min_us": intervals[0], "interval_max_us": intervals[intervals.len()-1],
         "interval_p999_us": intervals[((intervals.len()-1) as f64 * 0.999).ceil() as usize],
-        "queue_slots": if native { DEPTH } else { 0 },
-        "queue_storage_bytes": if native { DEPTH * std::mem::size_of::<Prepared>() } else { 0 },
+        "depth": depth, "stalled_workers": stalled_workers,
+        "source_progress_during_fault": fault_result.0,
+        "preparation_progress_during_fault": fault_result.1,
+        "steady_process_memory": fault_result.2,
+        "process_cpu_us": cpu.as_micros(), "elapsed_us": elapsed.as_micros(),
+        "cpu_percent_one_core": 100.0 * cpu.as_secs_f64() / elapsed.as_secs_f64(),
+        "receiver_storage_bytes": (count+5) * std::mem::size_of::<Captured>(),
+        "digest_storage_bytes": if native { (count+5)*8 } else { 0 },
+        "prepared_admission_frames_max": if native { 1 } else { 0 },
+        "native_inflight_frames_max": if native { 1 } else { 0 },
+        "source_channel_slots": 1,
+        "trace_storage_bytes": (count+5) * std::mem::size_of::<crate::SendRecord>(),
+        "preparation_buffer_bytes": if native { MAX_OPUS + MAX_PREPARED } else { 0 },
+        "queue_slots": if native { depth } else { 0 },
+        "queue_storage_bytes": if native { depth * std::mem::size_of::<Prepared>() } else { 0 },
         "native_stack_reserved_bytes": if native { 256 * 1024 } else { 0 } })
 }
 
-#[tokio::test]
-#[ignore = "serial release benchmark; real Oto/DAVE baseline and native queue"]
-async fn compare_runtime_stalls() {
+fn process_cpu() -> Duration {
+    let t = rustix::time::clock_gettime(rustix::time::ClockId::ProcessCPUTime);
+    Duration::new(t.tv_sec as u64, t.tv_nsec as u32)
+}
+fn process_memory() -> serde_json::Value {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let smaps = std::fs::read_to_string("/proc/self/smaps_rollup").unwrap();
+    let value = |input: &str, key: &str| -> u64 {
+        input
+            .lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    serde_json::json!({"rss_kib":value(&status,"VmRSS:"), "pss_kib":value(&smaps,"Pss:"),
+        "private_dirty_kib":value(&smaps,"Private_Dirty:"), "threads":value(&status,"Threads:")})
+}
+
+#[test]
+#[ignore = "serial release benchmark; owned channel and actual DAVE runtime"]
+fn compare_runtime_stalls() {
     let count: usize = std::env::var("OTO_QUEUE_FRAMES")
         .ok()
         .map(|v| v.parse().unwrap())
-        .unwrap_or(150);
+        .unwrap_or(180);
+    let depth: usize = std::env::var("OTO_QUEUE_DEPTH")
+        .ok()
+        .map(|v| v.parse().unwrap())
+        .unwrap_or(8);
+    let workers: usize = std::env::var("OTO_QUEUE_WORKERS")
+        .ok()
+        .map(|v| v.parse().unwrap())
+        .unwrap_or(2);
     assert!((120..=3000).contains(&count));
+    assert!((1..=32).contains(&depth));
+    assert!((1..=2).contains(&workers));
     let reverse = std::env::var_os("OTO_QUEUE_REVERSE").is_some();
-    for delay in [0, 100, 250] {
+    let only = std::env::var("OTO_QUEUE_ONLY").ok();
+    assert!(matches!(only.as_deref(), None | Some("current" | "native")));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .unwrap();
+    let cases = if only.is_some() {
+        vec![(0, 1)]
+    } else {
+        let mut cases = vec![(0, 1), (100, workers), (250, workers), (400, workers)];
+        if workers == 2 {
+            cases.push((100, 1));
+        }
+        cases
+    };
+    for (delay, stalled_workers) in cases {
         for native in if reverse {
             [true, false]
         } else {
             [false, true]
         } {
-            let result = trial(native, count, delay, 0).await;
+            if only.as_deref().is_some_and(|s| (s == "native") != native) {
+                continue;
+            }
+            // Spawn the trial on a worker so runtime saturation blocks source
+            // preparation too. block_on alone is an additional runnable thread.
+            let mut result = runtime.block_on(async {
+                tokio::spawn(trial(native, count, delay, 0, depth, stalled_workers))
+                    .await
+                    .unwrap()
+            });
+            result["runtime_workers"] = workers.into();
             println!("QUEUE_TRIAL={result}");
         }
     }
-    let result = trial(true, count, 0, 100).await;
-    println!("QUEUE_TRIAL={result}");
+    if only.is_none() {
+        let mut result = runtime.block_on(async {
+            tokio::spawn(trial(true, count, 0, 100, depth, 1))
+                .await
+                .unwrap()
+        });
+        result["runtime_workers"] = workers.into();
+        println!("QUEUE_TRIAL={result}");
+    }
 }
 
 #[tokio::test]
@@ -650,20 +848,43 @@ fn native_queue_allocations() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        for i in 0..16 {
-            native.send(Prepared::plain(i)).await;
+        let owner = dave::Handle::spawn_ready_fixture(8);
+        let mut media = owner.media_encryptor();
+        let mut buffers = (vec![0; MAX_OPUS], Vec::with_capacity(MAX_PREPARED));
+        let (mut writer, mut reader) = crate::frame_channel();
+        let source = tokio::spawn(async move {
+            for i in 0..164 {
+                let frame = Prepared::plain(i);
+                writer.send(&frame.raw).await.unwrap();
+            }
+        });
+        for i in 0..64 {
+            let mut frame = Prepared::plain(i);
+            assert_eq!(
+                futures_util::future::poll_fn(|cx| reader.poll_owned(cx, &mut frame.raw)).await,
+                FrameStatus::Frame { len: MAX_OPUS }
+            );
+            prepare(&mut media, &mut frame, &mut buffers).await;
+            native.send(frame).await;
         }
-        wait_count(&receiver.count, 16).await;
+        wait_count(&receiver.count, 64).await;
         let region = stats_alloc::Region::new(crate::TEST_ALLOCATOR);
-        for i in 16..116 {
-            native.send(Prepared::plain(i)).await;
+        for i in 64..164 {
+            let mut frame = Prepared::plain(i);
+            assert_eq!(
+                futures_util::future::poll_fn(|cx| reader.poll_owned(cx, &mut frame.raw)).await,
+                FrameStatus::Frame { len: MAX_OPUS }
+            );
+            prepare(&mut media, &mut frame, &mut buffers).await;
+            native.send(frame).await;
         }
-        wait_count(&receiver.count, 116).await;
+        wait_count(&receiver.count, 164).await;
         let stats = region.change();
+        println!("QUEUE_ALLOCATIONS={stats:?}");
         assert_eq!(stats.allocations, 0);
         assert_eq!(stats.reallocations, 0);
-        println!("QUEUE_ALLOCATIONS={stats:?}");
+        source.await.unwrap();
     });
     native.shutdown();
-    assert_eq!(receiver.finish().len(), 116);
+    assert_eq!(receiver.finish().len(), 164);
 }
