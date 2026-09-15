@@ -7,8 +7,11 @@ use crate::transport::TransportMode;
 use std::net::UdpSocket as StdSocket;
 use std::sync::atomic::AtomicBool;
 use std::thread;
+use std::hash::{Hash, Hasher};
 
-const DEPTH: usize = 8;
+// 16 x 20 ms gives 320 ms of bounded prepared audio. This is still only
+// ~41 KiB of fixed frame storage; the benchmark reports the exact footprint.
+const DEPTH: usize = 16;
 const MAX_OPUS: usize = 1275;
 const MAX_PREPARED: usize = MAX_OPUS + dave::OPUS_MAX_ENCRYPTION_OVERHEAD_BYTES;
 const MAX_PACKET: usize = 2048;
@@ -41,6 +44,11 @@ impl Prepared {
         frame
     }
 }
+fn digest(bytes: &[u8]) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
+}
 
 struct Shared {
     cancel: AtomicBool,
@@ -64,7 +72,6 @@ struct Native {
     controls: std::sync::mpsc::SyncSender<Control>,
     shared: Arc<Shared>,
     thread: Option<thread::JoinHandle<Result<(), String>>>,
-    source_thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Native {
@@ -184,32 +191,7 @@ impl Native {
             controls,
             shared,
             thread: Some(thread),
-            source_thread: None,
         }
-    }
-
-    fn feed_prepared(&mut self, frames: Vec<Prepared>) {
-        let mut producer = self.producer.take().expect("source producer is available");
-        let shared = self.shared.clone();
-        let worker = self
-            .thread
-            .as_ref()
-            .expect("sender thread")
-            .thread()
-            .clone();
-        self.source_thread = Some(thread::spawn(move || {
-            for frame in frames {
-                while producer.slots() == 0 && !shared.cancel.load(Ordering::Acquire) {
-                    worker.unpark();
-                    thread::park_timeout(Duration::from_millis(1));
-                }
-                if shared.cancel.load(Ordering::Acquire) || producer.push(frame).is_err() {
-                    break;
-                }
-                worker.unpark();
-            }
-            drop(producer);
-        }));
     }
 
     async fn send(&mut self, frame: Prepared) {
@@ -270,9 +252,6 @@ impl Native {
     }
     fn shutdown(&mut self) {
         self.shared.cancel.store(true, Ordering::Release);
-        if let Some(source) = self.source_thread.take() {
-            let _ = source.join();
-        }
         if let Some(thread) = self.thread.take() {
             thread.thread().unpark();
             thread.join().unwrap().unwrap();
@@ -282,9 +261,6 @@ impl Native {
 impl Drop for Native {
     fn drop(&mut self) {
         self.shared.cancel.store(true, Ordering::Release);
-        if let Some(source) = self.source_thread.take() {
-            let _ = source.join();
-        }
         if let Some(thread) = self.thread.take() {
             thread.thread().unpark();
             // All I/O is nonblocking and sleeps are <=20ms outside fault injection.
@@ -430,28 +406,18 @@ async fn trial(
 ) -> serde_json::Value {
     let (mut receiver, socket) = Receiver::start(count + 5);
     let owner = dave::Handle::spawn_ready_fixture(8);
-    let mut media = owner.media_encryptor();
     let mut baseline = None;
     let mut gateway_task = None;
     let mut keepalive = None;
     let mut worker = None;
-    let mut expected = Vec::with_capacity(count + 5);
+    let mut expected_hashes: Option<Vec<u64>> = None;
+    // Candidate preparation is deliberately incremental. At most DEPTH frames
+    // plus the one being prepared can exist; no whole-stream Vec is permitted.
     if native {
-        let mut sender = Native::start(socket, encoder(), DEPTH, sender_stall_ms);
-        let mut buffers = (vec![0; MAX_OPUS], Vec::with_capacity(MAX_PREPARED));
-        let mut prepared = Vec::with_capacity(count + 5);
-        for index in 0..count + 5 {
-            let mut frame = Prepared::plain(index);
-            if index >= count {
-                frame.silence = true;
-                frame.raw_len = 3;
-                frame.raw[..3].copy_from_slice(&SILENCE);
-            }
-            prepare(&mut media, &mut frame, &mut buffers).await;
-            expected.push((frame.len, frame.bytes));
-            prepared.push(frame);
-        }
-        sender.feed_prepared(prepared);
+        let sender = Native::start(socket, encoder(), DEPTH, sender_stall_ms);
+        // The caller feeds after the fault task is installed below. This keeps
+        // the runtime stall concurrent with source preparation, as it is in
+        // production, instead of precomputing while the runtime is idle.
         worker = Some(sender);
     } else {
         assert_eq!(sender_stall_ms, 0);
@@ -489,7 +455,7 @@ async fn trial(
                 validity: TransportValidity::new(),
                 dave_protocol_version: 1,
                 dave: Some(owner.clone()),
-                dave_media: Some(media),
+                dave_media: Some(owner.media_encryptor()),
             },
             transport_updates,
             pacer,
@@ -512,6 +478,25 @@ async fn trial(
             thread::sleep(Duration::from_millis(runtime_stall_ms));
         }
     });
+    if native {
+        let mut sender = worker.take().unwrap();
+        let mut media = owner.media_encryptor();
+        let mut buffers = (vec![0; MAX_OPUS], Vec::with_capacity(MAX_PREPARED));
+        let mut hashes = Vec::with_capacity(count + 5);
+        for index in 0..count + 5 {
+            let mut frame = Prepared::plain(index);
+            if index >= count {
+                frame.silence = true;
+                frame.raw_len = 3;
+                frame.raw[..3].copy_from_slice(&SILENCE);
+            }
+            prepare(&mut media, &mut frame, &mut buffers).await;
+            hashes.push(digest(&frame.bytes[..frame.len]));
+            sender.send(frame).await;
+        }
+        expected_hashes = Some(hashes);
+        worker = Some(sender);
+    }
     wait_count(&receiver.count, count + 5).await;
     fault.await.unwrap();
     if let Some(sender) = baseline {
@@ -548,12 +533,8 @@ async fn trial(
             decoded.payload.ends_with(&[0xfa, 0xfa]),
             "DAVE trailer missing"
         );
-        if native {
-            assert_eq!(
-                decoded.payload,
-                expected[index].1[..expected[index].0],
-                "prepared payload altered"
-            );
+        if let Some(expected) = expected_hashes.as_ref() {
+            assert_eq!(digest(&decoded.payload), expected[index], "prepared payload altered");
         }
     }
     let mut intervals: Vec<u64> = capture[..count]
@@ -596,7 +577,7 @@ async fn compare_runtime_stalls() {
 
 #[tokio::test]
 async fn native_pause_fence_rekey_stop_and_rtp_continuity() {
-    let (mut receiver, socket) = Receiver::start(16);
+    let (mut receiver, socket) = Receiver::start(DEPTH + 1);
     let mut native = Native::start(socket, encoder(), DEPTH, 0);
     native.pause(true).await;
     let owner = dave::Handle::spawn_ready_fixture(8);
