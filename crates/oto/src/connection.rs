@@ -99,6 +99,7 @@ impl VoiceConnection {
                 "a running Tokio runtime is required",
             ));
         }
+        crate::audio_worker::initialize()?;
         let info = gateway::ValidatedInfo::new(info, Operation::Connect, None)?;
         let initial = ConnectionSnapshot::initial();
         let (state_tx, state_rx) = watch::channel(initial.clone());

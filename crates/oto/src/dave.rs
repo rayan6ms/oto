@@ -145,7 +145,7 @@ impl Handle {
     fn spawn_core(core: Core, capacity: usize) -> Self {
         let (commands, mut receiver) = mpsc::channel(capacity);
         let (state_tx, state) = watch::channel(core.snapshot());
-        let task = tokio::spawn(async move {
+        let task = crate::audio_worker::spawn(async move {
             let mut core = core;
             while let Some(command) = receiver.recv().await {
                 match command {

@@ -104,6 +104,15 @@ impl std::fmt::Debug for PacedAudioSender {
 }
 
 impl PacedAudioSender {
+    /// Pauses without discarding staged or queued Opus frames.
+    pub async fn set_paused(&self, paused: bool) -> Result<(), Error> {
+        let (reply, response) = oneshot::channel();
+        self.control
+            .send(AudioCommand::Pause { paused, reply }, Operation::StopAudio)
+            .await?;
+        response.await.map_err(|_| gateway_stopped())?
+    }
+
     /// Starts optional RTP header/timing recording. No per-packet allocation or I/O.
     /// Capacity must be 1..=4096; a full trace drops records, never audio.
     /// Replaces an earlier trace. Dropping the consumer disables it on the next send.
@@ -304,7 +313,7 @@ impl AudioControl {
         let (cancel, cancel_rx) = watch::channel(false);
         let active = input.active.clone();
         let counters = Arc::new(AudioCounters::default());
-        let task = tokio::spawn(run_audio(
+        let task = crate::audio_worker::spawn(run_audio(
             input,
             command_rx,
             state_tx,
@@ -378,6 +387,10 @@ impl AudioControl {
 }
 
 enum AudioCommand {
+    Pause {
+        paused: bool,
+        reply: oneshot::Sender<Result<(), Error>>,
+    },
     Trace {
         writer: crate::send_trace::TraceWriter,
         reply: oneshot::Sender<()>,
@@ -614,6 +627,9 @@ struct Executor {
     last_packet_sent: Option<Instant>,
     silence_sent: u8,
     source_ended: bool,
+    paused: bool,
+    #[cfg(all(feature = "experimental-audio-worker", unix))]
+    send_socket: Option<tokio::net::UdpSocket>,
     stop_reply: Option<oneshot::Sender<Result<AudioSnapshot, Error>>>,
     #[cfg(test)]
     fail_udp_sends: Arc<AtomicBool>,
@@ -663,6 +679,9 @@ async fn run_audio(
         last_packet_sent: None,
         silence_sent: 0,
         source_ended: false,
+        paused: false,
+        #[cfg(all(feature = "experimental-audio-worker", unix))]
+        send_socket: None,
         stop_reply: None,
         #[cfg(test)]
         fail_udp_sends: input.fail_udp_sends,
@@ -698,6 +717,7 @@ async fn run_audio(
 
 impl Executor {
     async fn run(&mut self) -> Result<(), Error> {
+        self.register_send_socket()?;
         self.connection_was_ready = self.connection_ready();
         self.try_start().await?;
         loop {
@@ -767,7 +787,11 @@ impl Executor {
     }
 
     async fn try_start(&mut self) -> Result<(), Error> {
-        if self.stop_reply.is_some() || !self.connection_ready() || self.transport.is_none() {
+        if self.paused
+            || self.stop_reply.is_some()
+            || !self.connection_ready()
+            || self.transport.is_none()
+        {
             return Ok(());
         }
         self.send_timing = Default::default();
@@ -859,7 +883,7 @@ impl Executor {
         // stall. The completion path rebases the next deadline and prevents
         // a catch-up burst after that stall.
 
-        let polled = if self.stop_reply.is_some() {
+        let polled = if self.stop_reply.is_some() || self.paused {
             Polled::Ended
         } else {
             self.poll_source()?
@@ -877,7 +901,7 @@ impl Executor {
             }
             Polled::Pending | Polled::Ended => {
                 AudioCounters::increment(&self.store.counters.frames_unavailable);
-                self.source_ended |= matches!(polled, Polled::Ended);
+                self.source_ended |= !self.paused && matches!(polled, Polled::Ended);
                 self.store.phase(AudioPhase::DrainingSilence);
                 if self.send_silence().await? != SendOutcome::Sent {
                     self.connection_was_ready = false;
@@ -917,6 +941,19 @@ impl Executor {
 
     async fn handle_command(&mut self, command: Option<AudioCommand>) -> Result<bool, Error> {
         match command {
+            Some(AudioCommand::Pause { paused, reply }) => {
+                self.paused = paused;
+                if paused {
+                    self.silence_sent = 0;
+                } else if !self.active_timeline {
+                    self.wake
+                        .latest_generation
+                        .store(self.source.generation.get(), Ordering::Release);
+                    self.wake.notify.notify_one();
+                }
+                let _ = reply.send(Ok(()));
+                Ok(true)
+            }
             Some(AudioCommand::Trace { writer, reply }) => {
                 self.trace = Some(writer);
                 let _ = reply.send(());
@@ -933,6 +970,7 @@ impl Executor {
                     let _ = reply.send(Err(error.clone()));
                     return Err(error);
                 };
+                self.paused = false;
                 self.source = SourceSlot::new(source, generation, &self.wake);
                 self.staged_frame_len = None;
                 self.source_ended = false;
@@ -1004,6 +1042,7 @@ impl Executor {
                 .is_some_and(|dave| dave.snapshot().ready)
         {
             self.transport = Some(update);
+            self.register_send_socket()?;
             self.connection_was_ready = self.connection_ready();
             // A fresh connection generation can install its transport before
             // the DAVE control plane reaches Connected. Keep the sender
@@ -1014,6 +1053,7 @@ impl Executor {
             return Ok(());
         }
         self.transport = Some(update);
+        self.register_send_socket()?;
         self.connection_was_ready = self.connection_ready();
         self.try_start().await
     }
@@ -1126,8 +1166,16 @@ impl Executor {
     }
 
     async fn send_silence(&mut self) -> Result<SendOutcome, Error> {
+        // Preserve the paused/staged raw frame across terminal silence, including
+        // DAVE readiness and transport-renewal returns.
+        let mut prefix = [0; 3];
+        prefix.copy_from_slice(&self.frame[..3]);
         self.frame[..SILENCE.len()].copy_from_slice(&SILENCE);
-        let outcome = self.send_payload(SILENCE.len(), true).await?;
+        let result = self.send_payload(SILENCE.len(), true).await;
+        if self.frame.len() >= 3 {
+            self.frame[..3].copy_from_slice(&prefix);
+        }
+        let outcome = result?;
         if outcome == SendOutcome::Sent {
             AudioCounters::increment(&self.store.counters.silence_frames_sent);
         }
@@ -1220,10 +1268,21 @@ impl Executor {
             let result = if injected {
                 Ok(Err(std::io::Error::from(std::io::ErrorKind::Interrupted)))
             } else {
-                timeout(FRAME_PERIOD, transport.socket.send(&self.packet)).await
+                {
+                    #[cfg(all(feature = "experimental-audio-worker", unix))]
+                    let socket = self.send_socket.as_ref().expect("registered send socket");
+                    #[cfg(not(all(feature = "experimental-audio-worker", unix)))]
+                    let socket = &transport.socket;
+                    timeout(FRAME_PERIOD, socket.send(&self.packet)).await
+                }
             };
             if matches!(result, Ok(Ok(written)) if written == self.packet.len()) {
-                self.staged_frame_len = None;
+                if !silence {
+                    self.staged_frame_len = None;
+                    if let AudioSource::Channel(reader) = &self.source.source {
+                        reader.acknowledge_sent();
+                    }
+                }
                 let now = Instant::now();
                 if let Some(started) = udp_started {
                     self.send_timing.udp_wait = crate::send_trace::micros(started.elapsed());
@@ -1343,6 +1402,33 @@ impl Executor {
         if self.active_timeline {
             self.pacer.deactivate().await.map_err(pacer_error)?;
             self.active_timeline = false;
+        }
+        Ok(())
+    }
+
+    fn register_send_socket(&mut self) -> Result<(), Error> {
+        #[cfg(all(feature = "experimental-audio-worker", unix))]
+        {
+            use std::os::fd::AsFd;
+            let socket = self
+                .transport
+                .as_ref()
+                .expect("installed transport")
+                .socket
+                .as_fd()
+                .try_clone_to_owned()
+                .and_then(|fd| tokio::net::UdpSocket::from_std(std::net::UdpSocket::from(fd)))
+                .map_err(|source| {
+                    audio_error(
+                        ErrorKind::SendIo,
+                        Operation::StartAudio,
+                        RetryDisposition::Fatal,
+                        "failed to register isolated audio UDP socket",
+                    )
+                    .with_source(source)
+                })?;
+            // Keep original Arc in InstalledTransport: gateway detach validates identity.
+            self.send_socket = Some(socket);
         }
         Ok(())
     }
@@ -1685,9 +1771,13 @@ mod tests {
             last_packet_sent: None,
             silence_sent: 0,
             source_ended: false,
+            paused: false,
+            #[cfg(all(feature = "experimental-audio-worker", unix))]
+            send_socket: None,
             stop_reply: None,
             fail_udp_sends: Arc::new(AtomicBool::new(false)),
         };
+        executor.register_send_socket().unwrap();
         // A ready source has no queued pacing work yet. Simulate waking after
         // the intended deadline, including a delay spanning multiple frames.
         for delay in [Duration::from_millis(37), Duration::from_millis(137)] {
@@ -1801,6 +1891,236 @@ mod tests {
     #[tokio::test]
     async fn tracing_queued_before_first_speaking_ack_preserves_staged_audio() {
         verify_complete_paced_dave_path(true, true).await;
+    }
+
+    #[tokio::test]
+    async fn buffered_pause_keeps_order_tail_and_send_acknowledgement() {
+        use futures_util::FutureExt;
+        let (sink, socket) = connected_udp_pair().await;
+        let (gateway, mut gateway_rx) = mpsc::channel(8);
+        let gateway_task = tokio::spawn(async move {
+            while let Some(command) = gateway_rx.recv().await {
+                match command {
+                    GatewayCommand::Speaking { reply, .. } => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    GatewayCommand::DetachAudio { reply, .. } => {
+                        let _ = reply.send(());
+                        break;
+                    }
+                    _ => panic!("unexpected gateway command"),
+                }
+            }
+        });
+        let (_transport_tx, transport_updates) = mpsc::channel(1);
+        let (_connection_tx, connection_state) = connected_state();
+        let (_shutdown_tx, connection_shutdown) = watch::channel(false);
+        let (events, _) = broadcast::channel(8);
+        let (mut writer, reader) = crate::buffered_frame_channel();
+        for value in 0..8 {
+            writer.send(&[value; 64]).await.unwrap();
+        }
+        let control = AudioControl::spawn(SpawnAudio {
+            id: 1,
+            source: AudioSource::Channel(reader),
+            transport: InstalledTransport {
+                generation: ConnectionGeneration::FIRST,
+                socket: Arc::new(socket),
+                encoder: TransportEncoder::new(
+                    TransportMode::Aes256GcmRtpSize,
+                    &[0x42; 32],
+                    7,
+                    1275,
+                    2048,
+                )
+                .unwrap(),
+                validity: TransportValidity::new(),
+                dave_protocol_version: 0,
+                dave: None,
+                dave_media: None,
+            },
+            transport_updates,
+            pacer: Pacer::new().register().await.unwrap(),
+            gateway_commands: gateway,
+            connection_state,
+            connection_shutdown,
+            events,
+            command_capacity: 8,
+            max_frame_bytes: 1275,
+            max_datagram_bytes: 2048,
+            active: Arc::new(AtomicBool::new(true)),
+            fail_udp_sends: Arc::new(AtomicBool::new(false)),
+        });
+        let mut packet = [0; 2048];
+        let length = timeout(Duration::from_secs(2), sink.recv(&mut packet))
+            .await
+            .unwrap()
+            .unwrap();
+        let first = decrypt_transport_packet(
+            OracleMode::Aes256GcmRtpSize,
+            &[0x42; 32],
+            &packet[..length],
+            1275,
+        )
+        .unwrap();
+        assert_eq!(first.payload, [0; 64]);
+        control.sender().set_paused(true).await.unwrap();
+        // Drain only intentional pause silence. No queued media may disappear.
+        let mut received = vec![first.payload];
+        while let Ok(result) = timeout(Duration::from_millis(180), sink.recv(&mut packet)).await {
+            let length = result.unwrap();
+            let p = decrypt_transport_packet(
+                OracleMode::Aes256GcmRtpSize,
+                &[0x42; 32],
+                &packet[..length],
+                1275,
+            )
+            .unwrap();
+            if p.payload != SILENCE {
+                received.push(p.payload);
+            }
+        }
+        assert!(writer.drain().now_or_never().is_none());
+        let before = control.snapshot().stats().frames_sent();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(control.snapshot().stats().frames_sent(), before);
+        control.sender().set_paused(false).await.unwrap();
+        while received.len() < 8 {
+            let length = timeout(Duration::from_secs(2), sink.recv(&mut packet))
+                .await
+                .unwrap()
+                .unwrap();
+            let p = decrypt_transport_packet(
+                OracleMode::Aes256GcmRtpSize,
+                &[0x42; 32],
+                &packet[..length],
+                1275,
+            )
+            .unwrap();
+            if p.payload != SILENCE {
+                received.push(p.payload);
+            }
+        }
+        timeout(Duration::from_secs(1), writer.drain())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            received,
+            (0..8).map(|value| vec![value; 64]).collect::<Vec<_>>()
+        );
+        control.stop().await.unwrap();
+        assert_eq!(writer.send(&[9]).await, Err(crate::FrameSendError::Closed));
+        gateway_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "real-time integrated UDP/runtime-stall benchmark; run without builds"]
+    async fn benchmark_integrated_audio_worker_stall() {
+        let (sink, socket) = connected_udp_pair().await;
+        let sink = sink.into_std().unwrap();
+        sink.set_nonblocking(false).unwrap();
+        sink.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+        let receiver = std::thread::spawn(move || {
+            let mut packet = [0; 2048];
+            let mut times = Vec::new();
+            for _ in 0..160 {
+                sink.recv(&mut packet).unwrap();
+                times.push(StdInstant::now());
+            }
+            times
+        });
+        let (gateway, mut gateway_rx) = mpsc::channel(8);
+        let gateway_task = tokio::spawn(async move {
+            while let Some(command) = gateway_rx.recv().await {
+                match command {
+                    GatewayCommand::Speaking { reply, .. } => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    GatewayCommand::DetachAudio { reply, .. } => {
+                        let _ = reply.send(());
+                        break;
+                    }
+                    _ => panic!("unexpected gateway command"),
+                }
+            }
+        });
+        let (_transport_tx, transport_updates) = mpsc::channel(1);
+        let (_connection_tx, connection_state) = connected_state();
+        let (_shutdown_tx, connection_shutdown) = watch::channel(false);
+        let (events, _) = broadcast::channel(8);
+        let (mut writer, reader) = if cfg!(feature = "experimental-audio-worker") {
+            crate::buffered_frame_channel()
+        } else {
+            crate::frame_channel()
+        };
+        let producer = tokio::spawn(async move {
+            for value in 0..160 {
+                writer.send(&[value; 128]).await.unwrap();
+            }
+            writer.drain().await.unwrap();
+        });
+        let dave = dave::Handle::spawn_ready_fixture(8);
+        let media = dave.media_encryptor();
+        let control = AudioControl::spawn(SpawnAudio {
+            id: 1,
+            source: AudioSource::Channel(reader),
+            transport: InstalledTransport {
+                generation: ConnectionGeneration::FIRST,
+                socket: Arc::new(socket),
+                encoder: TransportEncoder::new(
+                    TransportMode::Aes256GcmRtpSize,
+                    &[0x42; 32],
+                    7,
+                    1275 + dave::OPUS_MAX_ENCRYPTION_OVERHEAD_BYTES,
+                    2048,
+                )
+                .unwrap(),
+                validity: TransportValidity::new(),
+                dave_protocol_version: 1,
+                dave: Some(dave),
+                dave_media: Some(media),
+            },
+            transport_updates,
+            pacer: Pacer::new().register().await.unwrap(),
+            gateway_commands: gateway,
+            connection_state,
+            connection_shutdown,
+            events,
+            command_capacity: 8,
+            max_frame_bytes: 1275,
+            max_datagram_bytes: 2048,
+            active: Arc::new(AtomicBool::new(true)),
+            fail_udp_sends: Arc::new(AtomicBool::new(false)),
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let stall_start = StdInstant::now();
+        std::thread::sleep(Duration::from_millis(100));
+        let stall_end = StdInstant::now();
+        timeout(Duration::from_secs(8), producer)
+            .await
+            .unwrap()
+            .unwrap();
+        let times = receiver.join().unwrap();
+        let max_gap = times
+            .windows(2)
+            .map(|t| t[1].duration_since(t[0]).as_secs_f64() * 1000.0)
+            .fold(0.0, f64::max);
+        let stall_gap = times
+            .windows(2)
+            .filter(|t| t[1] >= stall_start && t[0] <= stall_end)
+            .map(|t| t[1].duration_since(t[0]).as_secs_f64() * 1000.0)
+            .fold(0.0, f64::max);
+        println!(
+            "INTEGRATED_WORKER_BENCHMARK={}",
+            serde_json::json!({
+                "isolated":cfg!(feature="experimental-audio-worker"), "packets":times.len(),
+                "maxGapMs":max_gap, "stallGapMs":stall_gap,
+                "sendFailures":control.snapshot().stats().send_failures()
+            })
+        );
+        control.stop().await.unwrap();
+        gateway_task.await.unwrap();
     }
 
     async fn verify_complete_paced_dave_path(channel: bool, tracing: bool) {

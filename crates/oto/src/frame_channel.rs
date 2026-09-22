@@ -1,7 +1,7 @@
-//! A capacity-one encoded-frame handoff with bounded copying.
+//! Bounded encoded-frame handoff with consumption or publication acknowledgement.
 use std::sync::{
     Arc,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -19,8 +19,20 @@ const MAX_FRAME: usize = 1275;
 /// then wakes its producer task. Ordinary `FrameSource` attachment keeps task
 /// wake work outside its poll and still applies the callback watchdog.
 pub fn frame_channel() -> (FrameWriter, FrameReader) {
-    let (writer, reader) = RingBuffer::new(1);
+    channel(1, false)
+}
+
+/// Eight raw Opus frames with publication acknowledgement and send-based drain.
+/// Use only with `start_audio_channel`/`replace_channel`, not callback attachment.
+pub fn buffered_frame_channel() -> (FrameWriter, FrameReader) {
+    channel(8, true)
+}
+
+fn channel(capacity: usize, buffered: bool) -> (FrameWriter, FrameReader) {
+    let (writer, reader) = RingBuffer::new(capacity);
     let shared = Arc::new(Shared {
+        published: AtomicU64::new(0),
+        sent: AtomicU64::new(0),
         consumed: AtomicBool::new(false),
         ended: AtomicBool::new(false),
         closed: AtomicBool::new(false),
@@ -34,6 +46,8 @@ pub fn frame_channel() -> (FrameWriter, FrameReader) {
             queue: writer,
             shared: shared.clone(),
             in_flight: false,
+            buffered,
+            published: 0,
         },
         FrameReader {
             queue: reader,
@@ -48,6 +62,8 @@ pub struct FrameWriter {
     queue: Producer<Frame>,
     shared: Arc<Shared>,
     in_flight: bool,
+    buffered: bool,
+    published: u64,
 }
 
 /// The single consumer of an encoded-frame channel.
@@ -84,6 +100,8 @@ struct Frame {
     bytes: [u8; MAX_FRAME],
 }
 struct Shared {
+    published: AtomicU64,
+    sent: AtomicU64,
     consumed: AtomicBool,
     ended: AtomicBool,
     closed: AtomicBool,
@@ -93,10 +111,48 @@ struct Shared {
     producer_waker: AtomicWaker,
 }
 
+/// Read-only count of frames published but not yet successfully sent.
+#[derive(Clone)]
+pub struct FrameBacklog(Arc<Shared>);
+impl FrameBacklog {
+    /// Includes the raw frame staged by the sender, not just ring occupancy.
+    pub fn pending(&self) -> u64 {
+        self.0
+            .published
+            .load(Ordering::Acquire)
+            .saturating_sub(self.0.sent.load(Ordering::Acquire))
+    }
+}
+
 impl FrameWriter {
-    /// Publishes one frame and waits until the reader copies it.
+    /// Returns a lightweight queue observer without retaining either endpoint.
+    pub fn backlog(&self) -> FrameBacklog {
+        FrameBacklog(self.shared.clone())
+    }
+
+    /// Resolves on reader failure or close, including while the source is idle.
+    pub fn closed(&self) -> impl std::future::Future<Output = FrameSendError> + Send + use<> {
+        let shared = self.shared.clone();
+        async move {
+            futures_util::future::poll_fn(|cx| {
+                shared.producer_waker.register(cx.waker());
+                match shared.check_open() {
+                    Err(error) => Poll::Ready(error),
+                    Ok(()) => Poll::Pending,
+                }
+            })
+            .await
+        }
+    }
+
+    /// Whether this writer acknowledges publication rather than consumption.
+    pub fn is_buffered(&self) -> bool {
+        self.buffered
+    }
+
+    /// Publishes a frame; legacy channels wait for copying, buffered channels for a slot.
     ///
-    /// Completion acknowledges a source read, not UDP delivery. Cancellation
+    /// Completion never acknowledges UDP delivery; use `drain` for that. Cancellation
     /// before publication changes nothing. Cancellation after publication keeps
     /// that frame queued; a subsequent send waits for it before publishing the
     /// next frame. Do not retry the cancelled frame unless duplication is wanted.
@@ -107,7 +163,11 @@ impl FrameWriter {
         if !(1..=MAX_FRAME).contains(&bytes.len()) {
             return Err(FrameSendError::InvalidLength);
         }
-        self.wait_consumed().await?;
+        if self.buffered {
+            self.wait_capacity().await?;
+        } else {
+            self.wait_consumed().await?;
+        }
         self.check_open()?;
         let mut frame = Frame {
             len: bytes.len(),
@@ -120,8 +180,49 @@ impl FrameWriter {
             self.queue.push(frame).is_ok(),
             "frame channel capacity invariant"
         );
+        self.published += 1;
+        self.shared
+            .published
+            .store(self.published, Ordering::Release);
         self.shared.waker.wake();
-        self.wait_consumed().await
+        if self.buffered {
+            Ok(())
+        } else {
+            self.wait_consumed().await
+        }
+    }
+
+    /// Waits for a queue slot before reading the next source frame.
+    pub async fn wait_capacity(&mut self) -> Result<(), FrameSendError> {
+        let shared = &self.shared;
+        let queue = &mut self.queue;
+        futures_util::future::poll_fn(move |cx| {
+            shared.producer_waker.register(cx.waker());
+            shared.check_open()?;
+            if queue.slots() > 0 {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await
+    }
+
+    /// Waits until every published frame was successfully passed to UDP.
+    /// Close/replace/failure returns Closed; copying from the ring is not delivery.
+    pub async fn drain(&mut self) -> Result<(), FrameSendError> {
+        let shared = &self.shared;
+        let published = self.published;
+        futures_util::future::poll_fn(move |cx| {
+            shared.producer_waker.register(cx.waker());
+            shared.check_open()?;
+            if shared.sent.load(Ordering::Acquire) == published {
+                Poll::Ready(Ok(()))
+            } else {
+                Poll::Pending
+            }
+        })
+        .await
     }
 
     fn check_open(&self) -> Result<(), FrameSendError> {
@@ -186,6 +287,11 @@ impl Drop for FrameReader {
 }
 
 impl FrameReader {
+    pub(crate) fn acknowledge_sent(&self) {
+        self.shared.sent.fetch_add(1, Ordering::Release);
+        self.shared.producer_waker.wake();
+    }
+
     pub(crate) fn poll_owned(
         &mut self,
         cx: &mut Context<'_>,
@@ -245,6 +351,46 @@ mod tests {
 
     fn read(reader: &mut FrameReader, output: &mut [u8]) -> Poll<FrameStatus> {
         reader.poll_frame(&mut Context::from_waker(&noop_waker()), output)
+    }
+
+    #[tokio::test]
+    async fn buffered_capacity_cancel_and_successful_send_drain() {
+        use futures_util::FutureExt;
+        let (mut writer, mut reader) = buffered_frame_channel();
+        for value in 0..8 {
+            writer.send(&[value]).await.unwrap();
+        }
+        assert!(writer.send(&[8]).now_or_never().is_none());
+        let mut output = [0; MAX_FRAME];
+        assert!(
+            reader
+                .poll_owned(&mut Context::from_waker(&noop_waker()), &mut output)
+                .is_ready()
+        );
+        assert_eq!(output[0], 0);
+        assert!(
+            writer.drain().now_or_never().is_none(),
+            "pop is not UDP delivery"
+        );
+        reader.acknowledge_sent();
+        writer.send(&[8]).await.unwrap();
+        for value in 1..=8 {
+            assert!(
+                reader
+                    .poll_owned(&mut Context::from_waker(&noop_waker()), &mut output)
+                    .is_ready()
+            );
+            assert_eq!(
+                output[0], value,
+                "cancelled full send must not duplicate a frame"
+            );
+            reader.acknowledge_sent();
+        }
+        writer.drain().await.unwrap();
+        writer.send(&[9]).await.unwrap();
+        drop(reader);
+        assert_eq!(writer.drain().await, Err(FrameSendError::Closed));
+        assert_eq!(writer.send(&[10]).await, Err(FrameSendError::Closed));
     }
 
     #[tokio::test(start_paused = true)]

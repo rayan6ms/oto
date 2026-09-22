@@ -3261,7 +3261,10 @@ mod tests {
         }
         assert_eq!(gateway.udp.capture().len(), 1, "old wake cannot send");
         new.push(vec![7, 8, 9]);
-        eventually(|| sender.state().stats().frames_sent() == 1).await;
+        eventually(|| {
+            sender.state().stats().frames_sent() == 1 && gateway.udp.capture().len() >= 2
+        })
+        .await;
         let packet = gateway
             .udp
             .decrypt_captured_transport(1, OracleMode::Aes256GcmRtpSize, &[0x42; 32], 1_275)

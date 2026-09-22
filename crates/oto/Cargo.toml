@@ -11,6 +11,7 @@ rust-version.workspace = true
 publish = false
 
 [features]
+experimental-audio-worker = []
 testkit = ["dep:rustls"]
 
 [dependencies]
