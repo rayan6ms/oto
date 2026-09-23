@@ -661,6 +661,13 @@ impl ConnectionSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConnectionEvent {
+    /// Readiness is waiting for a listener in a confirmed empty voice room.
+    DaveWaitingForMembers {
+        /// External voice credential generation.
+        generation: ConnectionGeneration,
+        /// Bounded grace interval; no media is permitted while unready.
+        timeout_seconds: u64,
+    },
     /// Completed control processing and WebSocket writes, without payloads.
     DaveControlProcessed {
         /// External voice credential generation.

@@ -1,3 +1,9 @@
+## Live follow-up: confirmed empty-room wait
+
+- [x] Reproduce Oracle last-listener departure resetting DAVE without a completed group while alone.
+- [x] Implement bounded empty-room readiness grace and incremental, globally bounded membership tracking.
+- [ ] Finish full regression/Clippy checks and redeploy for verified listener return and five-minute receiver capture.
+
 ## September 23: bounded recovery after observed DAVE readiness timeout
 
 - [x] Reproduce missing-successor expiry with epoch reset, duplicate controls and resume; distinguish gateway readiness timeout from owner-response timeout.

@@ -475,6 +475,13 @@ pub(crate) struct StateStore {
 }
 
 impl StateStore {
+    pub(crate) fn dave_waiting_for_members(&self, timeout_seconds: u64) {
+        let _ = self.events.send(ConnectionEvent::DaveWaitingForMembers {
+            generation: self.generation(),
+            timeout_seconds,
+        });
+    }
+
     pub(crate) fn dave_control_processed(
         &self,
         opcode: u8,

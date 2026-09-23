@@ -27,6 +27,7 @@ use crate::transport::{
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DAVE_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const DAVE_EMPTY_ROOM_TIMEOUT: Duration = Duration::from_secs(120);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const MIN_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(10);
 const MAX_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(300);
@@ -405,7 +406,7 @@ pub(crate) async fn run(
     let mut audio_attachment = None;
     let mut dave = None;
     let mut dave_deadline = None;
-    let mut dave_roster = Vec::new();
+    let mut dave_roster = DaveRoster::default();
     let mut dave_recovery = DaveRecoveryBudget::default();
 
     'control: loop {
@@ -781,6 +782,30 @@ pub(crate) async fn run(
 // Independent of gateway retries: successful transport setup/resume must not
 // turn repeated MLS failures into an unlimited reconnect loop.
 #[derive(Default)]
+struct DaveRoster {
+    users: Vec<u64>,
+    known: bool,
+}
+impl DaveRoster {
+    fn clear(&mut self) {
+        self.users.clear();
+        self.known = false;
+    }
+    fn add(&mut self, users: Vec<u64>, maximum: usize) -> Result<(), DaveRosterError> {
+        for user in users {
+            if !self.users.contains(&user) {
+                if self.users.len() >= maximum {
+                    return Err(DaveRosterError::TooManyMembers);
+                }
+                self.users.push(user);
+            }
+        }
+        self.known = true;
+        Ok(())
+    }
+}
+
+#[derive(Default)]
 struct DaveRecoveryBudget {
     generation: Option<ConnectionGeneration>,
     used: u8,
@@ -799,8 +824,8 @@ impl DaveRecoveryBudget {
     }
 }
 
-async fn wait_dave_deadline(deadline: Option<Instant>) {
-    if let Some(deadline) = deadline {
+async fn wait_dave_deadline(deadline: Option<(Instant, bool)>) {
+    if let Some((deadline, _)) = deadline {
         sleep_until(deadline).await;
     } else {
         pending::<()>().await;
@@ -819,8 +844,8 @@ async fn run_session(
     transport: &mut Option<UdpTransport>,
     audio_attachment: &mut Option<(u64, mpsc::Sender<InstalledTransport>)>,
     dave: &mut Option<dave::Handle>,
-    dave_deadline: &mut Option<Instant>,
-    dave_roster: &mut Vec<u64>,
+    dave_deadline: &mut Option<(Instant, bool)>,
+    dave_roster: &mut DaveRoster,
     commands: &mut mpsc::Receiver<Command>,
     shutdown: &mut watch::Receiver<bool>,
     store: &mut StateStore,
@@ -839,7 +864,22 @@ async fn run_session(
         // Bound total not-ready time, not each individual successful control
         // operation. Heartbeats/duplicate epoch messages cannot extend this wait.
         if dave.as_ref().is_some_and(|owner| !owner.snapshot().ready) {
-            dave_deadline.get_or_insert_with(|| Instant::now() + DAVE_READY_TIMEOUT);
+            let alone = dave_roster.known
+                && dave_roster
+                    .users
+                    .iter()
+                    .all(|user| *user == info.info.user_id());
+            if dave_deadline.is_none_or(|(_, waiting_alone)| waiting_alone != alone) {
+                let timeout = if alone {
+                    DAVE_EMPTY_ROOM_TIMEOUT
+                } else {
+                    DAVE_READY_TIMEOUT
+                };
+                *dave_deadline = Some((Instant::now() + timeout, alone));
+                if alone {
+                    store.dave_waiting_for_members(timeout.as_secs());
+                }
+            }
         } else {
             *dave_deadline = None;
         }
@@ -1245,11 +1285,11 @@ async fn run_session(
                                             dave_error(store.generation()).with_source(source)
                                         ),
                                     };
-                                    if !dave_roster.is_empty()
+                                    if dave_roster.known
                                         && let Err(error) = run_dave_control(
                                             dave.as_ref().expect("DAVE handle was just installed"),
                                             config,
-                                            DaveControl::Roster(dave_roster.clone()),
+                                            DaveControl::Roster(dave_roster.users.clone()),
                                             &mut websocket,
                                             store,
                                         )
@@ -1352,10 +1392,13 @@ async fn run_session(
                                         return SessionOutcome::Fatal(resource_error(store.generation()));
                                     }
                                 };
-                                *dave_roster = users.clone();
+                                // Opcode 11 adds clients; it is not a replacement snapshot.
+                                if dave_roster.add(users, config.limits.dave_roster_members()).is_err() {
+                                    return SessionOutcome::Fatal(resource_error(store.generation()));
+                                }
                                 if let Some(dave) = dave.as_ref()
                                     && let Err(error) = run_dave_control(
-                                        dave, config, DaveControl::Roster(users),
+                                        dave, config, DaveControl::Roster(dave_roster.users.clone()),
                                         &mut websocket, store,
                                     ).await
                                 {
@@ -1367,7 +1410,7 @@ async fn run_session(
                                     .and_then(parse_dave_user_id) else {
                                     return SessionOutcome::Fatal(protocol_error(store.generation()));
                                 };
-                                dave_roster.retain(|candidate| *candidate != user);
+                                dave_roster.users.retain(|candidate| *candidate != user);
                                 if let Some(dave) = dave.as_ref()
                                     && let Err(error) = run_dave_control(
                                         dave, config, DaveControl::MemberDisconnected(user),
@@ -3559,6 +3602,138 @@ mod tests {
             connection.shutdown().await.unwrap();
             gateway.shutdown().await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn dave_empty_room_retains_audio_then_arms_normal_deadline_on_listener_return() {
+        let mut config = FakeVoiceGatewayConfig::local();
+        config.dave_protocol_version = 1;
+        config.heartbeat_interval = Duration::from_secs(300);
+        let gateway = TestGateway::start(config).await.unwrap();
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        oto.config
+            .ready_dave_fixture
+            .store(true, std::sync::atomic::Ordering::Release);
+        let connection = oto
+            .connect(voice_info(&gateway, "empty-room", "token"))
+            .await
+            .unwrap();
+        gateway.try_dave_prepare_transition(1, 0).unwrap();
+        gateway
+            .try_dispatch_json(11, json!({"user_ids":["2","4"]}), true)
+            .unwrap();
+        eventually(|| connection.state().phase() == ConnectionPhase::Connected).await;
+        let (source, handle) = BenchmarkSource::pair(false);
+        handle.activate();
+        let sender = connection.start_audio(source).await.unwrap();
+        eventually(|| sender.state().stats().frames_sent() >= 3).await;
+        gateway
+            .try_dispatch_json(13, json!({"user_id":"4"}), true)
+            .unwrap();
+        gateway.try_dave_prepare_epoch(1, 1).unwrap();
+        gateway.try_dave_prepare_transition(1, 0).unwrap();
+        eventually(|| connection.state().phase() == ConnectionPhase::EstablishingDave).await;
+        sleep(Duration::from_millis(5)).await;
+        let packets = gateway.udp.capture().len();
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(40)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            gateway.udp.capture().len(),
+            packets,
+            "no reconnect or media in empty-room grace"
+        );
+        assert_ne!(sender.state().phase(), AudioPhase::Failed);
+        tokio::time::resume();
+        gateway
+            .try_dispatch_json(11, json!({"user_ids":["2","4"]}), true)
+            .unwrap();
+        sleep(Duration::from_millis(20)).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(6)).await;
+        gateway
+            .try_dispatch_json(11, json!({"user_ids":["2","4"]}), true)
+            .unwrap();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(5)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::resume();
+        eventually(|| {
+            gateway.udp.capture().len() == packets + 1
+                && connection.state().phase() == ConnectionPhase::EstablishingDave
+        })
+        .await;
+        let sent = sender.state().stats().frames_sent();
+        gateway.try_dave_prepare_transition(1, 0).unwrap();
+        eventually(|| sender.state().stats().frames_sent() >= sent + 3).await;
+        connection.shutdown().await.unwrap();
+        gateway.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dave_empty_room_grace_is_bounded_and_duplicate_rosters_do_not_extend_it() {
+        let mut config = FakeVoiceGatewayConfig::local();
+        config.dave_protocol_version = 1;
+        config.heartbeat_interval = Duration::from_secs(300);
+        let gateway = TestGateway::start(config).await.unwrap();
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        let connection = oto
+            .connect(voice_info(&gateway, "empty-grace", "token"))
+            .await
+            .unwrap();
+        gateway
+            .try_dispatch_json(11, json!({"user_ids":["2"]}), true)
+            .unwrap();
+        sleep(Duration::from_millis(20)).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(60)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(gateway.udp.capture().len(), 1);
+        gateway
+            .try_dispatch_json(11, json!({"user_ids":["2"]}), true)
+            .unwrap();
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(Duration::from_secs(61)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::resume();
+        eventually(|| gateway.udp.capture().len() == 2).await;
+        connection.shutdown().await.unwrap();
+        gateway.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn dave_client_connect_batches_accumulate_without_losing_existing_members() {
+        let mut roster = DaveRoster::default();
+        roster.add(vec![2, 4], 3).unwrap();
+        roster.add(vec![5, 5], 3).unwrap();
+        assert_eq!(roster.users, vec![2, 4, 5]);
+        roster.users.retain(|user| *user != 5);
+        assert_eq!(
+            roster.users,
+            vec![2, 4],
+            "one departure is not an empty room"
+        );
+        roster.add(vec![6], 3).unwrap();
+        assert!(matches!(
+            roster.add(vec![7], 3),
+            Err(DaveRosterError::TooManyMembers)
+        ));
+        assert_eq!(roster.users.len(), 3);
+        roster.clear();
+        assert!(!roster.known);
+        assert!(roster.users.is_empty());
     }
 
     #[test]
