@@ -82,3 +82,12 @@ claim. The prototype cannot be promoted without Crust consumption-aware
 pause/EOF handling, real DAVE transition fencing, and transport/diagnostic
 ownership. Report/raw evidence are in Raydio docs/SENDER-QUEUE-VALIDATION-2026-09-15.md
 and evidence/sender-queue-20260915/. Production pins/deployment unchanged.
+
+
+## 2026-09-23: DAVE readiness recovery
+
+Oracle default-worker run lost its browser receiver at 03:25 UTC, then DAVE epoch reset/prepare at 03:27:31 left the sender unready. At 03:27:41 the gateway readiness watchdog classified this as an owner response timeout and terminated the connection. The initial receiver outage predates this failure; this change addresses recovery, not that unknown network cause.
+
+Readiness expiry now has a distinct typed cause. Oto invalidates the old transport and allows at most two fresh identifies per externally supplied voice generation, retaining the audio source. No deadline extension, key bypass, plaintext fallback, or hot-path scheduling change. A ready transport or successful recovery does not replenish the DAVE budget. Genuine owner-response timeout and malformed/unsupported controls remain terminal. Control diagnostics include safe prepare/execute IDs, epoch and successfully written reply count; recovery emits the attempt and redacted context.
+
+Current official protocol was rechecked against https://github.com/discord/dave-protocol/blob/main/protocol.md: epoch 1 requires a new key package and readiness before transition execution. Recovery deliberately renegotiates rather than reusing invalid epoch state. Local TLS/UDP fixture tests cover the observed reset/prepare sequence, retained frame source, strict readiness gating and bounded exhaustion; 114 tests pass. Live Crust/Raydio verification remains separate.

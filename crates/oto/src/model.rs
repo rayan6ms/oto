@@ -661,6 +661,28 @@ impl ConnectionSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ConnectionEvent {
+    /// Completed control processing and WebSocket writes, without payloads.
+    DaveControlProcessed {
+        /// External voice credential generation.
+        generation: ConnectionGeneration,
+        /// Received opcode.
+        opcode: u8,
+        /// Transition ID for prepare/execute controls, when present.
+        transition_id: Option<u16>,
+        /// Epoch for an epoch preparation, when present.
+        epoch: Option<u64>,
+        /// Number of control replies successfully written.
+        replies: usize,
+    },
+    /// A bounded fresh encrypted handshake after readiness expiry.
+    DaveRecovery {
+        /// External voice credential generation; resume does not reset its budget.
+        generation: ConnectionGeneration,
+        /// One-based recovery attempt, at most two per credential generation.
+        attempt: u8,
+        /// Redacted context at expiry.
+        context: Option<DaveContext>,
+    },
     /// Redaction-safe DAVE control transition, emitted only when state changes.
     DaveStateChanged {
         /// Connection generation receiving the control.

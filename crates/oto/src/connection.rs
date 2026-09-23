@@ -475,6 +475,30 @@ pub(crate) struct StateStore {
 }
 
 impl StateStore {
+    pub(crate) fn dave_control_processed(
+        &self,
+        opcode: u8,
+        transition_id: Option<u16>,
+        epoch: Option<u64>,
+        replies: usize,
+    ) {
+        let _ = self.events.send(ConnectionEvent::DaveControlProcessed {
+            generation: self.generation(),
+            opcode,
+            transition_id,
+            epoch,
+            replies,
+        });
+    }
+
+    pub(crate) fn dave_recovery(&self, attempt: u8, context: Option<crate::DaveContext>) {
+        let _ = self.events.send(ConnectionEvent::DaveRecovery {
+            generation: self.generation(),
+            attempt,
+            context,
+        });
+    }
+
     pub(crate) fn dave_changed(
         &self,
         opcode: u8,

@@ -1,3 +1,10 @@
+## September 23: bounded recovery after observed DAVE readiness timeout
+
+- [x] Reproduce missing-successor expiry with epoch reset, duplicate controls and resume; distinguish gateway readiness timeout from owner-response timeout.
+- [x] Retain the audio attachment through at most two fresh encrypted handshakes per external credential generation; transport readiness/resume cannot reset that budget.
+- [x] Cover resumed media only after readiness, retained source, repeated-success exhaustion, missing-successor exhaustion, no plaintext and existing shutdown/replacement cases (114 ordinary tests pass).
+- [ ] Complete Crust integration and Oracle Testbot receiver qualification. No six-hour or production readiness claim.
+
 # Current task: Raydio Oracle audio reliability
 
 ## Sender queue decision experiment — 2026-09-15

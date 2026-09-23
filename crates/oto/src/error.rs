@@ -72,6 +72,8 @@ pub enum DaveFailure {
     QueueTimeout,
     /// The owner did not respond before its deadline.
     ResponseTimeout,
+    /// The gateway did not complete encrypted-session readiness in time.
+    ReadinessTimeout,
     /// The owner command or response lane closed.
     Closed,
 }
@@ -87,6 +89,7 @@ impl std::fmt::Display for DaveFailure {
             Self::BackendPanic => "DAVE backend panicked while rejecting untrusted input",
             Self::QueueTimeout => "DAVE command queue remained full",
             Self::ResponseTimeout => "DAVE owner response deadline expired",
+            Self::ReadinessTimeout => "DAVE gateway readiness deadline expired",
             Self::Closed => "DAVE owner task stopped",
         })
     }

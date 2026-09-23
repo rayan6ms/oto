@@ -125,6 +125,7 @@ enum Attempt {
 enum SessionOutcome {
     Resume,
     FreshIdentify,
+    DaveNotReady(Error),
     Replace(ValidatedInfo),
     NeedsFresh(Error),
     Fatal(Error),
@@ -405,6 +406,7 @@ pub(crate) async fn run(
     let mut dave = None;
     let mut dave_deadline = None;
     let mut dave_roster = Vec::new();
+    let mut dave_recovery = DaveRecoveryBudget::default();
 
     'control: loop {
         if dave.is_none() {
@@ -464,7 +466,18 @@ pub(crate) async fn run(
                 }
                 () = wait_dave_deadline(dave_deadline) => {
                     let error = dave_error(store.generation())
-                        .with_source(crate::DaveFailure::ResponseTimeout);
+                        .with_source(crate::DaveFailure::ReadinessTimeout);
+                    if let Some(number) = dave_recovery.claim(store.generation()) {
+                        store.dave_recovery(number, dave.as_ref().map(|d: &dave::Handle| d.snapshot().into()));
+                        invalidate_transport(&mut transport).await;
+                        latest_sequence = None;
+                        transport = None;
+                        dave = None;
+                        dave_roster.clear();
+                        attempt = Attempt::Identify;
+                        reconnect_attempts = reconnect_attempts.saturating_add(1);
+                        continue 'control;
+                    }
                     terminal(&mut store, &mut initial, error);
                     return;
                 }
@@ -598,7 +611,19 @@ pub(crate) async fn run(
         )
         .await;
 
+        let outcome = if let SessionOutcome::DaveNotReady(error) = outcome {
+            if let Some(number) = dave_recovery.claim(store.generation()) {
+                store.dave_recovery(number, error.dave_context());
+                invalidate_transport(&mut transport).await;
+                SessionOutcome::FreshIdentify
+            } else {
+                SessionOutcome::Fatal(error)
+            }
+        } else {
+            outcome
+        };
         match outcome {
+            SessionOutcome::DaveNotReady(_) => unreachable!("readiness expiry normalized above"),
             SessionOutcome::Resume => {
                 reconnect_attempts = reconnect_attempts.saturating_add(1);
                 if reconnect_attempts > MAX_RECONNECT_ATTEMPTS {
@@ -753,6 +778,27 @@ pub(crate) async fn run(
     }
 }
 
+// Independent of gateway retries: successful transport setup/resume must not
+// turn repeated MLS failures into an unlimited reconnect loop.
+#[derive(Default)]
+struct DaveRecoveryBudget {
+    generation: Option<ConnectionGeneration>,
+    used: u8,
+}
+impl DaveRecoveryBudget {
+    fn claim(&mut self, generation: ConnectionGeneration) -> Option<u8> {
+        if self.generation != Some(generation) {
+            self.generation = Some(generation);
+            self.used = 0;
+        }
+        if self.used >= 2 {
+            return None;
+        }
+        self.used += 1;
+        Some(self.used)
+    }
+}
+
 async fn wait_dave_deadline(deadline: Option<Instant>) {
     if let Some(deadline) = deadline {
         sleep_until(deadline).await;
@@ -809,8 +855,8 @@ async fn run_session(
                 }
             }
             () = wait_dave_deadline(*dave_deadline) => {
-                return SessionOutcome::Fatal(dave_error(store.generation())
-                    .with_source(crate::DaveFailure::ResponseTimeout)
+                return SessionOutcome::DaveNotReady(dave_error(store.generation())
+                    .with_source(crate::DaveFailure::ReadinessTimeout)
                     .with_dave_context(dave.as_ref().expect("deadline requires DAVE owner").snapshot().into()));
             }
             command = commands.recv() => {
@@ -1236,8 +1282,8 @@ async fn run_session(
                                 };
                                 if let Some((_, updates)) = audio_attachment.as_ref() {
                                     match deliver_transport(updates, installed).await {
-                                        Ok(()) => active.encoder = None,
-                                        Err(returned) => {
+                                        None => active.encoder = None,
+                                        Some(returned) => {
                                             active.encoder = Some(returned.encoder);
                                             *audio_attachment = None;
                                         }
@@ -1482,6 +1528,13 @@ async fn run_dave_control(
 ) -> Result<(), Error> {
     let generation = store.generation();
     let opcode = control.opcode();
+    let (transition_id, epoch) = match &control {
+        DaveControl::PrepareTransition { id, .. } | DaveControl::ExecuteTransition { id } => {
+            (Some(*id), None)
+        }
+        DaveControl::PrepareEpoch { epoch, .. } => (None, Some(*epoch)),
+        _ => (None, None),
+    };
     let before = dave.snapshot().into();
     let result = dave.control(control).await;
     store.dave_changed(opcode, before, dave.snapshot().into());
@@ -1492,11 +1545,13 @@ async fn run_dave_control(
     })?;
     let messages =
         dave_outbound_messages(actions, config.limits.gateway_binary_bytes(), generation)?;
+    let replies = messages.len();
     for message in messages {
         timed_send(websocket, message)
             .await
             .map_err(|error| error.for_operation_generation(Operation::Connect, generation))?;
     }
+    store.dave_control_processed(opcode, transition_id, epoch, replies);
     Ok(())
 }
 
@@ -1636,13 +1691,13 @@ fn detach_audio(
 async fn deliver_transport(
     updates: &mpsc::Sender<InstalledTransport>,
     installed: InstalledTransport,
-) -> Result<(), InstalledTransport> {
+) -> Option<InstalledTransport> {
     match timeout(WRITE_TIMEOUT, updates.reserve()).await {
         Ok(Ok(permit)) => {
             permit.send(installed);
-            Ok(())
+            None
         }
-        _ => Err(installed),
+        _ => Some(installed),
     }
 }
 
@@ -3443,6 +3498,10 @@ mod tests {
                 eventually(|| connection.state().phase() == ConnectionPhase::EstablishingDave)
                     .await;
             }
+            // Recovery handshakes must also lack keys in this exhaustion case.
+            oto.config
+                .ready_dave_fixture
+                .store(false, std::sync::atomic::Ordering::Release);
             // Pause only after real socket setup, then hold the runtime alive
             // across manual advances to avoid idle auto-advance of TLS timers.
             tokio::time::pause();
@@ -3468,20 +3527,109 @@ mod tests {
             for _ in 0..100 {
                 tokio::task::yield_now().await;
             }
-            assert_eq!(connection.state().phase(), ConnectionPhase::Failed);
+            assert_ne!(connection.state().phase(), ConnectionPhase::Failed);
+            tokio::time::resume();
+            // A successful transport setup must not replenish the separate
+            // DAVE recovery budget. Each retry is a fresh encrypted session.
+            for discovery_count in [2, 3] {
+                eventually(|| {
+                    gateway.udp.capture().len() == discovery_count
+                        && connection.state().phase() == ConnectionPhase::EstablishingDave
+                })
+                .await;
+                tokio::time::pause();
+                tokio::time::advance(Duration::from_secs(11)).await;
+                for _ in 0..100 {
+                    tokio::task::yield_now().await;
+                }
+                tokio::time::resume();
+            }
+            eventually(|| connection.state().phase() == ConnectionPhase::Failed).await;
             assert_eq!(
-                connection.state().failure().map(|failure| failure.kind()),
-                Some(ErrorKind::DaveTransition)
+                connection.state().failure().unwrap().dave_failure(),
+                Some(crate::DaveFailure::ReadinessTimeout)
             );
             assert_eq!(
                 gateway.udp.capture().len(),
-                1,
-                "no media during missing key setup"
+                3,
+                "only discovery, never unencrypted media"
             );
+            tokio::time::pause();
             tokio::time::resume();
             connection.shutdown().await.unwrap();
             gateway.shutdown().await.unwrap();
         }
+    }
+
+    #[test]
+    fn dave_recovery_budget_only_resets_on_external_generation_change() {
+        let mut budget = DaveRecoveryBudget::default();
+        let generation = ConnectionGeneration::FIRST;
+        assert_eq!(budget.claim(generation), Some(1));
+        assert_eq!(budget.claim(generation), Some(2));
+        assert_eq!(budget.claim(generation), None);
+        assert_eq!(budget.claim(generation.next().unwrap()), Some(1));
+    }
+
+    #[tokio::test]
+    async fn dave_readiness_recovery_retains_source_and_resumes_only_after_keys_ready() {
+        let mut config = FakeVoiceGatewayConfig::local();
+        config.dave_protocol_version = 1;
+        config.heartbeat_interval = Duration::from_secs(300);
+        let gateway = TestGateway::start(config).await.unwrap();
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        oto.config
+            .ready_dave_fixture
+            .store(true, std::sync::atomic::Ordering::Release);
+        let connection = oto
+            .connect(voice_info(&gateway, "recovery", "token"))
+            .await
+            .unwrap();
+        gateway.try_dave_prepare_transition(1, 0).unwrap();
+        eventually(|| connection.state().phase() == ConnectionPhase::Connected).await;
+        let (source, handle) = BenchmarkSource::pair(false);
+        handle.activate();
+        let sender = connection.start_audio(source).await.unwrap();
+        eventually(|| sender.state().stats().frames_sent() >= 3).await;
+        for _ in 0..2 {
+            // Exact reset/prepare sequence observed on Oracle.
+            gateway.try_dave_prepare_epoch(1, 1).unwrap();
+            gateway.try_dave_prepare_transition(1, 1).unwrap();
+            eventually(|| connection.state().phase() == ConnectionPhase::EstablishingDave).await;
+            let sent = sender.state().stats().frames_sent();
+            let captured = gateway.udp.capture().len();
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(11)).await;
+            for _ in 0..100 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::resume();
+            eventually(|| {
+                gateway.udp.capture().len() == captured + 1
+                    && connection.state().phase() == ConnectionPhase::EstablishingDave
+            })
+            .await;
+            assert_eq!(
+                sender.state().stats().frames_sent(),
+                sent,
+                "no source progress while not ready"
+            );
+            assert_ne!(sender.state().phase(), AudioPhase::Failed);
+            gateway.try_dave_prepare_transition(1, 0).unwrap();
+            eventually(|| sender.state().stats().frames_sent() >= sent + 3).await;
+        }
+        // Even successful recovery does not allow an infinite loop in one call.
+        gateway.try_dave_prepare_epoch(1, 1).unwrap();
+        eventually(|| connection.state().phase() == ConnectionPhase::EstablishingDave).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(11)).await;
+        for _ in 0..100 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::resume();
+        eventually(|| connection.state().phase() == ConnectionPhase::Failed).await;
+        connection.shutdown().await.unwrap();
+        gateway.shutdown().await.unwrap();
     }
 
     #[tokio::test]
