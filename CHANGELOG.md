@@ -4,6 +4,17 @@ All notable changes to Oto are documented in this file. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project uses
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Accept the epoch transition announced by MLS Commit and Welcome messages
+  without requiring an earlier protocol-version Prepare Transition message.
+- Preserve applied MLS state when the same Prepare Transition is repeated;
+  sender ratchets still activate only at Execute Transition.
+- Retain MLS transition IDs in control diagnostics and incoming opcodes in
+  redacted DAVE failure snapshots.
+
 ## [1.0.0] - 2026-09-04
 
 ### Added

@@ -199,6 +199,11 @@ impl Error {
         self
     }
 
+    pub(crate) fn with_safe_code(mut self, code: u32) -> Self {
+        self.safe_code = Some(code);
+        self
+    }
+
     /// Returns the lifecycle state observed after a DAVE failure, if available.
     #[must_use]
     pub fn dave_context(&self) -> Option<DaveContext> {
@@ -254,6 +259,7 @@ impl Error {
     }
 
     /// Returns a redaction-safe protocol/status code when applicable.
+    /// DAVE control failures retain the incoming control opcode.
     #[must_use]
     pub fn safe_code(&self) -> Option<u32> {
         self.safe_code

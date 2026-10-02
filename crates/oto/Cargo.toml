@@ -31,6 +31,9 @@ rtrb.workspace = true
 rustix = { version = "1.1.4", default-features = false, features = ["net", "time", "std"] }
 
 [dev-dependencies]
+openmls = "0.8.1"
+openmls_basic_credential = "0.5.0"
+openmls_rust_crypto = "0.5.1"
 oto-testkit = { path = "../oto-testkit" }
 rustls.workspace = true
 stats_alloc = "0.1.10"

@@ -1576,6 +1576,12 @@ async fn run_dave_control(
             (Some(*id), None)
         }
         DaveControl::PrepareEpoch { epoch, .. } => (None, Some(*epoch)),
+        DaveControl::Commit(payload) | DaveControl::Welcome(payload) => (
+            payload
+                .get(..2)
+                .map(|bytes| u16::from_be_bytes([bytes[0], bytes[1]])),
+            None,
+        ),
         _ => (None, None),
     };
     let before = dave.snapshot().into();
@@ -1583,6 +1589,7 @@ async fn run_dave_control(
     store.dave_changed(opcode, before, dave.snapshot().into());
     let actions = result.map_err(|source| {
         dave_error(generation)
+            .with_safe_code(u32::from(opcode))
             .with_source(source)
             .with_dave_context(dave.snapshot().into())
     })?;
@@ -4394,6 +4401,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mls_welcome_announces_transition_over_the_gateway_without_prepare() {
+        let mut config = FakeVoiceGatewayConfig::local();
+        config.dave_protocol_version = 1;
+        let gateway = TestGateway::start(config).await.unwrap();
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        let info = VoiceConnectInfo::new(
+            1,
+            8,
+            10,
+            "joining-fixture",
+            format!("localhost:{}", gateway.local_addr().port()),
+            VoiceToken::new("fixture-only"),
+        );
+        let connection = oto.connect(info).await.unwrap();
+        let mut events = connection.subscribe_events().unwrap();
+        let (external_sender, welcome_for_package) = crate::dave::test_generated_welcome();
+        gateway
+            .try_dispatch_json(11, json!({"user_ids":["7","8"]}), true)
+            .unwrap();
+        gateway.try_dave_external_sender(external_sender).unwrap();
+        eventually(|| {
+            gateway
+                .dave_client_records()
+                .iter()
+                .any(|record| matches!(record, DaveClientRecord::KeyPackage(_)))
+        })
+        .await;
+        let package = gateway
+            .dave_client_records()
+            .into_iter()
+            .find_map(|record| match record {
+                DaveClientRecord::KeyPackage(package) => Some(package),
+                _ => None,
+            })
+            .unwrap();
+        let mut payload = 42_u16.to_be_bytes().to_vec();
+        payload.extend(welcome_for_package(&package));
+        gateway.try_dispatch_binary(30, payload).unwrap();
+        eventually(|| {
+            gateway
+                .dave_client_records()
+                .iter()
+                .any(|record| matches!(record, DaveClientRecord::Ready { transition_id: 42 }))
+        })
+        .await;
+        assert_eq!(
+            connection.state().phase(),
+            ConnectionPhase::EstablishingDave
+        );
+        assert!(connection.state().failure().is_none());
+        let (source, handle) = QueueSource::pair();
+        handle.push(davey::OPUS_SILENCE_PACKET.to_vec());
+        let error = connection.start_audio(source).await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DaveRequired);
+        assert_eq!(
+            gateway.udp.capture().len(),
+            1,
+            "only discovery before Execute"
+        );
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(
+                    events.recv().await.unwrap(),
+                    crate::ConnectionEvent::DaveControlProcessed {
+                        opcode: 30,
+                        transition_id: Some(42),
+                        ..
+                    }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("retain announced MLS transition ID in diagnostics");
+        gateway.try_dave_execute_transition(42).unwrap();
+        eventually(|| connection.state().phase() == ConnectionPhase::Connected).await;
+        let (source, handle) = QueueSource::pair();
+        handle.push(davey::OPUS_SILENCE_PACKET.to_vec());
+        let sender = connection.start_audio(source).await.unwrap();
+        eventually(|| sender.state().stats().frames_sent() >= 1).await;
+        assert!(connection.state().failure().is_none());
+        sender.stop().await.unwrap();
+        connection.shutdown().await.unwrap();
+        gateway.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn mls_welcome_without_external_sender_retains_failed_opcode() {
+        let mut config = FakeVoiceGatewayConfig::local();
+        config.dave_protocol_version = 1;
+        let gateway = TestGateway::start(config).await.unwrap();
+        let oto = test_oto(&gateway, ResourceLimits::default());
+        let connection = oto
+            .connect(voice_info(&gateway, "missing-sender", "fixture-only"))
+            .await
+            .unwrap();
+        gateway.try_dispatch_binary(30, vec![0, 42, 0]).unwrap();
+        eventually(|| connection.state().phase() == ConnectionPhase::Failed).await;
+        let state = connection.state();
+        let failure = state.failure().unwrap();
+        assert_eq!(failure.kind(), ErrorKind::DaveTransition);
+        assert_eq!(
+            failure.dave_failure(),
+            Some(crate::DaveFailure::InvalidState)
+        );
+        assert_eq!(failure.safe_code(), Some(30));
+        assert!(gateway.dave_client_records().is_empty());
+        assert_eq!(gateway.udp.capture().len(), 1);
+        connection.shutdown().await.unwrap();
+        gateway.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn rejected_dave_versions_are_typed_transitions_end_to_end() {
         for (case, opcode, data) in [
             (
@@ -4434,6 +4555,7 @@ mod tests {
             let state = connection.state();
             let failure = state.failure().expect("DAVE transition failure persists");
             assert_eq!(failure.kind(), ErrorKind::DaveTransition, "case {case}");
+            assert_eq!(failure.safe_code(), Some(u32::from(opcode)), "case {case}");
             assert_eq!(failure.operation(), Operation::Connect, "case {case}");
             assert_eq!(
                 failure.retry_disposition(),

@@ -382,8 +382,16 @@ impl Core {
 
     fn prepare_transition(&mut self, version: u16, id: u16) -> Result<Vec<Outbound>, Failure> {
         validate_version(version)?;
-        if self.pending.is_some_and(|pending| pending.id != id) {
-            return Err(Failure::InvalidState);
+        if let Some(pending) = self.pending {
+            if pending.id != id || pending.protocol_version != version {
+                return Err(Failure::InvalidState);
+            }
+            // A repeated protocol preparation must not discard an MLS Commit
+            // or Welcome already applied for this transition.
+            if id == 0 && pending.prepared {
+                return self.execute_transition(id);
+            }
+            return Ok(pending.prepared.then(|| ready(id)).into_iter().collect());
         }
         let prepared =
             self.active_version == version && self.backend.is_ready() && !self.epoch_prepared;
@@ -490,20 +498,22 @@ impl Core {
         }
         let id = u16::from_be_bytes([payload[0], payload[1]]);
         let body = &payload[2..];
-        let initial = id == 0
-            && self.pending.is_none()
-            && self.active_version == 0
-            && self.external_sender
-            && !self.backend.is_ready();
-        if initial {
-            self.pending = Some(PendingTransition {
-                id,
-                protocol_version: MAX_PROTOCOL_VERSION,
-                prepared: false,
-                sender_ratchet_pending: false,
-            });
-        } else if !self.pending.is_some_and(|pending| pending.id == id) {
-            return Err(Failure::InvalidState);
+        match self.pending {
+            Some(pending) if pending.id != id => return Err(Failure::InvalidState),
+            Some(_) => {}
+            None if self.external_sender => {
+                // MLS Commit (29) and Welcome (30) announce their own epoch
+                // transition. Prepare Transition (21) is for protocol changes
+                // and need not precede these messages, including a newcomer
+                // joining an established group with a nonzero transition ID.
+                self.pending = Some(PendingTransition {
+                    id,
+                    protocol_version: MAX_PROTOCOL_VERSION,
+                    prepared: false,
+                    sender_ratchet_pending: false,
+                });
+            }
+            None => return Err(Failure::InvalidState),
         }
         let result = if welcome {
             let mut recognized: Vec<_> = self.roster.iter().copied().collect();
@@ -607,6 +617,11 @@ fn fixture(name: &str, next_name: &str) -> Vec<u8> {
 #[cfg(test)]
 pub(crate) fn test_external_sender_fixture() -> Vec<u8> {
     fixture("EXTERNAL_SENDER", "APPENDING_PROPOSALS")
+}
+
+#[cfg(test)]
+pub(crate) fn test_generated_welcome() -> (Vec<u8>, impl FnOnce(&[u8]) -> Vec<u8>) {
+    tests::gateway_welcome_fixture()
 }
 
 #[cfg(any(test, fuzzing))]
@@ -760,8 +775,245 @@ fn prefix_u64(input: &[u8], offset: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use crate::transport::{TransportEncoder, TransportMode};
+    use openmls::prelude::{
+        tls_codec::{Serialize, VLBytes},
+        *,
+    };
+    use openmls_basic_credential::SignatureKeyPair;
+    use openmls_rust_crypto::OpenMlsRustCrypto;
 
     use super::*;
+
+    fn generated_member(user: u64, signer: &SignatureKeyPair) -> (Core, Vec<u8>) {
+        let sender = ExternalSender::new(
+            signer.public().into(),
+            BasicCredential::new(vec![0, 1, 1, 0]).into(),
+        )
+        .tls_serialize_detached()
+        .unwrap();
+        let mut core = Core::new(user, 10).unwrap();
+        core.control(Control::Roster(vec![7, 8, 9])).unwrap();
+        let actions = core.control(Control::ExternalSender(sender)).unwrap();
+        let [Outbound::Binary(package)] = actions.as_slice() else {
+            panic!("external sender must produce one key package");
+        };
+        assert_eq!(package[0], 26);
+        (core, package[1..].to_vec())
+    }
+
+    fn generated_members() -> (Core, Core, SignatureKeyPair, Vec<u8>) {
+        let ciphersuite = Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256;
+        let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+        let (member, _) = generated_member(7, &signer);
+        let (joiner, package) = generated_member(8, &signer);
+        (member, joiner, signer, package)
+    }
+
+    pub(super) fn gateway_welcome_fixture() -> (Vec<u8>, impl FnOnce(&[u8]) -> Vec<u8>) {
+        let ciphersuite = Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256;
+        let signer = SignatureKeyPair::new(ciphersuite.signature_algorithm()).unwrap();
+        let sender = ExternalSender::new(
+            signer.public().into(),
+            BasicCredential::new(vec![0, 1, 1, 0]).into(),
+        )
+        .tls_serialize_detached()
+        .unwrap();
+        let (mut member, _) = generated_member(7, &signer);
+        (sender, move |package| {
+            generated_add(&mut member, package, &signer).1
+        })
+    }
+
+    fn generated_add(
+        member: &mut Core,
+        package: &[u8],
+        signer: &SignatureKeyPair,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let crypto = OpenMlsRustCrypto::default();
+        let package = KeyPackageIn::tls_deserialize_exact_bytes(package)
+            .unwrap()
+            .validate(crypto.crypto(), ProtocolVersion::Mls10)
+            .unwrap();
+        let proposal = ExternalProposal::new_add::<OpenMlsRustCrypto>(
+            package,
+            GroupId::from_slice(&10_u64.to_be_bytes()),
+            member.backend.epoch().unwrap(),
+            signer,
+            SenderExtensionIndex::new(0),
+        )
+        .unwrap()
+        .tls_serialize_detached()
+        .unwrap();
+        let proposals = VLBytes::from(proposal).tls_serialize_detached().unwrap();
+        let response = member
+            .backend
+            .process_proposals(
+                davey::ProposalsOperationType::APPEND,
+                &proposals,
+                Some(&[7, 8, 9]),
+            )
+            .unwrap()
+            .expect("external add creates real commit and Welcome");
+        (response.commit, response.welcome.unwrap(), proposals)
+    }
+
+    fn announced(id: u16, body: Vec<u8>) -> Vec<u8> {
+        let mut payload = id.to_be_bytes().to_vec();
+        payload.extend(body);
+        payload
+    }
+
+    fn assert_transition_ready(actions: &[Outbound], id: u16) {
+        assert!(
+            matches!(actions, [Outbound::Json { opcode: 23, data }] if data["transition_id"] == id)
+        );
+    }
+
+    #[test]
+    fn mls_welcome_announces_a_nonzero_transition_without_prepare() {
+        let (mut member, mut joiner, signer, package) = generated_members();
+        let (commit, welcome, _) = generated_add(&mut member, &package, &signer);
+        member
+            .control(Control::PrepareTransition {
+                protocol_version: 1,
+                id: 42,
+            })
+            .unwrap();
+        member
+            .control(Control::Commit(announced(42, commit)))
+            .unwrap();
+        member
+            .control(Control::ExecuteTransition { id: 42 })
+            .unwrap();
+
+        let actions = joiner
+            .control(Control::Welcome(announced(42, welcome)))
+            .unwrap();
+        assert_transition_ready(&actions, 42);
+        assert_eq!(joiner.snapshot().transition_id, Some(42));
+        assert!(!joiner.snapshot().ready);
+        assert!(matches!(
+            joiner.encrypt(b"before execute"),
+            Err(Failure::InvalidState)
+        ));
+        assert!(matches!(
+            joiner.control(Control::ExecuteTransition { id: 43 }),
+            Err(Failure::InvalidState)
+        ));
+        joiner
+            .control(Control::ExecuteTransition { id: 42 })
+            .unwrap();
+        assert!(joiner.snapshot().ready);
+        let encrypted = member.encrypt(b"welcome succeeded").unwrap();
+        assert_eq!(
+            joiner
+                .backend
+                .decrypt(7, davey::MediaType::AUDIO, &encrypted)
+                .unwrap()
+                .as_slice(),
+            b"welcome succeeded"
+        );
+    }
+
+    #[test]
+    fn mls_initial_commit_announces_a_nonzero_transition_without_prepare() {
+        let (mut member, _joiner, signer, package) = generated_members();
+        let (commit, _, _) = generated_add(&mut member, &package, &signer);
+        let actions = member
+            .control(Control::Commit(announced(42, commit)))
+            .unwrap();
+        assert_transition_ready(&actions, 42);
+        assert!(!member.snapshot().ready);
+        assert!(matches!(
+            member.encrypt(b"before execute"),
+            Err(Failure::InvalidState)
+        ));
+        member
+            .control(Control::ExecuteTransition { id: 42 })
+            .unwrap();
+        assert!(member.snapshot().ready);
+        assert_ne!(member.encrypt(b"after execute").unwrap(), b"after execute");
+    }
+
+    #[test]
+    fn mls_member_add_announces_a_new_epoch_and_preserves_sender_until_execute() {
+        let (mut member, mut joiner, signer, package) = generated_members();
+        let (commit, welcome, _) = generated_add(&mut member, &package, &signer);
+        for core in [&mut member, &mut joiner] {
+            core.control(Control::PrepareTransition {
+                protocol_version: 1,
+                id: 42,
+            })
+            .unwrap();
+        }
+        member
+            .control(Control::Commit(announced(42, commit)))
+            .unwrap();
+        joiner
+            .control(Control::Welcome(announced(42, welcome)))
+            .unwrap();
+        for core in [&mut member, &mut joiner] {
+            core.control(Control::ExecuteTransition { id: 42 }).unwrap();
+        }
+        let (mut third, package) = generated_member(9, &signer);
+        let (commit, welcome, proposals) = generated_add(&mut member, &package, &signer);
+        let mut proposal_payload = vec![0];
+        proposal_payload.extend(proposals);
+        joiner
+            .control(Control::Proposals(proposal_payload))
+            .unwrap();
+        let actions = member
+            .control(Control::Commit(announced(43, commit.clone())))
+            .unwrap();
+        assert_transition_ready(&actions, 43);
+        joiner
+            .control(Control::Commit(announced(43, commit)))
+            .unwrap();
+        third
+            .control(Control::Welcome(announced(43, welcome)))
+            .unwrap();
+        let old_epoch = member.encrypt(b"old epoch").unwrap();
+        assert_eq!(
+            joiner
+                .backend
+                .decrypt(7, davey::MediaType::AUDIO, &old_epoch)
+                .unwrap()
+                .as_slice(),
+            b"old epoch"
+        );
+        assert!(
+            third
+                .backend
+                .decrypt(7, davey::MediaType::AUDIO, &old_epoch)
+                .is_err()
+        );
+        member
+            .control(Control::ExecuteTransition { id: 43 })
+            .unwrap();
+        let new_epoch = member.encrypt(b"new epoch").unwrap();
+        assert_eq!(
+            third
+                .backend
+                .decrypt(7, davey::MediaType::AUDIO, &new_epoch)
+                .unwrap()
+                .as_slice(),
+            b"new epoch"
+        );
+    }
+
+    #[test]
+    fn mls_repeated_prepare_preserves_an_applied_commit() {
+        let mut core = prepared_fixture_core();
+        let actions = core
+            .control(Control::PrepareTransition {
+                protocol_version: 1,
+                id: 7,
+            })
+            .unwrap();
+        assert_transition_ready(&actions, 7);
+        core.control(Control::ExecuteTransition { id: 7 }).unwrap();
+        assert!(core.snapshot().ready);
+    }
 
     #[test]
     fn vendored_backend_source_does_not_log_dave_security_material() {
